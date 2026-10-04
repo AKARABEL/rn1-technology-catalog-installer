@@ -1,6 +1,6 @@
 # RN1 Technology Catalog Installer
 
-`catalog.sh` installs and runs the **Raynet One Technology Catalog** (RayVentory Catalog) with Docker Compose. A menu guides you through setup, updates, offline installations and catalog snapshots.
+`catalog.sh` installs and runs the **Raynet One Technology Catalog** with Docker Compose. A menu guides you through setup, updates, offline installations and catalog snapshots.
 
 ## Requirements
 
