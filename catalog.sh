@@ -10,6 +10,7 @@ set -euo pipefail
 
 ENV_FILE=".env"
 COMPOSE_FILE="docker-compose.yml"
+COMPOSE_PROJECT_NAME=""
 
 # General
 TZ="Europe/Berlin"
@@ -307,7 +308,11 @@ require_docker() {
 }
 
 compose() {
-  "${COMPOSE[@]}" --env-file "$ENV_FILE" -f "$COMPOSE_FILE" "$@"
+  if [ -n "$COMPOSE_PROJECT_NAME" ]; then
+    "${COMPOSE[@]}" -p "$COMPOSE_PROJECT_NAME" --env-file "$ENV_FILE" -f "$COMPOSE_FILE" "$@"
+  else
+    "${COMPOSE[@]}" --env-file "$ENV_FILE" -f "$COMPOSE_FILE" "$@"
+  fi
 }
 
 require_files() {
@@ -2849,6 +2854,204 @@ update_installer() {
 }
 
 ###############################################################################
+# Take over an existing installation
+###############################################################################
+
+project_name_of() {
+  printf '%s' "$1" | tr '[:upper:]' '[:lower:]' | tr -cd 'a-z0-9_-'
+}
+
+# Existing Catalog installations, one per line: project|folder|compose file|env file|image|status
+find_installations() {
+  local project dir cfg envf image status f d seen=" "
+  if command -v docker >/dev/null 2>&1; then
+    while IFS='|' read -r project dir cfg envf image status; do
+      if [ -z "$dir" ] || [ "$dir" = "$WORK_DIR" ] || [[ "$seen" == *" $dir "* ]]; then
+        continue
+      fi
+      seen="$seen$dir "
+      cfg="${cfg%%,*}"
+      printf '%s|%s|%s|%s|%s|%s\n' "$project" "$dir" "${cfg:-$dir/docker-compose.yml}" "${envf:-$dir/.env}" "$image" "$status"
+    done < <(docker ps -a --filter "label=com.docker.compose.service=catalog-web" \
+      --format '{{.Label "com.docker.compose.project"}}|{{.Label "com.docker.compose.project.working_dir"}}|{{.Label "com.docker.compose.project.config_files"}}|{{.Label "com.docker.compose.project.environment_file"}}|{{.Image}}|{{.Status}}' 2>/dev/null || true)
+  fi
+  while IFS= read -r f; do
+    d="$(dirname -- "$f")"
+    if [ "$d" = "$WORK_DIR" ] || [[ "$seen" == *" $d "* ]] || ! grep -q 'rayventory-catalog' "$f" 2>/dev/null; then
+      continue
+    fi
+    seen="$seen$d "
+    printf '%s|%s|%s|%s|%s|%s\n' "$(project_name_of "$(basename -- "$d")")" "$d" "$f" "$d/.env" "" "not running"
+  done < <(find /root /home /opt /srv -maxdepth 3 \( -name docker-compose.yml -o -name docker-compose.yaml -o -name compose.yml -o -name compose.yaml \) 2>/dev/null || true)
+}
+
+# Value of KEY in an env file (any file, not only ours).
+env_file_value() {
+  sed -n "s/^$1=//p" "$2" 2>/dev/null | tail -n 1 | tr -d '\r'
+}
+
+# adopt_installation [interactive|cli] [FOLDER]
+adopt_installation() {
+  local mode="${1:-interactive}" wanted="${2:-}" line choice project dir cfg envf image status i version key value imported=0 skipped="" backup tmp_env tmp_compose
+  local -a cands=()
+  if [ -z "$SCRIPT_PATH" ] || [ ! -w "$SCRIPT_PATH" ]; then
+    err "Cannot change ${SCRIPT_PATH:-the installer} (not a writable file)."
+    return 1
+  fi
+  while IFS= read -r line; do
+    if [ -n "$wanted" ]; then
+      IFS='|' read -r project dir cfg envf image status <<< "$line"
+      if [ "$dir" != "${wanted%/}" ]; then
+        continue
+      fi
+    fi
+    cands+=("$line")
+  done < <(find_installations)
+  if [ "${#cands[@]}" -eq 0 ] && [ -n "$wanted" ] && [ -d "$wanted" ]; then
+    wanted="$(cd -- "$wanted" && pwd -P)"
+    for cfg in "$wanted/docker-compose.yml" "$wanted/docker-compose.yaml" "$wanted/compose.yml" "$wanted/compose.yaml"; do
+      if [ -f "$cfg" ]; then
+        cands+=("$(project_name_of "$(basename -- "$wanted")")|$wanted|$cfg|$wanted/.env||not running")
+        break
+      fi
+    done
+  fi
+  if [ "${#cands[@]}" -eq 0 ]; then
+    info "No other Catalog installation found on this host."
+    return 0
+  fi
+
+  echo
+  echo " Existing Catalog installations:"
+  for i in "${!cands[@]}"; do
+    IFS='|' read -r project dir cfg envf image status <<< "${cands[i]}"
+    version="${image##*:}"
+    if [ -z "$image" ]; then
+      version="$(env_file_value CATALOG_IMAGE "$envf")"
+      version="${version##*:}"
+    fi
+    printf '   %d) %-40s project %-22s Catalog %-15s %s\n' "$((i + 1))" "$dir" "$project" "${version:-?}" "$status"
+  done
+  if [ "${#cands[@]}" -eq 1 ]; then
+    choice=1
+  elif [ "$mode" = "interactive" ]; then
+    echo "   0) Cancel"
+    read -r -p " Select [1]: " choice || choice="0"
+    choice="${choice:-1}"
+  else
+    err "More than one installation found - give the folder: $SCRIPT_NAME adopt FOLDER"
+    return 1
+  fi
+  if ! [[ "$choice" =~ ^[0-9]+$ ]] || [ "$choice" -lt 1 ] || [ "$choice" -gt "${#cands[@]}" ]; then
+    info "Cancelled."
+    return 0
+  fi
+  IFS='|' read -r project dir cfg envf image status <<< "${cands[choice - 1]}"
+  if [ ! -r "$cfg" ] || [ ! -r "$envf" ]; then
+    err "$cfg or $envf is missing or not readable."
+    return 1
+  fi
+
+  echo
+  echo " Found in $dir:"
+  printf '   %-22s %s\n' "Compose file" "$cfg" "Env file" "$envf" "Compose project" "$project" \
+    "Catalog version" "$(env_file_value CATALOG_IMAGE "$envf" | sed 's/.*://')" \
+    "Catalog Web port" "$(env_file_value CATALOG_WEB_PORT "$envf")" \
+    "Nginx Proxy Manager" "$(env_file_value INSTALL_NGINX_PROXY_MANAGER "$envf")" \
+    "MongoDB tag" "$(env_file_value MONGO_TAG "$envf")"
+  for key in MONGO_INITDB_ROOT_PASSWORD MINIO_ROOT_PASSWORD RABBITMQ_DEFAULT_PASS; do
+    if [ -n "$(env_file_value "$key" "$envf")" ]; then
+      printf '   %-22s %s\n' "$key" "found (not shown)"
+    else
+      printf '   %-22s %s\n' "$key" "missing"
+    fi
+  done
+  echo
+  echo " Taking it over copies its .env and docker-compose.yml to $WORK_DIR and writes its values into"
+  echo " the settings of $SCRIPT_NAME. The running containers and their data are not touched."
+  if [ "$mode" = "interactive" ] && ! confirm "Take over this installation?" y; then
+    info "Cancelled."
+    return 0
+  fi
+
+  backup="$SCRIPT_PATH.bak-$(date +%Y%m%d-%H%M%S)"
+  cp -p -- "$SCRIPT_PATH" "$backup"
+  backup_file "$ENV_FILE"
+  backup_file "$COMPOSE_FILE"
+  (umask 077 && cp -- "$envf" "$ENV_FILE")
+  chmod 600 "$ENV_FILE"
+  cp -- "$cfg" "$COMPOSE_FILE"
+
+  while IFS= read -r line; do
+    line="${line%$'\r'}"
+    if ! [[ "$line" =~ ^([A-Z_][A-Z0-9_]*)=(.*)$ ]]; then
+      continue
+    fi
+    key="${BASH_REMATCH[1]}"
+    value="${BASH_REMATCH[2]}"
+    value="${value#\"}"
+    value="${value%\"}"
+    case "$key" in
+      MONGO_INITDB_ROOT_PASSWORD|MINIO_ROOT_PASSWORD|RABBITMQ_DEFAULT_PASS|ENV_FILE|COMPOSE_FILE) continue ;;
+      CATALOG_IMAGE)
+        set_setting CATALOG_IMAGE_REPO "${value%:*}"
+        set_setting CATALOG_VERSION "${value##*:}"
+        imported=$((imported + 2))
+        continue
+        ;;
+      CATALOG_WORKER_IMAGE)
+        set_setting CATALOG_WORKER_IMAGE_REPO "${value%:*}"
+        imported=$((imported + 1))
+        continue
+        ;;
+    esac
+    if [[ "$value" == *[\"\\\$\`]* ]]; then
+      skipped="$skipped $key"
+    elif grep -q "^$key=\"" "$SCRIPT_PATH"; then
+      set_setting "$key" "$value"
+      imported=$((imported + 1))
+    fi
+  done < "$envf"
+  if [ "$project" != "$(project_name_of "$(basename -- "$WORK_DIR")")" ]; then
+    set_setting COMPOSE_PROJECT_NAME "$project"
+    if ! grep -q '^COMPOSE_PROJECT_NAME=' "$ENV_FILE"; then
+      printf '\nCOMPOSE_PROJECT_NAME=%s\n' "$project" >> "$ENV_FILE"
+    fi
+  fi
+  if ! bash -n "$SCRIPT_PATH" || ! bash "$SCRIPT_PATH" check-settings; then
+    cat -- "$backup" > "$SCRIPT_PATH"
+    err "The values of $envf do not fit the settings - nothing was changed in $SCRIPT_NAME."
+    return 1
+  fi
+  ok "Imported $imported settings from $envf; passwords kept in $ENV_FILE."
+  if [ -n "$skipped" ]; then
+    warn "Not imported (special characters):$skipped"
+  fi
+  if [ -n "$(sed -n 's/^COMPOSE_PROJECT_NAME="\(.*\)"$/\1/p' "$SCRIPT_PATH")" ]; then
+    ok "Compose project \"$project\" is used, so the same containers and volumes stay in use."
+  fi
+
+  tmp_env="$(mktemp -d)"
+  cp -- "$SCRIPT_PATH" "$tmp_env/catalog.sh"
+  cp -p -- "$ENV_FILE" "$tmp_env/.env"
+  (cd -- "$tmp_env" && bash catalog.sh generate </dev/null >/dev/null 2>&1) || true
+  tmp_compose="$tmp_env/$(basename -- "$COMPOSE_FILE")"
+  if [ -f "$tmp_compose" ] && [ "$(cat "$tmp_compose")" = "$(cat "$COMPOSE_FILE")" ]; then
+    ok "Its docker-compose.yml is the same as the one this installer generates."
+  elif [ -f "$tmp_compose" ]; then
+    warn "Its docker-compose.yml differs from the one this installer generates:"
+    diff <(grep -E '^[[:space:]]+image:' "$COMPOSE_FILE") <(grep -E '^[[:space:]]+image:' "$tmp_compose") | sed -n 's/^[<>]/   &/p' || true
+    echo "   ($(diff "$COMPOSE_FILE" "$tmp_compose" | grep -c '^[<>]' || true) changed lines in total.) Nothing changes until you run option 2 (generate) and 6 (start)."
+  fi
+  rm -rf -- "$tmp_env"
+  echo "  From now on manage the stack from $WORK_DIR. The files in $dir are left as they are."
+  if [ "$mode" = "interactive" ]; then
+    export RVC_NOTICE="Installation in $dir taken over."
+    exec bash "$SCRIPT_PATH" menu
+  fi
+}
+
+###############################################################################
 # Generate .env and docker-compose.yml
 ###############################################################################
 
@@ -2872,6 +3075,10 @@ check_settings() {
     fi
     seen="${seen}${value} "
   done
+  if [ -n "$COMPOSE_PROJECT_NAME" ] && ! [[ "$COMPOSE_PROJECT_NAME" =~ ^[a-z0-9][a-z0-9_-]*$ ]]; then
+    err "COMPOSE_PROJECT_NAME may only contain lower-case letters, digits, - and _ (is \"$COMPOSE_PROJECT_NAME\")."
+    problems=$((problems + 1))
+  fi
   if [ -z "$CATALOG_VERSION" ]; then
     err "CATALOG_VERSION must not be empty."
     problems=$((problems + 1))
@@ -2946,6 +3153,11 @@ ASPNETCORE_URLS=${ASPNETCORE_URLS}
 ASPNETCORE_HTTP_PORTS=${ASPNETCORE_HTTP_PORTS}
 LOG_LEVEL_DEFAULT=${LOG_LEVEL_DEFAULT}
 EOF
+  if [ -n "$COMPOSE_PROJECT_NAME" ]; then
+    printf '
+COMPOSE_PROJECT_NAME=%s
+' "$COMPOSE_PROJECT_NAME" >> "$ENV_FILE"
+  fi
 }
 
 write_compose_file() {
@@ -3751,10 +3963,17 @@ stack_state() {
 }
 
 show_menu() {
+  local found
   printf '%s\n' "${C_BLD}Raynet One Technology Catalog - Installation Portal${C_RST}   ($(version_label))"
   printf 'Folder : %s\n' "$WORK_DIR"
   printf 'Files  : %s %s   %s %s\n' "$ENV_FILE" "$(file_state "$ENV_FILE")" "$COMPOSE_FILE" "$(file_state "$COMPOSE_FILE")"
   printf 'Stack  : %s\n' "$(stack_state)"
+  if [ ! -f "$ENV_FILE" ]; then
+    found="$(find_installations 2>/dev/null | head -n 1 | cut -d'|' -f2)" || found=""
+    if [ -n "$found" ]; then
+      printf '%s\n' "${C_YLW}A Catalog installation already exists in $found - option 23 takes it over (settings, passwords, data).${C_RST}"
+    fi
+  fi
   if settings_stale; then
     printf '%s\n' "${C_YLW}The generated files do not match the settings above (changed settings or manual edits) - option 2 regenerates them.${C_RST}"
   fi
@@ -3789,6 +4008,7 @@ show_menu() {
  Upgrade
   21) Guided upgrade: Catalog to the newest version, health check, patch updates
   22) Update this installer from GitHub (your settings are kept)
+  23) Take over an existing installation on this host (reads its .env and docker-compose.yml)
 
   99) Reset: remove containers AND all data volumes
    0) Exit
@@ -3850,6 +4070,7 @@ menu() {
       20) run_action local_self_sync ;;
       21) run_action do_upgrade ;;
       22) update_installer || true ;;
+      23) adopt_installation || true ;;
       99) run_action do_reset ;;
       0|q|Q|exit|quit) exit 0 ;;
       "") continue ;;
@@ -3884,6 +4105,7 @@ Commands:
   updates                     Show available updates for all components
   upgrade                     Guided upgrade (asks before every step)
   self-update                 Update this installer from GitHub, keeping the settings
+  adopt [FOLDER]              Take over an existing installation (its .env, docker-compose.yml and data)
   download                    Download all images into a new offline bundle folder (+ .tar.gz)
   snapshot [daily|full]       Download the newest catalog snapshot (needs a stored API key)
   import FILE                 Import a snapshot file into the local catalog (needs a stored local key)
@@ -3935,6 +4157,7 @@ main() {
     updates) show_updates_cli ;;
     upgrade) INTERACTIVE="true"; do_upgrade ;;
     self-update) update_installer cli ;;
+    adopt) adopt_installation cli "${1:-}" ;;
     download) download_bundle all ;;
     snapshot) download_snapshot "${1:-daily}" cli ;;
     import) import_snapshot "${1:-}" cli ;;

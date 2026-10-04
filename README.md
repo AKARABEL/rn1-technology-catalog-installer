@@ -21,6 +21,16 @@ Then choose **7** (generate + validate + start). The settings are at the top of 
 - Run the script as a file, as shown above. Piping it into bash (`wget -O- ... | bash`) does not work, because the menu needs the keyboard and the script stores its settings in its own file.
 - **Later updates:** use option **22** (or `./catalog.sh self-update`) instead of the `wget` line. It downloads the newest version and keeps all your settings. The previous version is kept as `catalog.sh.bak-<timestamp>`. Running the `wget` line again would overwrite your settings.
 
+## A Catalog already runs on the server
+
+If the Catalog was installed earlier in another folder, for example with an older script in `/root`, the menu shows where that installation is. Option **23** then takes it over:
+
+- It finds the installation from the Docker Compose labels of its containers: project, folder, compose file and env file. If the containers carry no labels, it searches `/root`, `/home`, `/opt` and `/srv`, or uses the folder you name with `./catalog.sh adopt FOLDER`.
+- It shows the version, the ports and which passwords were found; the passwords themselves are not displayed.
+- It copies `.env` (with the passwords) and `docker-compose.yml` into this folder, and writes the values into the settings of `catalog.sh`.
+- It sets `COMPOSE_PROJECT_NAME` to the existing project (for example `root`), so that the same containers and data volumes stay in use. A new folder name would otherwise start a second, empty stack.
+- The running containers and the old folder are not changed. If the old compose file differs from what this installer generates (for example another MinIO image), the differences are listed. They take effect only with option 2 (generate) and 6 (start).
+
 ## Menu
 
 | Option | Purpose |
@@ -38,6 +48,7 @@ Then choose **7** (generate + validate + start). The settings are at the top of 
 | 20 | Let the local catalog synchronize itself daily (servers with internet access) |
 | 21 | **Guided upgrade**: Catalog to the newest version, health check, patch updates of the other components |
 | 22 | Update this installer from GitHub; your settings are kept |
+| 23 | Take over an existing installation on this host (its `.env`, `docker-compose.yml`, passwords and data) |
 | 99 | Remove containers **and all data volumes** (you must type `DELETE`) |
 
 ## Command line
@@ -50,6 +61,7 @@ Then choose **7** (generate + validate + start). The settings are at the top of 
 ./catalog.sh updates                 available updates of all components
 ./catalog.sh upgrade                 guided upgrade (asks before every step)
 ./catalog.sh self-update             newest installer from GitHub, settings kept
+./catalog.sh adopt [FOLDER]          take over an existing installation
 ./catalog.sh download                offline bundle with all images (+ .tar.gz)
 ./catalog.sh versions | set-version VERSION|stable
 ./catalog.sh snapshot [daily|full]   needs a stored online API key
@@ -124,6 +136,7 @@ bash tests/run_bundle_tests.sh "$PWD/catalog.sh"
 bash tests/run_snapshot_tests.sh "$PWD/catalog.sh"
 bash tests/run_upgrade_tests.sh "$PWD/catalog.sh"
 bash tests/run_selfupdate_tests.sh "$PWD/catalog.sh"
+bash tests/run_adopt_tests.sh "$PWD/catalog.sh"
 ```
 
-Docker, ssh, scp and the Raynet APIs are replaced by fakes. The Updates tests query Docker Hub and GHCR, so they need internet access. GitHub Actions runs all five suites on every push.
+Docker, ssh, scp and the Raynet APIs are replaced by fakes. The Updates tests query Docker Hub and GHCR, so they need internet access. GitHub Actions runs all six suites on every push.
