@@ -8,15 +8,18 @@
 - bash 4.2 or newer and curl. Snapshot features also need `jq` or `python3`.
 - For OpenSearch: `vm.max_map_count` of at least 262144. Menu option 16 checks this.
 
-## Quick start
+## Install with one command
+
+On the server, in the folder where the Catalog should live:
 
 ```bash
-git clone https://github.com/AKARABEL/rn1-technology-catalog-installer.git
-cd rn1-technology-catalog-installer
-./catalog.sh
+mkdir -p ~/rn1-catalog && cd ~/rn1-catalog && wget -qO catalog.sh https://raw.githubusercontent.com/AKARABEL/rn1-technology-catalog-installer/main/catalog.sh && bash catalog.sh
 ```
 
-Choose **7** (generate + validate + start). The settings are at the top of `catalog.sh`; option **1** opens them in `vi`.
+Then choose **7** (generate + validate + start). The settings are at the top of `catalog.sh`; option **1** opens them in `vi`.
+
+- Run the script as a file, as shown above. Piping it into bash (`wget -O- ... | bash`) does not work, because the menu needs the keyboard and the script stores its settings in its own file.
+- **Later updates:** use option **22** (or `./catalog.sh self-update`) instead of the `wget` line. It downloads the newest version and keeps all your settings. The previous version is kept as `catalog.sh.bak-<timestamp>`. Running the `wget` line again would overwrite your settings.
 
 ## Menu
 
@@ -34,6 +37,7 @@ Choose **7** (generate + validate + start). The settings are at the top of `cata
 | 19 | Import a downloaded snapshot into the local catalog |
 | 20 | Let the local catalog synchronize itself daily (servers with internet access) |
 | 21 | **Guided upgrade**: Catalog to the newest version, health check, patch updates of the other components |
+| 22 | Update this installer from GitHub; your settings are kept |
 | 99 | Remove containers **and all data volumes** (you must type `DELETE`) |
 
 ## Command line
@@ -45,6 +49,7 @@ Choose **7** (generate + validate + start). The settings are at the top of `cata
 ./catalog.sh up | down | status | logs [service] | pull | restart
 ./catalog.sh updates                 available updates of all components
 ./catalog.sh upgrade                 guided upgrade (asks before every step)
+./catalog.sh self-update             newest installer from GitHub, settings kept
 ./catalog.sh download                offline bundle with all images (+ .tar.gz)
 ./catalog.sh versions | set-version VERSION|stable
 ./catalog.sh snapshot [daily|full]   needs a stored online API key
@@ -118,6 +123,7 @@ bash tests/run_tests.sh "$PWD/catalog.sh"
 bash tests/run_bundle_tests.sh "$PWD/catalog.sh"
 bash tests/run_snapshot_tests.sh "$PWD/catalog.sh"
 bash tests/run_upgrade_tests.sh "$PWD/catalog.sh"
+bash tests/run_selfupdate_tests.sh "$PWD/catalog.sh"
 ```
 
-Docker, ssh, scp and the Raynet APIs are replaced by fakes. The Updates tests query Docker Hub and GHCR, so they need internet access. GitHub Actions runs all four suites on every push.
+Docker, ssh, scp and the Raynet APIs are replaced by fakes. The Updates tests query Docker Hub and GHCR, so they need internet access. GitHub Actions runs all five suites on every push.

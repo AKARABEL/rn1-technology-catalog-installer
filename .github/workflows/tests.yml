@@ -19,3 +19,5 @@ jobs:
         run: bash tests/run_snapshot_tests.sh "$PWD/catalog.sh"
       - name: Guided upgrade
         run: bash tests/run_upgrade_tests.sh "$PWD/catalog.sh"
+      - name: Installer self-update
+        run: bash tests/run_selfupdate_tests.sh "$PWD/catalog.sh"

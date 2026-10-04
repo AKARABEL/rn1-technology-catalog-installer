@@ -53,6 +53,7 @@ CATALOG_WEB_PORT="8080"
 CATALOG_LICENSE_PATH="/app/license"
 CATALOG_CLOUD_URL="https://rayventorycatalog.raynet.de"
 HEALTH_TIMEOUT="600"
+INSTALLER_URL="https://raw.githubusercontent.com/AKARABEL/rn1-technology-catalog-installer/main/catalog.sh"
 
 # OpenSearch
 OPENSEARCH_HEAP="-Xms512m -Xmx512m"
@@ -2788,6 +2789,66 @@ EOF
 }
 
 ###############################################################################
+# Installer update
+###############################################################################
+
+# Downloads the newest installer and carries the current settings over to it.
+update_installer() {
+  local mode="${1:-interactive}" tmp line name value backup
+  if [ -z "$SCRIPT_PATH" ] || [ ! -w "$SCRIPT_PATH" ]; then
+    err "Cannot update ${SCRIPT_PATH:-the installer} (not a writable file)."
+    return 1
+  fi
+  tmp="$(mktemp)"
+  info "Downloading the newest installer from $INSTALLER_URL"
+  if command -v curl >/dev/null 2>&1; then
+    curl -fsSL --proto '=https' --connect-timeout 10 --max-time 120 -o "$tmp" "$INSTALLER_URL" || : > "$tmp"
+  else
+    wget -q -T 120 -O "$tmp" "$INSTALLER_URL" || : > "$tmp"
+  fi
+  if ! head -n 1 "$tmp" | grep -q '^#!/usr/bin/env bash' || ! grep -q '^# CONFIGURE ONLY THIS SECTION' "$tmp" || ! bash -n "$tmp" 2>/dev/null; then
+    rm -f -- "$tmp"
+    err "The download failed or is not a valid installer."
+    return 1
+  fi
+  while IFS= read -r line; do
+    if [[ "$line" =~ ^([A-Z_][A-Z0-9_]*)=\"(.*)\"$ ]]; then
+      name="${BASH_REMATCH[1]}"
+      value="${BASH_REMATCH[2]}"
+      if grep -q "^$name=\"" "$tmp"; then
+        set_setting "$name" "$value" "$tmp"
+      fi
+    fi
+  done < <(sed -n '/^# CONFIGURE ONLY THIS SECTION/,/^# DO NOT CHANGE ANYTHING BELOW/p' "$SCRIPT_PATH")
+  if [ "$(cksum < "$tmp")" = "$(cksum < "$SCRIPT_PATH")" ]; then
+    rm -f -- "$tmp"
+    ok "The installer is up to date."
+    return 0
+  fi
+  if ! bash "$tmp" check-settings >/dev/null; then
+    rm -f -- "$tmp"
+    err "The new installer does not accept the current settings - not updated."
+    return 1
+  fi
+  echo "  Settings that are new in this version keep their defaults; all others keep your values."
+  if [ "$mode" = "interactive" ] && ! confirm "Replace $SCRIPT_NAME with the new version?" y; then
+    rm -f -- "$tmp"
+    info "Cancelled."
+    return 0
+  fi
+  backup="$SCRIPT_PATH.bak-$(date +%Y%m%d-%H%M%S)"
+  cp -p -- "$SCRIPT_PATH" "$backup"
+  # Write the content back instead of moving the file, so owner and mode stay.
+  cat -- "$tmp" > "$SCRIPT_PATH"
+  rm -f -- "$tmp"
+  ok "Installer updated (previous version: $backup)."
+  if [ "$mode" = "interactive" ]; then
+    export RVC_NOTICE="Installer updated - your settings were kept."
+    exec bash "$SCRIPT_PATH" menu
+  fi
+}
+
+###############################################################################
 # Generate .env and docker-compose.yml
 ###############################################################################
 
@@ -3727,6 +3788,7 @@ show_menu() {
 
  Upgrade
   21) Guided upgrade: Catalog to the newest version, health check, patch updates
+  22) Update this installer from GitHub (your settings are kept)
 
   99) Reset: remove containers AND all data volumes
    0) Exit
@@ -3787,6 +3849,7 @@ menu() {
       19) run_action import_snapshot_menu ;;
       20) run_action local_self_sync ;;
       21) run_action do_upgrade ;;
+      22) update_installer || true ;;
       99) run_action do_reset ;;
       0|q|Q|exit|quit) exit 0 ;;
       "") continue ;;
@@ -3820,6 +3883,7 @@ Commands:
   check                       Check prerequisites (Docker, Compose, ports, vm.max_map_count, Docker Hub)
   updates                     Show available updates for all components
   upgrade                     Guided upgrade (asks before every step)
+  self-update                 Update this installer from GitHub, keeping the settings
   download                    Download all images into a new offline bundle folder (+ .tar.gz)
   snapshot [daily|full]       Download the newest catalog snapshot (needs a stored API key)
   import FILE                 Import a snapshot file into the local catalog (needs a stored local key)
@@ -3870,6 +3934,7 @@ main() {
     check) do_check ;;
     updates) show_updates_cli ;;
     upgrade) INTERACTIVE="true"; do_upgrade ;;
+    self-update) update_installer cli ;;
     download) download_bundle all ;;
     snapshot) download_snapshot "${1:-daily}" cli ;;
     import) import_snapshot "${1:-}" cli ;;
