@@ -59,7 +59,20 @@ echo "$name $HOSTKEY"
 EOF
 chmod +x "$T/bin/"*
 export HOME="$T/home"; mkdir -p "$HOME"
-export PATH="$T/bin:$PATH"
+sysdirs="$PATH"
+if PATH="$sysdirs" command -v sshpass >/dev/null 2>&1 || PATH="$sysdirs" command -v docker >/dev/null 2>&1 || PATH="$sysdirs" command -v podman >/dev/null 2>&1; then
+  mkdir -p "$T/sys"
+  IFS=: read -r -a dirs <<< "$sysdirs"
+  for dir in "${dirs[@]}"; do
+    for f in "$dir"/*; do
+      n="${f##*/}"
+      case "$n" in sshpass|docker|podman) continue ;; esac
+      [ -e "$T/sys/$n" ] || ln -s "$f" "$T/sys/$n" 2>/dev/null || true
+    done
+  done
+  sysdirs="$T/sys"
+fi
+export PATH="$T/bin:$sysdirs"
 
 D="$T/src"; mkdir -p "$D"; cp "$NEW" "$D/catalog.sh"
 sed -i '0,/^MONGO_TAG=/s/^MONGO_TAG=.*/MONGO_TAG="7.0.43"/; 0,/^OPENSEARCH_TAG=/s/^OPENSEARCH_TAG=.*/OPENSEARCH_TAG="2.19.6"/; 0,/^OPENSEARCH_DASHBOARDS_TAG=/s/^OPENSEARCH_DASHBOARDS_TAG=.*/OPENSEARCH_DASHBOARDS_TAG="2.19.6"/; 0,/^RABBITMQ_TAG=/s/^RABBITMQ_TAG=.*/RABBITMQ_TAG="3.13.7-management-alpine"/; 0,/^NGINX_PROXY_MANAGER_TAG=/s/^NGINX_PROXY_MANAGER_TAG=.*/NGINX_PROXY_MANAGER_TAG="2.16.0"/; s/^CHECK_FOR_UPDATES=.*/CHECK_FOR_UPDATES="false"/' "$D/catalog.sh"
