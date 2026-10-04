@@ -33,6 +33,7 @@ Choose **7** (generate + validate + start). The settings are at the top of `cata
 | 18 | API keys for the online and the local catalog: show, change, test, delete |
 | 19 | Import a downloaded snapshot into the local catalog |
 | 20 | Let the local catalog synchronize itself daily (servers with internet access) |
+| 21 | **Guided upgrade**: Catalog to the newest version, health check, patch updates of the other components |
 | 99 | Remove containers **and all data volumes** (you must type `DELETE`) |
 
 ## Command line
@@ -43,6 +44,7 @@ Choose **7** (generate + validate + start). The settings are at the top of `cata
 ./catalog.sh generate [--new-passwords]
 ./catalog.sh up | down | status | logs [service] | pull | restart
 ./catalog.sh updates                 available updates of all components
+./catalog.sh upgrade                 guided upgrade (asks before every step)
 ./catalog.sh download                offline bundle with all images (+ .tar.gz)
 ./catalog.sh versions | set-version VERSION|stable
 ./catalog.sh snapshot [daily|full]   needs a stored online API key
@@ -77,6 +79,21 @@ The bundle contains no `.env`. The target generates its own passwords.
 
 API keys and passwords are passed to curl through stdin. They never appear on a command line or in a URL.
 
+## Guided upgrade
+
+Option **21** compares the running Catalog with the newest version on Docker Hub (the `stable` tag). If the running version is older, the script:
+
+1. takes a MongoDB backup (`mongodump`, stored in `backups/`; the password stays inside the container);
+2. pulls the new images while the old version still runs;
+3. runs `docker compose down` (data volumes are kept);
+4. sets `CATALOG_VERSION` and regenerates the files (the passwords are kept);
+5. runs `docker compose up -d`;
+6. runs a health check: every container must be running (and healthy where a healthcheck exists), and Catalog Web must answer. The script waits at most `HEALTH_TIMEOUT` seconds (default 600).
+
+If the health check fails, it shows the logs and offers to go back to the previous version, together with the `mongorestore` command for the backup.
+
+Afterwards it offers patch updates in the same release series, for example MongoDB 8.0.4 to 8.0.32, OpenSearch 2.19.5 to 2.19.6 and RabbitMQ 3.13.6 to 3.13.7. Major upgrades are never offered there; use option 8 for those.
+
 ## Files next to the script
 
 These files are created at runtime and are listed in `.gitignore`. Do not commit them:
@@ -87,6 +104,7 @@ These files are created at runtime and are listed in `.gitignore`. Do not commit
 | `docker-compose.yml` (+ backups) | generated stack definition |
 | `.catalog_api_key`, `.catalog_local_api_key` | stored API keys (mode 600) |
 | `snapshots/` | downloaded catalog snapshots |
+| `backups/` | MongoDB backups taken before an upgrade (mode 600) |
 | `RN1-Technology-Catalog-*` | offline bundles |
 
 ## Known issues
@@ -99,6 +117,7 @@ These files are created at runtime and are listed in `.gitignore`. Do not commit
 bash tests/run_tests.sh "$PWD/catalog.sh"
 bash tests/run_bundle_tests.sh "$PWD/catalog.sh"
 bash tests/run_snapshot_tests.sh "$PWD/catalog.sh"
+bash tests/run_upgrade_tests.sh "$PWD/catalog.sh"
 ```
 
-Docker, ssh, scp and the Raynet APIs are replaced by fakes. The Updates tests query Docker Hub and GHCR, so they need internet access. GitHub Actions runs all three suites on every push.
+Docker, ssh, scp and the Raynet APIs are replaced by fakes. The Updates tests query Docker Hub and GHCR, so they need internet access. GitHub Actions runs all four suites on every push.

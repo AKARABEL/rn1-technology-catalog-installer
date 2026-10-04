@@ -17,3 +17,5 @@ jobs:
         run: bash tests/run_bundle_tests.sh "$PWD/catalog.sh"
       - name: Snapshots, API keys and import
         run: bash tests/run_snapshot_tests.sh "$PWD/catalog.sh"
+      - name: Guided upgrade
+        run: bash tests/run_upgrade_tests.sh "$PWD/catalog.sh"

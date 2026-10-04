@@ -83,6 +83,7 @@ echo "cfg-key-present=$([ -n "$key" ] && echo yes || echo no)" >> "$LOG"
 path="${url#https://rayventorycatalog.raynet.de}"
 code=200
 if [ "${SHIM_OFFLINE:-}" = 1 ]; then printf '000'; exit 7; fi
+if [ "${SHIM_OLD_SERVER:-}" = 1 ] && [[ "$path" == /v3/* ]]; then : > "$out"; reply 404; fi
 if [ "$key" = "$NOSYNC" ]; then code=403; : > "$out"
 elif [ "$key" != "$VALID" ]; then code=401; printf '{"title":"Authentication Error","status":401,"detail":"Api key is not registered in the database."}' > "$out"
 else
@@ -158,6 +159,9 @@ out="$(SHIM_OFFLINE=1 bash "$D/catalog.sh" snapshot </dev/null 2>&1)"; rc=$?
 check "offline: clear message, no 'invalid'" '[ "$rc" -ne 0 ] && grep -q "could not be checked" <<< "$out" && ! grep -q "not valid" <<< "$out"'
 out="$(SHIM_NO_MANIFEST=1 bash "$D/catalog.sh" snapshot </dev/null 2>&1)"; rc=$?
 check "no manifest yet: valid key, nothing to download" '[ "$rc" -eq 0 ] && grep -q "has no snapshot yet" <<< "$out"'
+
+out="$(SHIM_OLD_SERVER=1 bash "$D/catalog.sh" snapshot </dev/null 2>&1)"; rc=$?
+check "server without v3 API: not reported as valid" '[ "$rc" -ne 0 ] && grep -q "offers no snapshot API" <<< "$out" && ! grep -q "The API key is valid" <<< "$out"'
 
 # 10. Key file is not part of an offline bundle copy and not in help as plain text
 check "help lists snapshot command" 'bash "$D/catalog.sh" help | grep -q "snapshot \[daily|full\]"'

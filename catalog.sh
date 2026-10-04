@@ -52,6 +52,7 @@ RABBITMQ_UI_PORT="15672"
 CATALOG_WEB_PORT="8080"
 CATALOG_LICENSE_PATH="/app/license"
 CATALOG_CLOUD_URL="https://rayventorycatalog.raynet.de"
+HEALTH_TIMEOUT="600"
 
 # OpenSearch
 OPENSEARCH_HEAP="-Xms512m -Xmx512m"
@@ -95,6 +96,7 @@ fi
 
 API_KEY_FILE="$WORK_DIR/.catalog_api_key"
 LOCAL_KEY_FILE="$WORK_DIR/.catalog_local_api_key"
+LAST_BACKUP=""
 INTERACTIVE="false"
 GENERATE_CANCELLED="false"
 COMPOSE=()
@@ -1812,7 +1814,14 @@ api_key_check() {
   code="$(cloud_get "$key" /v3/synchronization/manifest "$MANIFEST_FILE")"
   case "$code" in
     200) KEY_STATE="valid" ;;
-    404) KEY_STATE="valid"; : > "$MANIFEST_FILE" ;;
+    404)
+      if [ "$(curl -sS -o /dev/null -w '%{http_code}' --proto '=https' --connect-timeout 10 --max-time 30         "${CATALOG_CLOUD_URL%/}/v3/synchronization/manifest" || true)" = "401" ]; then
+        KEY_STATE="valid"
+        : > "$MANIFEST_FILE"
+      else
+        KEY_DETAIL="$CATALOG_CLOUD_URL offers no snapshot API (/v3/synchronization) - the Catalog there is older than 26.3"
+      fi
+      ;;
     401)
       KEY_STATE="invalid"
       KEY_DETAIL="$(sed -n 's/.*"detail" *: *"\([^"]*\)".*/\1/p' "$MANIFEST_FILE" | head -n 1)" || KEY_DETAIL=""
@@ -2497,6 +2506,285 @@ print(json.dumps(cur))
     403) rm -f -- "$out"; err "The local catalog refused the synchronization (HTTP 403) - the online key may lack the Synchronizer role."; return 1 ;;
     *) rm -f -- "$out"; err "Starting the synchronization failed (HTTP $code)."; return 1 ;;
   esac
+}
+
+###############################################################################
+# Guided upgrade
+###############################################################################
+
+# Image tag of a running service (empty when it does not run).
+running_tag() {
+  local id image
+  id="$(compose ps -q "$1" 2>/dev/null | head -n 1)" || id=""
+  if [ -z "$id" ]; then
+    return 0
+  fi
+  image="$(docker inspect --format '{{.Config.Image}}' "$id" 2>/dev/null)" || image=""
+  printf '%s' "${image##*:}"
+}
+
+mongo_running_version() {
+  compose exec -T mongo mongod --version 2>/dev/null | sed -n 's/^db version v//p' | head -n 1 || true
+}
+
+# Waits until every service runs (and is healthy where it has a healthcheck) and Catalog Web answers.
+stack_health() {
+  local timeout="${1:-$HEALTH_TIMEOUT}" waited=0 svc id state health restarts bad code warned
+  local -a services=()
+  while IFS= read -r svc; do
+    if [ -n "$svc" ]; then
+      services+=("$svc")
+    fi
+  done < <(compose config --services 2>/dev/null)
+  info "Health check of ${#services[@]} services (up to $((timeout / 60)) minutes)"
+  while true; do
+    bad=""
+    warned=""
+    for svc in "${services[@]}"; do
+      id="$(compose ps -q "$svc" 2>/dev/null | head -n 1)" || id=""
+      if [ -z "$id" ]; then
+        bad="$bad $svc(missing)"
+        continue
+      fi
+      read -r state health restarts <<< "$(docker inspect --format '{{.State.Status}} {{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}} {{.RestartCount}}' "$id" 2>/dev/null)" || true
+      if [ "${state:-}" != "running" ] || { [ "${health:-none}" != "none" ] && [ "$health" != "healthy" ]; }; then
+        bad="$bad $svc(${state:-?}/${health:-?})"
+      elif [ "${restarts:-0}" != "0" ]; then
+        warned="$warned $svc(${restarts}x)"
+      fi
+    done
+    code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 "$(local_url)/" || true)"
+    if [ -z "$bad" ] && [ "$code" = "200" ]; then
+      if [ -t 1 ]; then
+        echo
+      fi
+      ok "All ${#services[@]} services run and Catalog Web answers on $(local_url)."
+      if [ -n "$warned" ]; then
+        warn "Restarted while starting:$warned - check their logs (option 10) if this keeps growing."
+      fi
+      return 0
+    fi
+    if [ "$waited" -ge "$timeout" ]; then
+      if [ -t 1 ]; then
+        echo
+      fi
+      err "Not healthy after $((timeout / 60)) minutes:${bad} Catalog Web: HTTP $code"
+      return 1
+    fi
+    if [ -t 1 ]; then
+      printf '\r       %4ss  waiting for:%s web=%s          ' "$waited" "${bad:- -}" "$code"
+    fi
+    sleep 5
+    waited=$((waited + 5))
+  done
+}
+
+# Writes a compressed mongodump of all databases to backups/; the password stays inside the container.
+mongo_backup() {
+  local dir file
+  dir="$WORK_DIR/backups"
+  mkdir -p -- "$dir"
+  file="$dir/mongo-$(date +%Y%m%d-%H%M%S).archive.gz"
+  info "MongoDB backup -> $file"
+  if (umask 077 && compose exec -T mongo sh -c '
+      umask 077
+      printf "password: \"%s\"\n" "$MONGO_INITDB_ROOT_PASSWORD" > /tmp/.rvc-dump.yml
+      mongodump --quiet --archive --gzip --config=/tmp/.rvc-dump.yml \
+        --username "$MONGO_INITDB_ROOT_USERNAME" --authenticationDatabase admin
+      rc=$?
+      rm -f /tmp/.rvc-dump.yml
+      exit $rc' > "$file") && [ -s "$file" ]; then
+    chmod 600 "$file"
+    ok "Backup written ($(human_size "$(stat -c %s -- "$file")"))."
+    LAST_BACKUP="$file"
+  else
+    rm -f -- "$file"
+    err "The MongoDB backup failed."
+    return 1
+  fi
+}
+
+# Series of a version for patch updates: MongoDB, OpenSearch and RabbitMQ X.Y, Nginx Proxy Manager X.
+version_series() {
+  local key="$1" core
+  core="$(version_core "$2")"
+  case "$key" in
+    npm) printf '%s' "${core%%.*}" ;;
+    minio) printf 'RELEASE' ;;
+    *) printf '%s' "$(cut -d. -f1-2 <<< "$core")" ;;
+  esac
+}
+
+# Same-series updates of the infrastructure components (MongoDB 8.0.4 -> 8.0.32 and so on).
+offer_patch_updates() {
+  local key first tag current series newest v count=0 i choice tok mongo_running
+  local -a keys=() froms=() tos=() picked=() toks=()
+  mongo_running="$(mongo_running_version)"
+  for key in "${UPD_KEYS[@]}"; do
+    component_info "$key"
+    first="${C_SETTINGS%% *}"
+    tag="${!first}"
+    if [ "$key" = "mongo" ] && [ -n "$mongo_running" ]; then
+      current="$mongo_running"
+    elif [[ "$tag" =~ $(kind_regex "$C_KIND") ]]; then
+      current="$tag"
+    else
+      current="${UPD_RESOLVED[$key]-}"
+    fi
+    if [ -z "$current" ] || [ -z "${UPD_VERSIONS[$key]-}" ]; then
+      continue
+    fi
+    series="$(version_series "$key" "$current")"
+    newest=""
+    while IFS= read -r v; do
+      if [ "$(version_series "$key" "$v")" = "$series" ]; then
+        newest="$v"
+        break
+      fi
+    done <<< "${UPD_VERSIONS[$key]}"
+    if [ -n "$newest" ] && kind_newer "$C_KIND" "$newest" "$current"; then
+      keys+=("$key")
+      froms+=("$current")
+      tos+=("$newest")
+      picked+=(1)
+    fi
+  done
+  if [ "$mongo_running" != "" ] && [ "${mongo_running%%.*}" -lt 8 ] 2>/dev/null; then
+    info "MongoDB ${mongo_running%%.*}.x runs here. MongoDB 8.0 is a major upgrade (Updates, option 8)$(if kernel_blocks_mongo8; then printf ' and does not start on this kernel'; fi)."
+  fi
+  if [ "${#keys[@]}" -eq 0 ]; then
+    ok "MongoDB, OpenSearch, RabbitMQ, MinIO and Nginx Proxy Manager have the newest patch versions of their series."
+    return 0
+  fi
+  while true; do
+    echo
+    echo " Patch updates in the same series (bug and security fixes, no data migration):"
+    for i in "${!keys[@]}"; do
+      component_info "${keys[i]}"
+      printf '   [%s] %d  %-24s %s -> %s\n' "$(if [ "${picked[i]}" = 1 ]; then printf x; else printf ' '; fi)" "$((i + 1))" "$C_LABEL" "$(version_core "${froms[i]}")" "$(version_core "${tos[i]}")"
+    done
+    echo " Toggle with numbers, Enter = apply the selected ones, 0 = skip"
+    read -r -p " > " choice || choice="0"
+    case "$choice" in
+      "") break ;;
+      0) info "No patch updates applied."; return 0 ;;
+      *)
+        read -r -a toks <<< "$choice"
+        for tok in "${toks[@]}"; do
+          if [[ "$tok" =~ ^[0-9]+$ ]] && [ "$tok" -ge 1 ] && [ "$tok" -le "${#keys[@]}" ]; then
+            picked[tok - 1]=$((1 - picked[tok - 1]))
+          fi
+        done
+        ;;
+    esac
+  done
+  for i in "${!keys[@]}"; do
+    if [ "${picked[i]}" = 1 ]; then
+      component_info "${keys[i]}"
+      for first in $C_SETTINGS; do
+        set_setting "$first" "${tos[i]}"
+        printf -v "$first" '%s' "${tos[i]}"
+      done
+      count=$((count + 1))
+    fi
+  done
+  if [ "$count" -eq 0 ]; then
+    info "No patch updates applied."
+    return 0
+  fi
+  do_generate keep no-next
+  info "Pulling the new images"
+  compose pull
+  info "Recreating the changed services"
+  compose up -d --remove-orphans
+  stack_health
+}
+
+do_upgrade() {
+  local installed target old_version answer
+  require_files || return 1
+  require_docker || return 1
+  if ! command -v curl >/dev/null 2>&1; then
+    err "curl is needed (apt-get install curl)."
+    return 1
+  fi
+  collect_updates
+  installed="$(running_tag catalog-web)"
+  if [ -z "$installed" ]; then
+    installed="$(env_value CATALOG_IMAGE)"
+    installed="${installed##*:}"
+  fi
+  target="${HUB_STABLE:-${HUB_VERSIONS%%$'\n'*}}"
+  if [ -z "$target" ]; then
+    err "The available Catalog versions could not be read from Docker Hub."
+    return 1
+  fi
+  echo
+  echo " Installed Catalog: ${installed:-unknown}"
+  echo " Newest Catalog:    $(version_with_tag "$target")"
+
+  if [ "$installed" = "$target" ] || { is_version "$installed" && ! version_gt "$target" "$installed"; }; then
+    ok "The Catalog is up to date."
+  else
+    cat <<EOF
+
+ Upgrade plan
+   1. MongoDB backup (recommended; the new version may migrate the database)
+   2. Pull the images of $target while the old version still runs
+   3. docker compose down (data volumes are kept)
+   4. CATALOG_VERSION $installed -> $target, regenerate the files (passwords are kept)
+   5. docker compose up -d
+   6. Health check of all services and Catalog Web
+EOF
+    if ! confirm "Upgrade the Catalog to $target now? (the Catalog is offline during steps 3 to 6)" n; then
+      info "Cancelled - nothing was changed."
+      return 0
+    fi
+    LAST_BACKUP=""
+    if confirm "Create the MongoDB backup first?" y; then
+      if ! mongo_backup && ! confirm "Continue without a backup?" n; then
+        info "Cancelled - nothing was changed."
+        return 0
+      fi
+    fi
+    old_version="$CATALOG_VERSION"
+    set_setting CATALOG_VERSION "$target"
+    CATALOG_VERSION="$target"
+    do_generate keep no-next
+    info "Pulling the images of $target"
+    if ! compose pull catalog-web worker-recognition-1 worker-recognition-2 worker-other worker-search; then
+      err "Pulling the images failed - the running version was not touched."
+      set_setting CATALOG_VERSION "$old_version"
+      CATALOG_VERSION="$old_version"
+      do_generate keep no-next
+      return 1
+    fi
+    info "Stopping the stack (docker compose down)"
+    compose down --remove-orphans
+    info "Starting $target (docker compose up -d)"
+    compose up -d --remove-orphans
+    if stack_health && [ "$(running_tag catalog-web)" = "$target" ]; then
+      ok "Catalog upgraded: $installed -> $target."
+    else
+      err "The upgrade to $target is not healthy."
+      compose ps || true
+      echo "  Last log lines of catalog-web:"
+      compose logs --tail=30 catalog-web 2>/dev/null | sed 's/^/    /' || true
+      if confirm "Go back to $old_version?" n; then
+        set_setting CATALOG_VERSION "$old_version"
+        CATALOG_VERSION="$old_version"
+        do_generate keep no-next
+        compose up -d --remove-orphans
+        stack_health || true
+        if [ -n "$LAST_BACKUP" ]; then
+          warn "If $target already migrated the database, restore the backup:"
+          echo "      docker compose exec -T mongo sh -c 'mongorestore --drop --archive --gzip -u \"\$MONGO_INITDB_ROOT_USERNAME\" -p \"\$MONGO_INITDB_ROOT_PASSWORD\" --authenticationDatabase admin' < $LAST_BACKUP"
+        fi
+      fi
+      return 1
+    fi
+  fi
+  offer_patch_updates
 }
 
 ###############################################################################
@@ -3437,6 +3725,9 @@ show_menu() {
   19) Import a downloaded snapshot into the local catalog
   20) Let the local catalog synchronize itself daily (online servers)
 
+ Upgrade
+  21) Guided upgrade: Catalog to the newest version, health check, patch updates
+
   99) Reset: remove containers AND all data volumes
    0) Exit
 
@@ -3495,6 +3786,7 @@ menu() {
       18) run_action api_key_menu ;;
       19) run_action import_snapshot_menu ;;
       20) run_action local_self_sync ;;
+      21) run_action do_upgrade ;;
       99) run_action do_reset ;;
       0|q|Q|exit|quit) exit 0 ;;
       "") continue ;;
@@ -3527,6 +3819,7 @@ Commands:
   info                        Show URLs and Nginx Proxy Manager instructions
   check                       Check prerequisites (Docker, Compose, ports, vm.max_map_count, Docker Hub)
   updates                     Show available updates for all components
+  upgrade                     Guided upgrade (asks before every step)
   download                    Download all images into a new offline bundle folder (+ .tar.gz)
   snapshot [daily|full]       Download the newest catalog snapshot (needs a stored API key)
   import FILE                 Import a snapshot file into the local catalog (needs a stored local key)
@@ -3576,6 +3869,7 @@ main() {
     info|urls) show_access_info ;;
     check) do_check ;;
     updates) show_updates_cli ;;
+    upgrade) INTERACTIVE="true"; do_upgrade ;;
     download) download_bundle all ;;
     snapshot) download_snapshot "${1:-daily}" cli ;;
     import) import_snapshot "${1:-}" cli ;;
