@@ -13,7 +13,7 @@
 On the server, in the folder where the Catalog should live:
 
 ```bash
-mkdir -p ~/rn1-catalog && cd ~/rn1-catalog && wget -qO catalog.sh https://raw.githubusercontent.com/AKARABEL/rn1-technology-catalog-installer/main/catalog.sh && bash catalog.sh
+mkdir -p ~/rn1-technology-catalog && cd ~/rn1-technology-catalog && wget -qO catalog.sh https://raw.githubusercontent.com/AKARABEL/rn1-technology-catalog-installer/main/catalog.sh && bash catalog.sh
 ```
 
 Then choose **7** (generate + validate + start). The settings are at the top of `catalog.sh`; option **1** opens them in `vi`.
