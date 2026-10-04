@@ -1,0 +1,19 @@
+name: tests
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Syntax
+        run: bash -n catalog.sh && dash -c 'exit 0'
+      - name: Generator, menu and Catalog versions
+        run: bash tests/run_tests.sh "$PWD/catalog.sh"
+      - name: Updates and offline bundle
+        run: bash tests/run_bundle_tests.sh "$PWD/catalog.sh"
+      - name: Snapshots, API keys and import
+        run: bash tests/run_snapshot_tests.sh "$PWD/catalog.sh"

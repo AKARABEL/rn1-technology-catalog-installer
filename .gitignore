@@ -1,0 +1,8 @@
+.env
+.env.bak-*
+docker-compose.yml
+docker-compose.yml.bak-*
+.catalog_api_key
+.catalog_local_api_key
+snapshots/
+RN1-Technology-Catalog-*
