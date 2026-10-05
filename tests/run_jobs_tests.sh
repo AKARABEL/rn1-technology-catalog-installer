@@ -76,7 +76,7 @@ FILE="$D/snapshots/2026-10-02-daily.tar.gz"
 state() { cat "$D/.jobs/$1/state" 2>/dev/null; }
 
 # 1. The SSH session ends while the download runs: the job carries on and finishes
-setsid bash -c 'printf "17\n1\n\n\n0\n" | bash "$0/rn1-technology-catalog-installer.sh" menu > "$0/menu1.out" 2>&1' "$D" &
+setsid bash -c 'printf "17\n3\n\n\n0\n" | bash "$0/rn1-technology-catalog-installer.sh" menu > "$0/menu1.out" 2>&1' "$D" &
 sp=$!
 disown "$sp" 2>/dev/null || true
 wait_for '[ -s "$PART" ]'
@@ -94,7 +94,7 @@ check "key never on a command line" '! grep "^curl " "$LOG" | grep -q "$VALID"'
 
 # 2. Cancel from another session: curl stops and the partial file is removed
 rm -f "$FILE"
-( printf '17\n1\n\n0\n' | bash "$D/rn1-technology-catalog-installer.sh" menu > "$T/menu2.out" 2>&1 ) &
+( printf '17\n3\n\n0\n' | bash "$D/rn1-technology-catalog-installer.sh" menu > "$T/menu2.out" 2>&1 ) &
 mp=$!
 wait_for '[ -s "$PART" ]'
 out="$(bash "$D/rn1-technology-catalog-installer.sh" jobs cancel 2 2>&1)"
@@ -115,10 +115,10 @@ check "finished job cannot be cancelled" '[ "$rc" -ne 0 ] && grep -q "is not run
 
 # 4. Only one snapshot download at a time (slower server from here on)
 export SHIM_DELAY=0.7
-( printf '17\n1\n\n0\n' | bash "$D/rn1-technology-catalog-installer.sh" menu > "$T/menu3.out" 2>&1 ) &
+( printf '17\n3\n\n0\n' | bash "$D/rn1-technology-catalog-installer.sh" menu > "$T/menu3.out" 2>&1 ) &
 mp=$!
 wait_for '[ -s "$PART" ]'
-out="$(printf '17\n1\n\n0\n' | bash "$D/rn1-technology-catalog-installer.sh" menu 2>&1)"
+out="$(printf '17\n3\n\n0\n' | bash "$D/rn1-technology-catalog-installer.sh" menu 2>&1)"
 check "second download refused while one runs" 'grep -q "Job #3 (Snapshot download" <<< "$out" && grep -q "is still running" <<< "$out" && [ ! -d "$D/.jobs/4" ]'
 
 # 5. Full screen menu: Current processes box, hold X cancels the selected process

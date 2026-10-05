@@ -53,6 +53,7 @@ RABBITMQ_UI_PORT="15672"
 CATALOG_WEB_PORT="8080"
 CATALOG_LICENSE_PATH="/app/license"
 CATALOG_CLOUD_URL="https://rayventorycatalog.raynet.de"
+SYNC_MAX_UPLOAD="32GB"
 HEALTH_TIMEOUT="600"
 INSTALLER_URL="https://raw.githubusercontent.com/AKARABEL/rn1-technology-catalog-installer/main/rn1-technology-catalog-installer.sh"
 
@@ -2241,11 +2242,14 @@ api_key_menu() {
   done
 }
 
-# Manifest -> one line per snapshot: type, date, size, checksum, path, based-on date (tab separated).
+# Manifest -> one line per snapshot (tab separated): kind, date (up to), size, checksum, path, from.
+# kind is full, daily, cumulative-7d or cumulative-30d; "from" is the date the archive builds on
+# (basedOnDate of a daily, rangeStart of a cumulative, empty for the full snapshot).
 manifest_rows() {
   if command -v jq >/dev/null 2>&1; then
     jq -r '([.latestFullSnapshot | select(.) | ["full", .date, (.sizeBytes | tostring), (.checksum // ""), .downloadPath, ""]]
-      + [.dailyDeltas[]? | ["daily", .date, (.sizeBytes | tostring), (.checksum // ""), .downloadPath, (.basedOnDate // "")]])[] | @tsv'
+      + [.dailyDeltas[]? | ["daily", .date, (.sizeBytes | tostring), (.checksum // ""), .downloadPath, (.basedOnDate // "")]]
+      + [.cumulativeDeltas[]? | ["cumulative-" + (.window // "x"), (.rangeEnd // .date), (.sizeBytes | tostring), (.checksum // ""), .downloadPath, (.rangeStart // "")]])[] | @tsv'
   elif command -v python3 >/dev/null 2>&1; then
     python3 -c '
 import json, sys
@@ -2256,6 +2260,8 @@ if f:
     rows.append(["full", f.get("date", ""), str(f.get("sizeBytes", 0)), f.get("checksum") or "", f.get("downloadPath", ""), ""])
 for d in m.get("dailyDeltas") or []:
     rows.append(["daily", d.get("date", ""), str(d.get("sizeBytes", 0)), d.get("checksum") or "", d.get("downloadPath", ""), d.get("basedOnDate") or ""])
+for c in m.get("cumulativeDeltas") or []:
+    rows.append(["cumulative-" + (c.get("window") or "x"), c.get("rangeEnd") or c.get("date") or "", str(c.get("sizeBytes", 0)), c.get("checksum") or "", c.get("downloadPath", ""), c.get("rangeStart") or ""])
 for r in rows:
     print("\t".join(r))
 ' | tr -d '\r'
@@ -2265,10 +2271,47 @@ for r in rows:
   fi
 }
 
-# download_snapshot [daily|full] [interactive|cli]
+# snapshot_chain DATE < rows -> the deltas that bring a catalog with the data of DATE up to the newest
+# date, in the order to apply them, and a last line "#END<TAB>reached<TAB>newest". A delta applies
+# when it builds on a date not after the current one and reaches further; the one that reaches
+# furthest wins (the smaller file on a tie), so the chain needs the fewest downloads.
+snapshot_chain() {
+  awk -F'\t' -v L="$1" '
+    $1 != "full" && $1 != "" {
+      n++; to[n] = $2; sz[n] = $3 + 0; fr[n] = $6; line[n] = $0
+      if ($2 > newest) newest = $2
+    }
+    END {
+      while (1) {
+        best = 0
+        for (i = 1; i <= n; i++) {
+          if (used[i] || fr[i] > L || to[i] <= L) continue
+          if (!best || to[i] > to[best] || (to[i] == to[best] && sz[i] < sz[best])) best = i
+        }
+        if (!best) break
+        used[best] = 1
+        print line[best]
+        L = to[best]
+      }
+      printf "#END\t%s\t%s\n", L, newest
+    }'
+}
+
+# "full 2026-10-04" / "daily 2026-10-05" / "weekly 2026-10-04" for a manifest row
+snapshot_name() {
+  local kind date
+  IFS=$'\t' read -r kind date _ <<< "$1"
+  case "$kind" in
+    cumulative-7d) printf 'weekly %s' "$date" ;;
+    cumulative-30d) printf 'monthly %s' "$date" ;;
+    *) printf '%s %s' "$kind" "$date" ;;
+  esac
+}
+
+# download_snapshot [daily|full|chain|since:YYYY-MM-DD] [interactive|cli]
 download_snapshot() {
-  local kind="${1:-}" mode="${2:-interactive}" key rows daily full row choice
-  local type date size checksum path based dir dest free_kb rc
+  local kind="${1:-}" mode="${2:-interactive}" key rows daily full row choice since="" chain plan planfile reached newest fdate
+  local type date size checksum path based dir dest free_kb rc total count title chainfile
   if ! command -v curl >/dev/null 2>&1; then
     err "curl is needed (apt-get install curl)."
     return 1
@@ -2316,74 +2359,223 @@ download_snapshot() {
   full="$(grep $'^full\t' <<< "$rows" | head -n 1)" || full=""
 
   if [ "$mode" = "interactive" ]; then
-    echo
-    echo " Snapshots on $CATALOG_CLOUD_URL"
-    if [ -n "$daily" ]; then
-      IFS=$'\t' read -r type date size checksum path based <<< "$daily"
-      printf '   1) Latest daily snapshot   %s   %10s   (applies on top of %s)\n' "$date" "$(human_size "$size")" "${based:-the previous state}"
-    else
-      echo "   1) Latest daily snapshot   - none available"
-    fi
-    if [ -n "$full" ]; then
-      IFS=$'\t' read -r type date size checksum path based <<< "$full"
-      printf '   2) Latest full snapshot    %s   %10s   (for a new installation)\n' "$date" "$(human_size "$size")"
-    else
-      echo "   2) Latest full snapshot    - none available"
-    fi
-    echo "   0) Cancel"
-    read -r -p " Select [1]: " choice || choice="0"
-    case "${choice:-1}" in
-      1) kind="daily" ;;
-      2) kind="full" ;;
-      *) info "Cancelled."; return 0 ;;
+    snapshot_choose "$rows" "$full" "$daily" || return 0
+    kind="$SNAP_KIND"
+    since="$SNAP_SINCE"
+  else
+    case "${kind:-daily}" in
+      since:*) since="${kind#since:}"; kind="since" ;;
     esac
   fi
+
+  plan=""
   case "${kind:-daily}" in
-    daily) row="$daily" ;;
-    full) row="$full" ;;
-    *) err "Unknown snapshot type: $kind (daily or full)"; return 2 ;;
+    daily) plan="$daily" ;;
+    full) plan="$full" ;;
+    chain)
+      if [ -z "$full" ]; then
+        err "The manifest has no full snapshot."
+        return 1
+      fi
+      IFS=$'\t' read -r _ fdate _ <<< "$full"
+      chain="$(snapshot_chain "$fdate" <<< "$rows")"
+      plan="$full"$'\n'"$(grep -v '^#END' <<< "$chain" || true)"
+      ;;
+    since)
+      if ! [[ "$since" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]]; then
+        err "Give the date as YYYY-MM-DD (is \"$since\")."
+        return 2
+      fi
+      chain="$(snapshot_chain "$since" <<< "$rows")"
+      plan="$(grep -v '^#END' <<< "$chain" || true)"
+      IFS=$'\t' read -r _ reached newest <<< "$(grep '^#END' <<< "$chain")"
+      if [ -z "$plan" ] && [ "$reached" \< "$newest" ]; then
+        err "No snapshot builds on $since - the deltas only reach back to the dates in the manifest."
+        echo "  Use 'Full + all changes up to today' instead."
+        return 1
+      fi
+      if [ -z "$plan" ]; then
+        ok "A catalog with the data of $since is up to date ($newest is the newest snapshot)."
+        return 0
+      fi
+      ;;
+    *) err "Unknown snapshot type: $kind (daily, full, chain or since:YYYY-MM-DD)"; return 2 ;;
   esac
-  if [ -z "$row" ]; then
+  plan="$(sed '/^$/d' <<< "$plan")"
+  if [ -z "$plan" ]; then
     err "No ${kind:-daily} snapshot is available."
     return 1
   fi
-  IFS=$'\t' read -r type date size checksum path based <<< "$row"
-  if [[ "$path" == *..* ]] || ! [[ "$path" =~ ^[A-Za-z0-9._/-]+$ ]]; then
-    err "Unexpected snapshot path in the manifest: $path"
-    return 1
+  if [ "$kind" = "chain" ] || [ "$kind" = "since" ]; then
+    IFS=$'\t' read -r _ reached newest <<< "$(grep '^#END' <<< "$chain")"
+    if [ "$reached" \< "$newest" ]; then
+      warn "The chain reaches $reached; newer snapshots ($newest) do not build on it and are left out."
+    fi
   fi
 
   dir="$WORK_DIR/snapshots"
   mkdir -p -- "$dir"
-  dest="$dir/$date-$type.tar.gz"
-  if [ -f "$dest" ] && [ -n "$checksum" ] && [ "$(sha256sum -- "$dest" | cut -d' ' -f1)" = "${checksum#sha256:}" ]; then
-    ok "Already downloaded: $dest"
-    return 0
-  fi
+  total=0
+  count=0
+  while IFS=$'\t' read -r type date size checksum path based; do
+    if [[ "$path" == *..* ]] || ! [[ "$path" =~ ^[A-Za-z0-9._/-]+$ ]]; then
+      err "Unexpected snapshot path in the manifest: $path"
+      return 1
+    fi
+    count=$((count + 1))
+    dest="$dir/$date-$type.tar.gz"
+    if ! { [ -f "$dest" ] && [ -n "$checksum" ] && [ "$(sha256sum -- "$dest" | cut -d' ' -f1)" = "${checksum#sha256:}" ]; } && [[ "$size" =~ ^[0-9]+$ ]]; then
+      total=$((total + size))
+    fi
+  done <<< "$plan"
   free_kb="$(df -Pk -- "$dir" | awk 'NR == 2 { print $4 }')" || free_kb=0
-  if [[ "$size" =~ ^[0-9]+$ ]] && [ "$size" -gt $((free_kb * 1024)) ]; then
-    err "Not enough free space in $dir: $(human_size "$size") needed, $(human_size "$((free_kb * 1024))") free."
+  if [ "$total" -gt $((free_kb * 1024)) ]; then
+    err "Not enough free space in $dir: $(human_size "$total") needed, $(human_size "$((free_kb * 1024))") free."
     return 1
   fi
+  planfile="$dir/plan-$(date +%Y%m%d-%H%M%S)-$$.tsv"
+  printf '%s\n' "$plan" > "$planfile"
 
   if [ "$mode" = "interactive" ] && [ -n "$SCRIPT_PATH" ]; then
     rc=0
-    run_job "Snapshot download ($type $date, $(human_size "$size"))" "$key" -- snapshot_fetch "$type" "$date" "$size" "$checksum" "$path" "$based" || rc=$?
+    if [ "$count" -eq 1 ]; then
+      IFS=$'\t' read -r type date size _ <<< "$plan"
+      title="Snapshot download ($(snapshot_name "$plan"), $(human_size "$size"))"
+    else
+      title="Snapshot download ($count files up to $(tail -n 1 <<< "$plan" | cut -f2), $(human_size "$total"))"
+    fi
+    run_job "$title" "$key" -- snapshot_plan_fetch "$planfile" || rc=$?
+    if [ "$rc" -ne 3 ]; then
+      rm -f -- "$planfile"
+    fi
     case "$rc" in
       0)
-        if confirm "Import $dest into the local catalog now?" n; then
-          import_snapshot "$dest"
+        chainfile="$(ls -1t -- "$dir"/chain-*.tsv 2>/dev/null | head -n 1)" || chainfile=""
+        if [ "$count" -gt 1 ] && [ -n "$chainfile" ]; then
+          if confirm "Import the $count files into the local catalog now, one after the other?" n; then
+            import_chain "$chainfile"
+          else
+            echo "  Import them later with option 19 (it offers the whole chain)."
+          fi
         else
-          echo "  Import it later with option 19."
+          IFS=$'\t' read -r type date _ <<< "$plan"
+          if confirm "Import $dir/$date-$type.tar.gz into the local catalog now?" n; then
+            import_snapshot "$dir/$date-$type.tar.gz"
+          else
+            echo "  Import it later with option 19."
+          fi
         fi
         ;;
       3) return 3 ;;
       *) return 1 ;;
     esac
   else
+    rc=0
     trap 'snapshot_cleanup; exit 130' INT TERM
-    SNAP_KEY="$key" snapshot_fetch "$type" "$date" "$size" "$checksum" "$path" "$based"
+    SNAP_KEY="$key" snapshot_plan_fetch "$planfile" || rc=$?
     trap - INT TERM
+    return "$rc"
+  fi
+}
+
+# The choice of what to download. Sets SNAP_KIND (chain, since, daily, full) and SNAP_SINCE;
+# fails when cancelled.
+SNAP_KIND=""
+SNAP_SINCE=""
+snapshot_choose() {
+  local rows="$1" full="$2" daily="$3" choice fdate fsize ddate dsize dbased chain reached newest n total line nd n7 n30
+  SNAP_KIND=""
+  SNAP_SINCE=""
+  nd="$(grep -c $'^daily\t' <<< "$rows" || true)"
+  n7="$(grep -c $'^cumulative-7d\t' <<< "$rows" || true)"
+  n30="$(grep -c $'^cumulative-30d\t' <<< "$rows" || true)"
+  echo
+  if [ -n "$full" ]; then
+    IFS=$'\t' read -r _ fdate fsize _ <<< "$full"
+    chain="$(snapshot_chain "$fdate" <<< "$rows")"
+    IFS=$'\t' read -r _ reached newest <<< "$(grep '^#END' <<< "$chain")"
+    n=0
+    total="$fsize"
+    while IFS=$'\t' read -r _ _ dsize _; do
+      n=$((n + 1))
+      total=$((total + dsize))
+    done < <(grep -v '^#END' <<< "$chain" || true)
+    ui_box "$(ui_width)" "Catalog snapshots $UI_SEP $CATALOG_CLOUD_URL" \
+      "Full snapshot $fdate ($(human_size "$fsize")) $UI_SEP $nd daily $UI_SEP $n7 weekly $UI_SEP $n30 monthly $UI_SEP newest data ${newest:-$fdate}"
+    printf '   %s %s  %s  %s\n' "${C_BLD}1$C_RST" "$(menu_icon run)" "$(ui_pad "Full + all changes up to today" 34)" "full $fdate + $n delta(s) $UI_SEP $(human_size "$total") $C_DIM(new installation)$C_RST"
+  else
+    ui_box "$(ui_width)" "Catalog snapshots $UI_SEP $CATALOG_CLOUD_URL" "No full snapshot in the manifest $UI_SEP $nd daily $UI_SEP $n7 weekly $UI_SEP $n30 monthly"
+    printf '   %s %s  %s  %s\n' "${C_BLD}1$C_RST" "$(menu_icon run)" "$(ui_pad "Full + all changes up to today" 34)" "${C_DIM}not available$C_RST"
+  fi
+  printf '   %s %s  %s  %s\n' "${C_BLD}2$C_RST" "$(menu_icon run)" "$(ui_pad "Changes since a date" 34)" "${C_DIM}deltas only, for a catalog that is behind$C_RST"
+  if [ -n "$daily" ]; then
+    IFS=$'\t' read -r _ ddate dsize _ _ dbased <<< "$daily"
+    printf '   %s %s  %s  %s\n' "${C_BLD}3$C_RST" "$(menu_icon run)" "$(ui_pad "Latest daily snapshot   $ddate" 34)" "$(human_size "$dsize") $C_DIM(applies on top of ${dbased:-the previous state})$C_RST"
+  else
+    printf '   %s %s  %s  %s\n' "${C_BLD}3$C_RST" "$(menu_icon run)" "$(ui_pad "Latest daily snapshot" 34)" "${C_DIM}none available$C_RST"
+  fi
+  if [ -n "$full" ]; then
+    printf '   %s %s  %s  %s\n' "${C_BLD}4$C_RST" "$(menu_icon run)" "$(ui_pad "Latest full snapshot    $fdate" 34)" "$(human_size "$fsize") $C_DIM(for a new installation)$C_RST"
+  else
+    printf '   %s %s  %s  %s\n' "${C_BLD}4$C_RST" "$(menu_icon run)" "$(ui_pad "Latest full snapshot" 34)" "${C_DIM}none available$C_RST"
+  fi
+  printf '   %s    %s\n' "${C_BLD}0$C_RST" "${C_DIM}cancel$C_RST"
+  echo
+  echo "  ${C_DIM}Servers with internet access: option 20 lets the Catalog fetch the changes itself every day.$C_RST"
+  ui_ask choice "Select [1]:" || choice="0"
+  case "${choice:-1}" in
+    1) SNAP_KIND="chain" ;;
+    2)
+      ui_ask SNAP_SINCE "Date of the newest data in the local catalog (YYYY-MM-DD):" || SNAP_SINCE=""
+      if [ -z "$SNAP_SINCE" ]; then
+        info "Cancelled."
+        return 1
+      fi
+      SNAP_KIND="since"
+      ;;
+    3) SNAP_KIND="daily" ;;
+    4) SNAP_KIND="full" ;;
+    *) info "Cancelled."; return 1 ;;
+  esac
+}
+
+# Worker: snapshot_plan_fetch PLANFILE - downloads the archives of the plan in order and writes the
+# chain file the import uses (key from the job secret or SNAP_KEY).
+snapshot_plan_fetch() {
+  local planfile="$1" key n=0 count dir type date size checksum path based chainfile line
+  local -a lines=()
+  key="$(job_secret_take)"
+  SNAP_KEY="${key:-${SNAP_KEY:-}}"
+  mapfile -t lines < "$planfile"
+  rm -f -- "$planfile"
+  count="${#lines[@]}"
+  dir="$WORK_DIR/snapshots"
+  for line in "${lines[@]}"; do
+    n=$((n + 1))
+    IFS=$'\t' read -r type date size checksum path based <<< "$line"
+    if [ "$count" -gt 1 ]; then
+      echo
+      info "[$n/$count] $(snapshot_name "$line")"
+    fi
+    if ! snapshot_fetch "$type" "$date" "$size" "$checksum" "$path" "$based" "$(if [ "$count" -gt 1 ]; then printf '[%s/%s] %s' "$n" "$count" "$(snapshot_name "$line")"; else printf 'Downloading'; fi)"; then
+      if [ "$count" -gt 1 ]; then
+        err "Stopped at $(snapshot_name "$line") - the files after it were not downloaded."
+      fi
+      return 1
+    fi
+  done
+  if [ "$count" -gt 1 ]; then
+    IFS=$'\t' read -r type date _ <<< "${lines[0]}"
+    chainfile="$dir/chain-$date-$type-to-$(cut -f2 <<< "${lines[count - 1]}").tsv"
+    printf '%s\n' "${lines[@]}" > "$chainfile"
+    echo
+    ok "$count snapshots downloaded. Apply them in this order (option 19 does it):"
+    n=0
+    for line in "${lines[@]}"; do
+      n=$((n + 1))
+      IFS=$'\t' read -r type date _ <<< "$line"
+      echo "   $n. $date-$type.tar.gz"
+    done
   fi
 }
 
@@ -2399,7 +2591,7 @@ snapshot_cleanup() {
 
 # Worker: snapshot_fetch TYPE DATE SIZE CHECKSUM PATH BASED (key from the job secret or SNAP_KEY)
 snapshot_fetch() {
-  local type="$1" date="$2" size="$3" checksum="$4" path="$5" based="$6" key dir dest code actual pid codefile
+  local type="$1" date="$2" size="$3" checksum="$4" path="$5" based="$6" label="${7:-Downloading}" key dir dest code actual pid codefile
   key="$(job_secret_take)"
   key="${key:-${SNAP_KEY:-}}"
   if [ -z "$key" ]; then
@@ -2421,7 +2613,7 @@ snapshot_fetch() {
     -o "$dest.part" -w '%{http_code}' "${CATALOG_CLOUD_URL%/}/v3/synchronization/snapshot/$path" \
     <<< "header = \"X-Api-Key: $key\"" > "$codefile" &
   pid=$!
-  job_watch_bytes "$pid" "$dest.part" "$size" "Downloading"
+  job_watch_bytes "$pid" "$dest.part" "$size" "$label"
   wait "$pid" || true
   code="$(cat -- "$codefile")"
   rm -f -- "$codefile"
@@ -2457,7 +2649,7 @@ snapshot_fetch() {
   mv -f -- "$dest.part" "$dest"
   JOB_CLEANUP=""
   ok "Snapshot saved: $dest ($(human_size "$(stat -c %s -- "$dest")"), sha256 verified)"
-  if [ "$type" = "daily" ]; then
+  if [ "$type" = "daily" ] && [ -z "$JOB_DIR" ]; then
     echo "  A daily snapshot applies on top of a catalog at ${based:-the previous day}; a new installation needs the full snapshot."
   fi
 }
@@ -2677,6 +2869,107 @@ watch_operation() {
   return 1
 }
 
+# catalog_fixed_upload_limit VERSION -> true for Catalog 25.x and older: 10 GB per upload, not configurable
+catalog_fixed_upload_limit() {
+  [[ "$1" =~ ^([0-9]+)\. ]] && [ "${BASH_REMATCH[1]}" -le 25 ]
+}
+
+# Bytes the local catalog accepts in one upload: Catalog 25.x has a fixed limit of 10 GB, newer
+# versions take Synchronization__MaxUploadFileSize (SYNC_MAX_UPLOAD in .env, 8GB when it is missing).
+upload_limit() {
+  local version value num unit
+  version=""
+  if command -v docker >/dev/null 2>&1 && detect_compose 2>/dev/null; then
+    version="$(running_tag catalog-web 2>/dev/null)" || version=""
+  fi
+  if ! [[ "$version" =~ ^[0-9]+\. ]]; then
+    version="$CATALOG_VERSION"
+  fi
+  if catalog_fixed_upload_limit "$version"; then
+    printf '%s' 10737418239
+    return 0
+  fi
+  value="$(env_value SYNC_MAX_UPLOAD 2>/dev/null)" || value=""
+  value="${value:-8GB}"
+  if [[ "$value" =~ ^([0-9]+)(GB|MB|KB)?$ ]]; then
+    num="${BASH_REMATCH[1]}"
+    unit="${BASH_REMATCH[2]}"
+    case "$unit" in
+      GB) printf '%s' $((num * 1024 * 1024 * 1024)) ;;
+      MB) printf '%s' $((num * 1024 * 1024)) ;;
+      KB) printf '%s' $((num * 1024)) ;;
+      *) printf '%s' "$num" ;;
+    esac
+  else
+    printf '%s' $((8 * 1024 * 1024 * 1024))
+  fi
+}
+
+# upload_fits FILE SIZE -> fails with an explanation when the file is larger than the upload limit
+upload_fits() {
+  local limit
+  limit="$(upload_limit)"
+  if [ "$2" -le "$limit" ]; then
+    return 0
+  fi
+  err "$(basename -- "$1") is $(human_size "$2"), the local catalog accepts at most $(human_size "$limit") per upload."
+  if [ "$limit" = 10737418239 ]; then
+    echo "  Catalog 25.x has a fixed limit of 10 GB. On a server with internet access option 20 lets the"
+    echo "  Catalog fetch the data itself; otherwise upgrade to 26.x (option 21) and import again."
+  else
+    echo "  Raise SYNC_MAX_UPLOAD in the settings (option 1), then apply it with option 2 and 6."
+  fi
+  return 1
+}
+
+# import_chain CHAINFILE -> uploads the files of a downloaded chain, in order, each after the previous one finished
+import_chain() {
+  local chainfile="$1" mode="${2:-interactive}" type date size file
+  local -a files=()
+  if [ -z "$chainfile" ] || [ ! -f "$chainfile" ]; then
+    err "No downloaded chain${chainfile:+ at $chainfile} - download one with option 17 ('Full + all changes up to today')."
+    return 1
+  fi
+  while IFS=$'\t' read -r type date size _; do
+    file="$WORK_DIR/snapshots/$date-$type.tar.gz"
+    if [ ! -f "$file" ]; then
+      err "$(basename -- "$file") of the chain is missing - download it again with option 17."
+      return 1
+    fi
+    upload_fits "$file" "$(stat -c %s -- "$file")" || return 1
+    files+=("$file")
+  done < "$chainfile"
+  if [ "${#files[@]}" -eq 0 ]; then
+    err "$chainfile lists no snapshot."
+    return 1
+  fi
+  local_auth_obtain "$mode" || return 1
+  if [ "${#files[@]}" -gt 1 ] && [[ "$LOCAL_AUTH" == "Authorization: Bearer "* ]]; then
+    warn "A login stays valid for about one hour - for a long chain store a local API key (option 18)."
+  fi
+  if [ "$mode" = "interactive" ] && [ -n "$SCRIPT_PATH" ]; then
+    run_job "Snapshot import (${#files[@]} files up to $(tail -n 1 "$chainfile" | cut -f2))" "$LOCAL_AUTH" -- import_chain_run "${files[@]}"
+  else
+    import_chain_run "${files[@]}"
+  fi
+}
+
+# Worker: import_chain_run FILE... - one upload after the other; stops at the first failure
+import_chain_run() {
+  local file n=0
+  for file in "$@"; do
+    n=$((n + 1))
+    echo
+    info "[$n/$#] $(basename -- "$file")"
+    job_step "[$n/$#] Importing $(basename -- "$file")"
+    if ! import_upload "$file"; then
+      err "Import stopped at $(basename -- "$file") - the files after it were not imported."
+      return 1
+    fi
+  done
+  ok "All $# snapshots imported."
+}
+
 # import_snapshot FILE [interactive|cli]
 import_snapshot() {
   local file="$1" mode="${2:-interactive}" size
@@ -2689,9 +2982,7 @@ import_snapshot() {
     return 1
   fi
   size="$(stat -c %s -- "$file")"
-  if [ "$size" -gt $((8 * 1024 * 1024 * 1024)) ]; then
-    warn "The file is larger than 8 GB, the default upload limit of the catalog (Synchronization__MaxUploadFileSize)."
-  fi
+  upload_fits "$file" "$size" || return 1
   if [[ "$(basename -- "$file")" == *-daily.tar.gz ]] && [ "$mode" = "interactive" ]; then
     warn "A daily snapshot only applies on top of a catalog that has the previous day's data."
     if ! confirm "Import $(basename -- "$file") anyway?" y; then
@@ -2743,7 +3034,10 @@ import_upload() {
 }
 
 import_snapshot_menu() {
-  local files=() f i choice
+  local files=() chains=() f i choice n total size names line
+  while IFS= read -r f; do
+    chains+=("$f")
+  done < <(ls -1t -- "$WORK_DIR"/snapshots/chain-*.tsv 2>/dev/null)
   while IFS= read -r f; do
     files+=("$f")
   done < <(ls -1t -- "$WORK_DIR"/snapshots/*.tar.gz 2>/dev/null)
@@ -2751,17 +3045,43 @@ import_snapshot_menu() {
     warn "No snapshot in $WORK_DIR/snapshots - download one with option 17."
     return 0
   fi
-  echo " Snapshots in $WORK_DIR/snapshots (newest first):"
-  for i in "${!files[@]}"; do
-    printf '   %d) %s  %s\n' "$((i + 1))" "$(basename -- "${files[i]}")" "$(human_size "$(stat -c %s -- "${files[i]}")")"
+  echo
+  ui_box "$(ui_width)" "Import into the local catalog $UI_SEP $(local_url)" "Snapshots in $WORK_DIR/snapshots, newest first. A chain is imported file by file, in order."
+  i=0
+  for f in "${chains[@]}"; do
+    i=$((i + 1))
+    n=0
+    total=0
+    names=""
+    while IFS= read -r line; do
+      IFS=$'\t' read -r _ _ size _ <<< "$line"
+      n=$((n + 1))
+      total=$((total + size))
+      if [ "$n" -eq 1 ]; then
+        names="$(snapshot_name "$line")"
+      fi
+    done < "$f"
+    if [ "$n" -gt 2 ]; then
+      names="$names $UI_RARR $((n - 2)) more $UI_RARR $(snapshot_name "$(tail -n 1 "$f")")"
+    elif [ "$n" -eq 2 ]; then
+      names="$names $UI_RARR $(snapshot_name "$(tail -n 1 "$f")")"
+    fi
+    printf '   %s %s  %s  %s\n' "$C_BLD$i$C_RST" "$(menu_icon run)" "$(ui_pad "Chain up to $(tail -n 1 "$f" | cut -f2)" 34)" "$names $UI_SEP $n files, $(human_size "$total")"
   done
-  echo "   0) Cancel"
-  read -r -p " Select [1]: " choice || choice="0"
+  for f in "${files[@]}"; do
+    i=$((i + 1))
+    printf '   %s %s  %s  %s\n' "$C_BLD$i$C_RST" "$(menu_icon run)" "$(ui_pad "$(basename -- "$f")" 34)" "$(human_size "$(stat -c %s -- "$f")")"
+  done
+  printf '   %s    %s\n' "${C_BLD}0$C_RST" "${C_DIM}cancel$C_RST"
+  echo
+  ui_ask choice "Select [1]:" || choice="0"
   choice="${choice:-1}"
-  if [[ "$choice" =~ ^[0-9]+$ ]] && [ "$choice" -ge 1 ] && [ "$choice" -le "${#files[@]}" ]; then
-    import_snapshot "${files[choice - 1]}"
-  else
+  if ! [[ "$choice" =~ ^[0-9]+$ ]] || [ "$choice" -lt 1 ] || [ "$choice" -gt "$i" ]; then
     info "Cancelled."
+  elif [ "$choice" -le "${#chains[@]}" ]; then
+    import_chain "${chains[choice - 1]}"
+  else
+    import_snapshot "${files[choice - 1 - ${#chains[@]}]}"
   fi
 }
 
@@ -4214,8 +4534,8 @@ job_bytes() {
 job_class() {
   case "$1" in
     do_up|do_down|do_restart|do_pull|do_reset|upgrade_run|upgrade_rollback|patch_apply) printf 'stack' ;;
-    snapshot_fetch) printf 'snapshot' ;;
-    import_upload|self_sync_run) printf 'import' ;;
+    snapshot_fetch|snapshot_plan_fetch) printf 'snapshot' ;;
+    import_upload|import_chain_run|self_sync_run) printf 'import' ;;
   esac
 }
 
@@ -5069,6 +5389,10 @@ check_settings() {
     err "CATALOG_VERSION must not be empty."
     problems=$((problems + 1))
   fi
+  if ! [[ "${SYNC_MAX_UPLOAD:-}" =~ ^[0-9]+(GB|MB|KB)?$ ]]; then
+    err "SYNC_MAX_UPLOAD must be a size like 32GB, 8000MB or a number of bytes (is \"${SYNC_MAX_UPLOAD:-}\")."
+    problems=$((problems + 1))
+  fi
   [ "$problems" -eq 0 ]
 }
 
@@ -5134,6 +5458,11 @@ QUEUE_PREFIX=${QUEUE_PREFIX}
 FILESTORAGE_BUCKET=${FILESTORAGE_BUCKET}
 FILESTORAGE_LOCATION=${FILESTORAGE_LOCATION}
 AUTOSYNC_CRON=${AUTOSYNC_CRON}
+EOF
+  if ! catalog_fixed_upload_limit "$CATALOG_VERSION"; then
+    printf 'SYNC_MAX_UPLOAD=%s\n' "$SYNC_MAX_UPLOAD" >> "$ENV_FILE"
+  fi
+  cat >> "$ENV_FILE" <<EOF
 VULNERABILITIES_CACHING_CRON=${VULNERABILITIES_CACHING_CRON}
 ASPNETCORE_URLS=${ASPNETCORE_URLS}
 ASPNETCORE_HTTP_PORTS=${ASPNETCORE_HTTP_PORTS}
@@ -5282,6 +5611,11 @@ EOF
       ASPNETCORE_URLS: "${ASPNETCORE_URLS}"
       ASPNETCORE_HTTP_PORTS: "${ASPNETCORE_HTTP_PORTS}"
       Synchronization__AutoSyncJobCronExpression: "${AUTOSYNC_CRON}"
+EOF
+    if ! catalog_fixed_upload_limit "$CATALOG_VERSION"; then
+      echo '      Synchronization__MaxUploadFileSize: "${SYNC_MAX_UPLOAD:-8GB}"'
+    fi
+    cat <<'EOF'
       OpenSearch__Urls: '["${OPENSEARCH_URL}"]'
       Vulnerabilities__CachingJobCronExpression: "${VULNERABILITIES_CACHING_CRON}"
 
@@ -6115,8 +6449,8 @@ $(help_item 13 run "Stop the stack" "docker compose down; the data volumes are k
 $(help_item J view "Jobs" "Long tasks run as jobs: they continue when you leave the menu or the" "SSH session ends. Follow, cancel or read their log here.")
 
 ${c}CATALOG DATA$r
-$(help_item 17 run "Download snapshot" "Downloads catalog data from $CATALOG_CLOUD_URL (needs an API key).")
-$(help_item 19 run "Import snapshot" "Uploads a downloaded snapshot into the local Catalog.")
+$(help_item 17 run "Download snapshot" "Catalog data from $CATALOG_CLOUD_URL (needs an API key): the full" "snapshot + all changes up to today, the changes since a date, or one file.")
+$(help_item 19 run "Import snapshot" "Uploads downloaded snapshots into the local Catalog; a chain file by" "file, in order. Catalog 25.x accepts at most 10 GB per file.")
 $(help_item 20 run "Daily self-sync" "Lets the local Catalog synchronize itself every day (servers with" "internet access).")
 $(help_item 18 edit "API keys" "Shows, changes, tests and deletes the keys for the online and the" "local Catalog. Keys are tested before they are saved.")
 
@@ -6570,8 +6904,11 @@ Commands:
   adopt [FOLDER]              Take over an existing installation (its .env, docker-compose.yml and data)
   jobs [follow N|cancel N|log N]  Background tasks: list, follow, cancel (cleans up first), log
   download                    Download all images into a new offline bundle folder (+ .tar.gz)
-  snapshot [daily|full]       Download the newest catalog snapshot (needs a stored API key)
+  snapshot [daily|full]       Download the newest daily or full catalog snapshot (needs a stored API key)
+  snapshot chain              Download the full snapshot and all changes up to today, in order
+  snapshot since YYYY-MM-DD   Download only the changes after that date
   import FILE                 Import a snapshot file into the local catalog (needs a stored local key)
+  import-chain [CHAINFILE]    Import a downloaded chain file by file (default: the newest chain)
   versions                    Show the newest Catalog versions on Docker Hub
   set-version VERSION|stable  Select the Catalog version (used by catalog-web and all workers)
   help                        Show this help
@@ -6626,7 +6963,13 @@ main() {
     jobs) jobs_cli "$@" ;;
     __job) job_run "$@" ;;
     download) download_bundle all ;;
-    snapshot) download_snapshot "${1:-daily}" cli ;;
+    snapshot)
+      case "${1:-daily}" in
+        since) download_snapshot "since:${2:-}" cli ;;
+        *) download_snapshot "${1:-daily}" cli ;;
+      esac
+      ;;
+    import-chain) import_chain "${1:-$(ls -1t -- "$WORK_DIR"/snapshots/chain-*.tsv 2>/dev/null | head -n 1)}" cli ;;
     import) import_snapshot "${1:-}" cli ;;
     versions) list_versions ;;
     set-version) set_version_cli "${1:-}" ;;

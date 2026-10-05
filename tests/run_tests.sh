@@ -253,5 +253,13 @@ out="$(printf '0\n' | bash "$D/gen.sh" menu 2>&1)"
 check "CHECK_FOR_UPDATES=false skips lookup" '! grep -q "^curl" "$SHIM_LOG" && ! grep -q "Checking Docker Hub" <<< "$out"'
 check "header plain when disabled" 'grep -q "Installation Portal   (Catalog 26.3.4789.148)$" <<< "$out"'
 
+# Upload limit setting: only Catalog 26 and newer read it (25.x output stays identical to the original)
+D="$(newdir upload26)"; sed -i 's/^CATALOG_VERSION=.*/CATALOG_VERSION="26.3.4789.148"/' "$D/gen.sh"
+bash "$D/gen.sh" generate </dev/null >/dev/null 2>&1
+check "26.x: SYNC_MAX_UPLOAD in .env and compose" 'grep -qx "SYNC_MAX_UPLOAD=32GB" "$D/.env" && grep -qF "Synchronization__MaxUploadFileSize: \"\${SYNC_MAX_UPLOAD:-8GB}\"" "$D/docker-compose.yml" && grep -A1 "^AUTOSYNC_CRON=" "$D/.env" | grep -q "^SYNC_MAX_UPLOAD="'
+sed -i 's/^SYNC_MAX_UPLOAD=.*/SYNC_MAX_UPLOAD="lots"/' "$D/gen.sh"
+out="$(bash "$D/gen.sh" generate </dev/null 2>&1)"; rc=$?
+check "invalid SYNC_MAX_UPLOAD refused" '[ "$rc" -ne 0 ] && grep -q "SYNC_MAX_UPLOAD must be a size" <<< "$out"'
+
 echo "== $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]

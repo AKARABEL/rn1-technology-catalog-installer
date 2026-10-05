@@ -58,9 +58,9 @@ Long tasks run as background jobs: start, pull, restart, stop, snapshot download
 | 7 | Full setup: generate, validate and start |
 | 8 | **Updates**: newest versions of all components on Docker Hub and GHCR, version picker, pinning of floating tags, **Download only** (offline bundle) |
 | 9 to 16 | Status, logs, pull, restart, stop, credentials, URLs and Nginx Proxy Manager steps, prerequisites check |
-| 17 | Download the daily or full catalog snapshot from rayventorycatalog.raynet.de |
+| 17 | Download catalog snapshots from rayventorycatalog.raynet.de: the full snapshot and all changes up to today (default), the changes since a date, or the latest daily or full snapshot |
 | 18 | API keys for the online and the local catalog: show, change, test, delete |
-| 19 | Import a downloaded snapshot into the local catalog |
+| 19 | Import downloaded snapshots into the local catalog; a downloaded chain is imported file by file, in order |
 | 20 | Let the local catalog synchronize itself daily (servers with internet access) |
 | 21 | **Guided upgrade**: Catalog to the newest version, health check, patch updates of the other components |
 | 22 | Update this installer from GitHub; your settings are kept |
@@ -83,8 +83,10 @@ Long tasks run as background jobs: start, pull, restart, stop, snapshot download
 ./rn1-technology-catalog-installer.sh adopt [FOLDER]          take over an existing installation
 ./rn1-technology-catalog-installer.sh download                offline bundle with all images (+ .tar.gz)
 ./rn1-technology-catalog-installer.sh versions | set-version VERSION|stable
-./rn1-technology-catalog-installer.sh snapshot [daily|full]   needs a stored online API key
+./rn1-technology-catalog-installer.sh snapshot [daily|full|chain]   needs a stored online API key (default: daily)
+./rn1-technology-catalog-installer.sh snapshot since YYYY-MM-DD     only the changes after that date
 ./rn1-technology-catalog-installer.sh import FILE             needs a stored local API key
+./rn1-technology-catalog-installer.sh import-chain [CHAINFILE]   a downloaded chain, file by file (default: the newest)
 ```
 
 ## Offline installation
@@ -103,15 +105,34 @@ The bundle contains no `.env`. The target generates its own passwords.
 
 ## Catalog snapshots
 
-- **17** asks for the API key of rayventorycatalog.raynet.de and tests it right away:
-  - 401: invalid or expired key.
-  - 403: the key has no Synchronizer role.
-  - If the key works, you can save it.
+The online catalog publishes its data through the v3 synchronization API (`/v3/synchronization/manifest`):
 
-  It then downloads the newest daily snapshot (or the full one) and verifies its sha256.
-- A daily snapshot only applies on top of a catalog that has the previous day's data. A new installation needs the full snapshot.
-- **19** uploads a snapshot to the local catalog (`/v1/synchronization/snapshot`) and follows the import until it finishes. It needs a local API key (role Synchronizer or Admin) or a local administrator login. The password is never stored.
-- **20** writes the online URL and key into the local catalog's synchronization settings. From then on the catalog downloads and imports the right snapshots itself, every day at `AUTOSYNC_CRON`.
+- one **full** snapshot: the complete catalog of one day;
+- **daily** deltas for about the last 31 days, each building on the day before;
+- **weekly** and **monthly** deltas that cover 7 or 30 days in one file.
+
+**17** asks for the API key of rayventorycatalog.raynet.de and tests it right away (401: invalid or expired key; 403: the key has no Synchronizer role). If the key works, you can save it. Then you choose what to download:
+
+| Choice | Downloads | For |
+|---|---|---|
+| 1 (default) | Full + all changes up to today: the full snapshot and the deltas that bring it to the newest date | a new installation |
+| 2 | Changes since a date: only the deltas after the date of the newest data in the local catalog | a catalog that is behind |
+| 3 | The latest daily delta | a catalog that has the previous day's data |
+| 4 | The latest full snapshot only | |
+
+- For 1 and 2 the script takes, step by step, the delta that builds on the current state and reaches furthest, so a weekly file replaces seven daily ones. Example from 2026-09-01: monthly up to 2026-10-01, weekly up to 2026-10-04, daily 2026-10-05.
+- The free disk space is checked first. Every file is verified against its sha256 from the manifest; files that are already there are not downloaded again.
+- With more than one file, `snapshots/chain-<first>-to-<last>.tsv` records the order in which they must be applied.
+- If no delta builds on the given date (it is older than the deltas the online catalog keeps), the script says so. Use choice 1 then.
+
+**19** lists the downloaded chains first, then the single files, and uploads to the local catalog (`/v1/synchronization/snapshot`). It follows each import until it finishes. A chain is imported file by file: the next upload starts only after the previous import finished, and the import stops at the first failure. It needs a local API key (role Synchronizer or Admin) or a local administrator login. The password is never stored. A login stays valid for about one hour, so use an API key for long chains.
+
+Every file must fit the upload limit of the local catalog. The script checks this before the upload:
+
+- Catalog 25.x accepts at most 10 GB per file, a fixed limit. If the full snapshot is larger, use **20** (servers with internet access) or upgrade to 26.x with **21** first.
+- Catalog 26.x takes the limit from `SYNC_MAX_UPLOAD` in the settings (default `32GB`; the Catalog itself defaults to 8 GB). It is passed to catalog-web as `Synchronization__MaxUploadFileSize`.
+
+**20** writes the online URL and key into the local catalog's synchronization settings. From then on the catalog downloads and imports the right snapshots itself, every day at `AUTOSYNC_CRON`. On a server with internet access this is the simplest way: no files to move and no upload limit.
 
 API keys and passwords are passed to curl through stdin. They never appear on a command line or in a URL.
 
@@ -139,7 +160,7 @@ These files are created at runtime and are listed in `.gitignore`. Do not commit
 | `.env` (+ `.env.bak-*`) | generated settings including the passwords (mode 600) |
 | `docker-compose.yml` (+ backups) | generated stack definition |
 | `.catalog_api_key`, `.catalog_local_api_key` | stored API keys (mode 600) |
-| `snapshots/` | downloaded catalog snapshots |
+| `snapshots/` | downloaded catalog snapshots and `chain-*.tsv` (the order of a downloaded chain) |
 | `backups/` | MongoDB backups taken before an upgrade (mode 600) |
 | `RN1-Technology-Catalog-*` | offline bundles |
 | `.jobs/` | state and logs of background jobs (mode 700; the newest 25 finished jobs are kept) |
