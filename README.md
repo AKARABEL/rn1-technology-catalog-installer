@@ -13,13 +13,13 @@
 On the server, in the folder where the Catalog should live (the installer keeps `.env`, `docker-compose.yml`, `snapshots/` and `backups/` next to itself):
 
 ```bash
-wget -qO rn1-technology-catalog-installer.sh https://raw.githubusercontent.com/AKARABEL/rn1-technology-catalog-installer/main/rn1-technology-catalog-installer.sh && chmod +x rn1-technology-catalog-installer.sh && ./rn1-technology-catalog-installer.sh
+wget -nv -O rn1-technology-catalog-installer.sh https://raw.githubusercontent.com/AKARABEL/rn1-technology-catalog-installer/main/rn1-technology-catalog-installer.sh && chmod +x rn1-technology-catalog-installer.sh && ./rn1-technology-catalog-installer.sh
 ```
 
 Then choose **7** (generate + validate + start). The settings are at the top of `rn1-technology-catalog-installer.sh`; option **1** opens them in `vi`.
 
 - Run the script as a file, as shown above. Piping it into bash (`wget -O- ... | bash`) does not work, because the menu needs the keyboard and the script stores its settings in its own file.
-- **Later updates:** use option **22** (or `./rn1-technology-catalog-installer.sh self-update`) instead of the `wget` line. It downloads the newest version and keeps all your settings. The previous version is kept as `rn1-technology-catalog-installer.sh.bak-<timestamp>`. Running the `wget` line again would overwrite your settings.
+- **Later updates:** use option **22** (or `./rn1-technology-catalog-installer.sh self-update`) instead of the `wget` line. It downloads the newest version and keeps all your settings. The previous version is kept as `rn1-technology-catalog-installer.sh.bak-<timestamp>`. Running the `wget` line again would overwrite your settings. If the line seems to do nothing, the download failed: `wget -nv` prints why (network, DNS, proxy).
 
 ## A Catalog already runs on the server
 
