@@ -625,6 +625,31 @@ print_versions() {
   done <<< "$HUB_VERSIONS"
 }
 
+# The newest versions (at most 4) as a numbered list with markers.
+print_version_choices() {
+  local generated="$1" v i=0 marker
+  while IFS= read -r v; do
+    if [ "$i" -ge 4 ]; then
+      break
+    fi
+    i=$((i + 1))
+    marker=""
+    if [ -n "$HUB_STABLE" ] && [ "$v" = "$HUB_STABLE" ]; then
+      marker="$marker  $C_YLW$UI_STAR stable$C_RST"
+    fi
+    if [ "$v" = "$CATALOG_VERSION" ]; then
+      marker="$marker  $C_GRN$UI_DOT selected$C_RST"
+    fi
+    if [ -n "$generated" ] && [ "$v" = "$generated" ] && [ "$generated" != "$CATALOG_VERSION" ]; then
+      marker="$marker  $C_DIM$UI_DOT in $ENV_FILE$C_RST"
+    fi
+    if is_version "$CATALOG_VERSION" && version_gt "$CATALOG_VERSION" "$v"; then
+      marker="$marker  ${C_DIM}older$C_RST"
+    fi
+    printf '   %s  %s%s\n' "$C_BLD$i$C_RST" "$(ui_pad "$v" 16)" "$marker"
+  done <<< "$HUB_VERSIONS"
+}
+
 # Menu: pick a version from Docker Hub, store it as CATALOG_VERSION and optionally apply it.
 select_version() {
   local mode="${1:-}" choice selected="" generated count
@@ -643,10 +668,13 @@ select_version() {
 
   while [ -z "$selected" ]; do
     echo
-    echo "Selected in $SCRIPT_NAME: $(version_with_tag "$CATALOG_VERSION")"
-    print_versions numbered
-    echo "  0) Cancel"
-    read -r -p "Select a version [0]: " choice || choice="0"
+    ui_box "$(ui_width)" "Catalog version" \
+      "Selected in $SCRIPT_NAME: $C_BLD$(ui_version "$CATALOG_VERSION")$C_RST$(if [ -n "$generated" ]; then printf '   %s %s in %s: %s%s' "$C_DIM" "$UI_SEP" "$ENV_FILE" "$generated" "$C_RST"; fi)" \
+      "${C_DIM}catalog-web and all 4 workers use this version$C_RST"
+    print_version_choices "$generated"
+    printf '   %s  %s\n' "${C_BLD}0$C_RST" "${C_DIM}cancel$C_RST"
+    echo
+    ui_ask choice "Select a version [0]:" || choice="0"
     choice="${choice:-0}"
     if [ "$choice" = "0" ]; then
       info "Cancelled - nothing was changed."
@@ -1071,10 +1099,12 @@ current_label() {
 }
 
 show_updates() {
-  local i=1 key first tag resolved versions newest current cat_resolved
-  echo
-  printf '%s\n\n' "${C_BLD}Raynet One Technology Catalog - Installation Portal - Updates${C_RST}   (checked $UPD_CHECKED - Docker Hub and GHCR)"
-  printf '  %-2s %-24s %-34s %-30s %s\n' "#" "Component" "Current" "Newest" "Status"
+  local i=1 key first tag resolved versions newest cat_resolved w_cur=34 w_new=31 head
+  local -a rows=()
+  if [ "$(ui_width)" -lt 112 ]; then
+    w_cur=26
+    w_new=24
+  fi
 
   cat_resolved="$CATALOG_VERSION"
   if ! is_version "$cat_resolved"; then
@@ -1088,12 +1118,12 @@ show_updates() {
     if [ -z "$cat_resolved" ]; then
       ST_TEXT="version behind the tag unknown"
     fi
-    newest="$(version_with_tag "${HUB_VERSIONS%%$'\n'*}")"
+    newest="$(ui_version "${HUB_VERSIONS%%$'\n'*}")"
   else
     row_status catalog "" ""
     newest="-"
   fi
-  printf '  %-2s %-24s %-34s %-30s %s\n' "$i" "Catalog + 4 workers" "$(current_label "$CATALOG_VERSION" "${cat_resolved:-$CATALOG_VERSION}")" "$newest" "$ST_COLOR$ST_TEXT$C_RST"
+  rows+=("$(ui_pad "$C_BLD$i$C_RST" 4)$(ui_pad "Catalog + 4 workers" 26)$(ui_pad "$(ui_current "$CATALOG_VERSION" "${cat_resolved:-$CATALOG_VERSION}")" "$w_cur")$(ui_pad "$newest" "$w_new")$(ui_badge "$ST_TEXT" "$ST_COLOR")")
 
   for key in "${UPD_KEYS[@]}"; do
     i=$((i + 1))
@@ -1118,9 +1148,16 @@ show_updates() {
     if [ "$key" = "npm" ] && [ "$INSTALL_NGINX_PROXY_MANAGER" != "true" ]; then
       ST_TEXT="$ST_TEXT (disabled)"
     fi
-    current="$(current_label "$tag" "$resolved")"
-    printf '  %-2s %-24s %-34s %-30s %s\n' "$i" "$C_LABEL" "$current" "$newest" "$ST_COLOR$ST_TEXT$C_RST"
+    rows+=("$(ui_pad "$C_BLD$i$C_RST" 4)$(ui_pad "$C_LABEL" 26)$(ui_pad "$(ui_current "$tag" "$resolved")" "$w_cur")$(ui_pad "$newest" "$w_new")$(ui_badge "$ST_TEXT" "$ST_COLOR")")
   done
+
+  head="Checked $UPD_CHECKED $UI_SEP Docker Hub and GHCR $UI_SEP linux/amd64"
+  if [ -f "$ENV_FILE" ]; then
+    head="$head $UI_SEP $ENV_FILE has Catalog $(env_value CATALOG_IMAGE | sed 's/.*://')"
+  fi
+  ui_screen "Updates" "$head"
+  printf '  %s\n' "$C_DIM$(ui_pad "#" 4)$(ui_pad "COMPONENT" 26)$(ui_pad "CURRENT" "$w_cur")$(ui_pad "NEWEST" "$w_new")STATUS$C_RST"
+  printf '  %s\n' "${rows[@]}"
 }
 
 # Up to 4 versions, newest first: the 2 newest of the current major, the newest
@@ -1168,23 +1205,24 @@ pick_component() {
 
   while [ -z "$selected" ]; do
     echo
-    echo " $C_LABEL   current: $(current_label "$tag" "$resolved")"
+    ui_box "$(ui_width)" "$C_LABEL" "Current: $C_BLD$(ui_current "$tag" "$resolved")$C_RST   $C_DIM$UI_SEP images: $C_IMAGES$C_RST"
     i=0
     while IFS= read -r v; do
       i=$((i + 1))
       marker=""
       if [ "$v" = "$resolved" ]; then
-        marker="  (current)"
+        marker="  $C_GRN$UI_DOT current$C_RST"
       elif [ "$C_KIND" != "minio" ] && [[ "$cur_major" =~ ^[0-9]+$ ]] && [ "$(version_major "$v")" -gt "$cur_major" ]; then
-        marker="  ${C_YLW}(major update)${C_RST}"
+        marker="  $C_MAG$UI_MAJOR major update$C_RST"
       fi
       if [ "$key" = "mongo" ] && [ "$(version_major "$v")" -ge 8 ] && kernel_blocks_mongo8; then
-        marker="$marker  ${C_RED}(may fail on this kernel)${C_RST}"
+        marker="$marker  $C_RED$UI_NO may fail on this kernel$C_RST"
       fi
-      printf '   %d) %s%s\n' "$i" "$(version_core "$v")" "$marker"
+      printf '   %s  %s%s\n' "$C_BLD$i$C_RST" "$(ui_pad "$(version_core "$v")" 30)" "$marker"
     done <<< "$list"
-    echo "   0) Cancel"
-    read -r -p " Select a version [0]: " choice || choice="0"
+    printf '   %s  %s\n' "${C_BLD}0$C_RST" "${C_DIM}cancel$C_RST"
+    echo
+    ui_ask choice "Select a version [0]:" || choice="0"
     choice="${choice:-0}"
     if [ "$choice" = "0" ]; then
       info "Cancelled - nothing was changed."
@@ -1308,18 +1346,17 @@ do_updates() {
   while true; do
     show_updates
     echo
-    echo "  1-6) Pick a version    p) Pin floating tags to exact versions    r) Check again"
-    echo "  s) Apply (generate + start)    d) Download only (offline bundle)    0) Back"
-    read -r -p "Select: " choice || choice="0"
+    ui_keys "1-6|pick a version" "p|pin floating tags" "r|check again" "s|apply (generate + start)" "d|offline bundle" "0|back"
+    ui_ask choice "Select:" || choice="0"
     case "$choice" in
-      1) run_action select_version no-apply; reload_settings ;;
-      [2-6]) run_action pick_component "${UPD_KEYS[$((choice - 2))]}"; reload_settings ;;
-      p|P) run_action pin_floating_tags; reload_settings ;;
+      1) run_action select_version no-apply; reload_settings; ui_pause_tty ;;
+      [2-6]) run_action pick_component "${UPD_KEYS[$((choice - 2))]}"; reload_settings; ui_pause_tty ;;
+      p|P) run_action pin_floating_tags; reload_settings; ui_pause_tty ;;
       r|R) collect_updates ;;
-      s|S) run_action apply_updates; reload_settings ;;
-      d|D) run_action download_bundle; reload_settings ;;
+      s|S) run_action apply_updates; reload_settings; ui_pause_tty ;;
+      d|D) run_action download_bundle; reload_settings; ui_pause_tty ;;
       0|"") return 0 ;;
-      *) warn "Unknown option: $choice" ;;
+      *) warn "Unknown option: $choice"; ui_pause_tty ;;
     esac
   done
 }
@@ -1793,16 +1830,17 @@ download_bundle() {
   if [ "$mode" = "interactive" ]; then
     while true; do
       echo
-      echo " Download only - offline bundle   (engine: $engine, platform: linux/amd64)"
+      ui_box "$(ui_width)" "Download only $UI_SEP offline bundle" "Engine $engine $UI_SEP platform linux/amd64 $UI_SEP the images are saved with their checksums and an import script"
       for i in "${!images[@]}"; do
         if [ "${picked[i]}" = "1" ]; then
-          printf '   [x] %d  %s\n' "$((i + 1))" "${images[i]}"
+          printf '   %s %s  %s\n' "$C_GRN$UI_ON$C_RST" "$C_BLD$((i + 1))$C_RST" "${images[i]}"
         else
-          printf '   [ ] %d  %s\n' "$((i + 1))" "${images[i]}"
+          printf '   %s %s  %s\n' "$C_DIM$UI_OFF$C_RST" "$C_BLD$((i + 1))$C_RST" "$C_DIM${images[i]}$C_RST"
         fi
       done
-      echo " Toggle with numbers (e.g. 1 3), a = all, n = none, Enter = start, 0 = cancel"
-      read -r -p " > " choice || choice="0"
+      echo
+      ui_keys "1-${#images[@]}|toggle (e.g. 1 3)" "a|all" "n|none" "Enter|start" "0|cancel"
+      ui_ask choice "Toggle, or Enter to start:" || choice="0"
       case "$choice" in
         "") break ;;
         0) info "Cancelled."; return 0 ;;
@@ -2125,22 +2163,21 @@ api_key_menu() {
     key="$(api_key_stored)"
     lkey=""
     if [ -s "$LOCAL_KEY_FILE" ]; then
-      lkey="$(tr -d ' 
-	' < "$LOCAL_KEY_FILE")"
+      lkey="$(tr -d ' \r\n\t' < "$LOCAL_KEY_FILE")"
     fi
     echo
-    echo " API keys"
-    printf '   Online catalog (%s): %s
-' "$CATALOG_CLOUD_URL" "$(if [ -n "$key" ]; then api_key_mask "$key"; else printf 'none'; fi)"
-    printf '   Local catalog  (%s): %s
-' "$(local_url)" "$(if [ -n "$lkey" ]; then api_key_mask "$lkey"; else printf 'none'; fi)"
-    echo "   1) Show the online key          5) Show the local key"
-    echo "   2) Add / change the online key  6) Add / change the local key"
-    echo "   3) Test the online key          7) Test the local key"
-    echo "   4) Delete the online key        8) Delete the local key"
-    echo "   0) Back"
-    echo " New keys are tested before they are saved."
-    read -r -p " Select: " choice || choice="0"
+    ui_box "$(ui_width)" "API keys" \
+      "$(if [ -n "$key" ]; then printf '%s' "$C_GRN$UI_OK$C_RST"; else printf '%s' "$C_DIM$UI_NO$C_RST"; fi) Online catalog ($CATALOG_CLOUD_URL): $(if [ -n "$key" ]; then api_key_mask "$key"; else printf 'none'; fi)" \
+      "$(if [ -n "$lkey" ]; then printf '%s' "$C_GRN$UI_OK$C_RST"; else printf '%s' "$C_DIM$UI_NO$C_RST"; fi) Local catalog  ($(local_url)): $(if [ -n "$lkey" ]; then api_key_mask "$lkey"; else printf 'none'; fi)" \
+      "${C_DIM}Keys are stored readable only by $(id -un) and tested before they are saved.$C_RST"
+    printf '  %s%s\n' "$C_CYN$(ui_pad "ONLINE CATALOG" 36)$C_RST" "${C_CYN}LOCAL CATALOG$C_RST"
+    printf '   %s  %s%s  %s\n' "${C_BLD}1$C_RST" "$(ui_pad "Show the key" 33)" "${C_BLD}5$C_RST" "Show the key"
+    printf '   %s  %s%s  %s\n' "${C_BLD}2$C_RST" "$(ui_pad "Add / change the key" 33)" "${C_BLD}6$C_RST" "Add / change the key"
+    printf '   %s  %s%s  %s\n' "${C_BLD}3$C_RST" "$(ui_pad "Test the key" 33)" "${C_BLD}7$C_RST" "Test the key"
+    printf '   %s  %s%s  %s\n' "${C_BLD}4$C_RST" "$(ui_pad "${C_RED}Delete the key$C_RST" 33)" "${C_BLD}8$C_RST" "${C_RED}Delete the key$C_RST"
+    echo
+    ui_keys "1-8|choose" "0|back"
+    ui_ask choice "Select:" || choice="0"
     case "$choice" in
       1|5)
         if [ "$choice" = "5" ]; then key="$lkey"; fi
@@ -2987,13 +3024,14 @@ offer_patch_updates() {
   fi
   while true; do
     echo
-    echo " Patch updates in the same series (bug and security fixes, no data migration):"
+    ui_box "$(ui_width)" "Patch updates" "Same release series: bug and security fixes, no data migration"
     for i in "${!keys[@]}"; do
       component_info "${keys[i]}"
-      printf '   [%s] %d  %-24s %s -> %s\n' "$(if [ "${picked[i]}" = 1 ]; then printf x; else printf ' '; fi)" "$((i + 1))" "$C_LABEL" "$(version_core "${froms[i]}")" "$(version_core "${tos[i]}")"
+      printf '   %s %s  %s %s -> %s\n' "$(if [ "${picked[i]}" = 1 ]; then printf '%s' "$C_GRN$UI_ON$C_RST"; else printf '%s' "$C_DIM$UI_OFF$C_RST"; fi)" "$C_BLD$((i + 1))$C_RST" "$(ui_pad "$C_LABEL" 26)" "$(version_core "${froms[i]}")" "$C_GRN$(version_core "${tos[i]}")$C_RST"
     done
-    echo " Toggle with numbers, Enter = apply the selected ones, 0 = skip"
-    read -r -p " > " choice || choice="0"
+    echo
+    ui_keys "1-${#keys[@]}|toggle" "Enter|apply the selected ones" "0|skip"
+    ui_ask choice "Toggle, or Enter to apply:" || choice="0"
     case "$choice" in
       "") break ;;
       0) info "No patch updates applied."; return 0 ;;
@@ -3763,17 +3801,103 @@ if [ "$UI_UTF" = "true" ]; then
   UI_TL="╭"; UI_TR="╮"; UI_BL="╰"; UI_BR="╯"; UI_H="─"; UI_V="│"
   UI_FULL="█"; UI_EMPTY="░"; UI_OK="✔"; UI_NO="✖"; UI_DOT="●"; UI_UP="▲"; UI_SEP="·"; UI_ARROW="›"
   UI_HOLD_ON="▰"; UI_HOLD_OFF="▱"
+  UI_STAR="★"; UI_MAJOR="⇧"; UI_RARR="→"; UI_HEART="♥"; UI_ON="■"; UI_OFF="□"
 else
   UI_TL="+"; UI_TR="+"; UI_BL="+"; UI_BR="+"; UI_H="-"; UI_V="|"
   UI_FULL="#"; UI_EMPTY="-"; UI_OK="ok"; UI_NO="x"; UI_DOT="*"; UI_UP="^"; UI_SEP="-"; UI_ARROW=">"
   UI_HOLD_ON="#"; UI_HOLD_OFF="-"
+  UI_STAR="*"; UI_MAJOR="^^"; UI_RARR="->"; UI_HEART="<3"; UI_ON="[x]"; UI_OFF="[ ]"
 fi
 C_DIM=""
 C_CYN=""
+C_MAG=""
+C_HRT=""
 if [ -n "$C_RST" ]; then
   C_DIM=$'\033[2m'
   C_CYN=$'\033[1;36m'
+  C_MAG=$'\033[1;35m'
+  C_HRT=$'\033[31m'
 fi
+
+# Width of sub-screens: the terminal, at most 118 columns.
+ui_width() {
+  local c
+  c="$(ui_cols)"
+  if [ "$c" -gt 118 ]; then
+    c=118
+  fi
+  if [ "$c" -lt 60 ]; then
+    c=60
+  fi
+  printf '%s' "$c"
+}
+
+# ui_screen TITLE [LINE...] -> clears the terminal (when it is one) and prints the framed header
+ui_screen() {
+  local title="$1"
+  shift
+  clear_screen
+  ui_box "$(ui_width)" "RAYNET ONE TECHNOLOGY CATALOG $UI_SEP $title" "$@"
+  echo
+}
+
+# ui_keys "KEY|what it does"... -> one dim hint line with highlighted keys
+ui_keys() {
+  local spec out=""
+  for spec in "$@"; do
+    out="$out$C_RST$C_BLD${spec%%|*}$C_RST$C_DIM ${spec#*|}   "
+  done
+  printf '  %s%s\n' "$C_DIM" "${out%   }$C_RST"
+}
+
+# ui_ask VAR PROMPT -> read with the arrow prompt; fails at end of input
+ui_ask() {
+  local __var="$1" __answer=""
+  if ! read -r -p "  $C_CYN$UI_ARROW$C_RST $2 " __answer; then
+    printf -v "$__var" '%s' ""
+    return 1
+  fi
+  printf -v "$__var" '%s' "$__answer"
+}
+
+# Status text of row_status as a badge: symbol, colour and text.
+ui_badge() {
+  local text="$1" color="$2" sym="$UI_NO"
+  case "$text" in
+    "up to date"*) sym="$UI_OK" ;;
+    "update available"*) sym="$UI_UP" ;;
+    "major update"*) sym="$UI_MAJOR"; color="$C_MAG" ;;
+  esac
+  printf '%s%s %s%s' "$color" "$sym" "$text" "$C_RST"
+}
+
+# "26.3.4789.148 ★ stable" for the version behind the stable tag
+ui_version() {
+  if [ -n "$HUB_STABLE" ] && [ "$1" = "$HUB_STABLE" ]; then
+    printf '%s %s%s stable%s' "$1" "$C_YLW" "$UI_STAR" "$C_RST"
+  else
+    printf '%s' "$1"
+  fi
+}
+
+# "2 → 2.19.6" for a floating tag and the version it points to
+ui_current() {
+  local tag="$1" resolved="$2"
+  if [ -n "$resolved" ] && [ "$resolved" != "$tag" ]; then
+    printf '%s %s%s%s %s' "$tag" "$C_DIM" "$UI_RARR" "$C_RST" "$(version_core "$resolved")"
+  else
+    printf '%s' "$tag"
+  fi
+}
+
+# Pauses after an action in a sub-screen, so its messages can be read before the screen is redrawn.
+ui_pause_tty() {
+  if [ -t 0 ] && [ -t 1 ]; then
+    echo
+    read -r -s -n 1 -p "  ${C_DIM}Press any key to continue$C_RST" _ || true
+    echo
+  fi
+}
 
 ui_fancy() {
   [ -t 0 ] && [ -t 1 ] && [ "${TERM:-dumb}" != "dumb" ] && [ "${RVC_UI:-}" != "plain" ]
@@ -4377,16 +4501,25 @@ job_report() {
   touch "$dir/seen"
 }
 
+job_state_color() {
+  case "$1" in
+    running) printf '%s' "$C_CYN" ;;
+    done) printf '%s' "$C_GRN" ;;
+    cancelled) printf '%s' "$C_YLW" ;;
+    *) printf '%s' "$C_RED" ;;
+  esac
+}
+
 jobs_list() {
   local id state
   if [ -z "$(job_ids)" ]; then
     echo "   No jobs yet."
     return 0
   fi
-  printf '   %-5s %-10s %-19s %s\n' "#" "State" "Started" "Task"
+  printf '   %s\n' "$C_DIM$(printf '%-5s %-10s %-19s %s' "#" "STATE" "STARTED" "TASK")$C_RST"
   while IFS= read -r id; do
     state="$(job_state "$id")"
-    printf '   %-5s %-10s %-19s %s  %s\n' "$id" "$state" "$(cat -- "$JOBS_DIR/$id/started")" "$(cat -- "$JOBS_DIR/$id/title")" "$(if [ "$state" = "running" ]; then job_summary "$id"; fi)"
+    printf '   %-5s %s %-19s %s  %s\n' "$id" "$(job_state_color "$state")$(printf '%-10s' "$state")$C_RST" "$(cat -- "$JOBS_DIR/$id/started")" "$(cat -- "$JOBS_DIR/$id/title")" "$(if [ "$state" = "running" ]; then job_summary "$id"; fi)"
     if [ "$state" != "running" ]; then
       touch "$JOBS_DIR/$id/seen"
     fi
@@ -4408,10 +4541,11 @@ jobs_menu() {
   local choice id
   while true; do
     echo
-    echo " Jobs - they keep running when you leave the menu or the SSH session ends"
+    ui_box "$(ui_width)" "Jobs" "Long tasks run as jobs: they keep running when you leave the menu or the SSH session ends."
     jobs_list
-    echo " f N) follow   c N) cancel   l N) log   d) delete finished jobs   0) back"
-    read -r -p " > " choice || choice="0"
+    echo
+    ui_keys "f N|follow" "c N|cancel" "l N|log" "d|delete finished jobs" "0|back"
+    ui_ask choice "Command:" || choice="0"
     id="${choice#* }"
     case "$choice" in
       f\ *|F\ *) job_follow "$id" || true ;;
@@ -5004,9 +5138,7 @@ ASPNETCORE_HTTP_PORTS=${ASPNETCORE_HTTP_PORTS}
 LOG_LEVEL_DEFAULT=${LOG_LEVEL_DEFAULT}
 EOF
   if [ -n "$COMPOSE_PROJECT_NAME" ]; then
-    printf '
-COMPOSE_PROJECT_NAME=%s
-' "$COMPOSE_PROJECT_NAME" >> "$ENV_FILE"
+    printf '\nCOMPOSE_PROJECT_NAME=%s\n' "$COMPOSE_PROJECT_NAME" >> "$ENV_FILE"
   fi
 }
 
@@ -6128,6 +6260,31 @@ tui_draw_box() {
   printf '\0338'
 }
 
+# "♥ www.raynet.de" centred in the last line, pulsing like a heartbeat (two beats, then a rest).
+UI_BEAT_LAST=""
+tui_heartbeat() {
+  local cols="$1" rows="$2" ms phase text styled
+  ms=$(( $(ui_now_ms) % 1000 ))
+  if [ "$ms" -lt 140 ] || { [ "$ms" -ge 260 ] && [ "$ms" -lt 400 ]; }; then
+    phase=2
+  elif [ "$ms" -lt 600 ]; then
+    phase=1
+  else
+    phase=0
+  fi
+  if [ "$phase" = "$UI_BEAT_LAST" ]; then
+    return 0
+  fi
+  UI_BEAT_LAST="$phase"
+  text="$UI_HEART www.raynet.de"
+  case "$phase" in
+    2) styled="$C_RED$UI_HEART$C_RST ${C_BLD}www.raynet.de$C_RST" ;;
+    1) styled="$C_HRT$UI_HEART$C_RST www.raynet.de" ;;
+    *) styled="$C_DIM$UI_HEART www.raynet.de$C_RST" ;;
+  esac
+  printf '\0337\033[%d;%dH%s\0338' "$rows" $(( (cols - ${#text}) / 2 + 1 )) "$styled"
+}
+
 tui_draw_hold() {
   if [ "$UI_BOX_HOLD" -lt 1 ]; then
     return 0
@@ -6152,6 +6309,7 @@ tui_menu() {
       fi
       redraw=0
       last_box=0
+      UI_BEAT_LAST=""
     fi
     now="$(ui_now_ms)"
     if [ "$UI_HOLD_PCT" -gt 0 ]; then
@@ -6163,6 +6321,7 @@ tui_menu() {
       held=0
     fi
     printf '\033[%d;3H%s Select: %s\033[K' $((rows - 1)) "$C_CYN$UI_ARROW$C_RST" "$buf"
+    tui_heartbeat "$cols" "$rows"
     key=""
     if ! read -rsn1 -t 0.1 key; then
       ui_hold_key "" || true
