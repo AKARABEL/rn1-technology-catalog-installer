@@ -75,7 +75,7 @@ case "$1" in
       config)
         if [ "${1:-}" = --services ]; then printf '%s\n' nginx-proxy-manager opensearch opensearch-dashboards mongo minio rabbitmq catalog-web worker-recognition-1 worker-recognition-2 worker-other worker-search; fi ;;
       ps) if [ "${1:-}" = -q ]; then running && echo "id-$2"; else echo "NAME STATUS"; fi ;;
-      pull) echo "pull $*" >> "$ST/pulls" ;;
+      pull) [ -n "${SHIM_SLOW_PULL:-}" ] && sleep 8; echo "pull $*" >> "$ST/pulls" ;;
       down) rm -f "$ST/up" ;;
       up)
         touch "$ST/up"
@@ -142,6 +142,28 @@ check "failed backup stops the upgrade on request" 'grep -q "The MongoDB backup 
 
 # 6. Password never on the host command line during backup
 check "backup password stays inside the container" '! grep -q "MONGO_INITDB_ROOT_PASSWORD=[A-Za-z0-9]" "$LOG"'
+
+# 7. Cancel while the new images are pulled: settings back, the stack keeps running
+setup
+( printf '21\ny\nn\n\n0\n' | SHIM_SLOW_PULL=1 bash "$D/catalog.sh" menu > "$T/cancel1.out" 2>&1 ) &
+mp=$!
+for i in $(seq 1 150); do grep -q "Pulling the images" "$D/.jobs/1/progress" 2>/dev/null && break; sleep 0.2; done
+sleep 0.5
+out="$(cd "$D" && bash catalog.sh jobs cancel 1 2>&1)"
+wait "$mp"
+check "cancel while pulling: job cancelled" '[ "$(cat "$D/.jobs/1/state")" = cancelled ] && grep -q "Job #1 cancelled" <<< "$out"'
+check "cancel while pulling: version and .env back, no down" 'grep -q "^CATALOG_VERSION=\"25.4.4191.133\"$" "$D/catalog.sh" && grep -q "^CATALOG_IMAGE=raynetgmbh/rayventory-catalog:25.4.4191.133$" "$D/.env" && ! grep -q "compose.* down" "$LOG" && [ -f "$ST/up" ]'
+
+# 8. Cancel during the health check after the switch: back to the old version
+setup
+( printf '21\ny\nn\n\n0\n' | SHIM_UNHEALTHY=1 bash "$D/catalog.sh" menu > "$T/cancel2.out" 2>&1 ) &
+mp=$!
+for i in $(seq 1 150); do grep -q "Health check" "$D/.jobs/1/progress" 2>/dev/null && break; sleep 0.2; done
+out="$(cd "$D" && bash catalog.sh jobs cancel 1 2>&1)"
+wait "$mp"
+check "cancel during the switch: job cancelled" '[ "$(cat "$D/.jobs/1/state")" = cancelled ]'
+check "cancel during the switch: 25.4 runs again" 'grep -q "^CATALOG_VERSION=\"25.4.4191.133\"$" "$D/catalog.sh" && grep -q "^CATALOG_IMAGE=raynetgmbh/rayventory-catalog:25.4.4191.133$" "$D/.env" && [ "$(cat "$ST/catalog_tag")" = 25.4.4191.133 ] && grep -q "going back to Catalog 25.4.4191.133" "$D/.jobs/1/log"'
+check "no rollback question after a cancel" '! grep -q "Go back to" "$T/cancel2.out" && [ ! -e "$D/.upgrade-failed" ]'
 
 echo "== $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]

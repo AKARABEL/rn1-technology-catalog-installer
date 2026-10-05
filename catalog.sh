@@ -98,7 +98,10 @@ fi
 
 API_KEY_FILE="$WORK_DIR/.catalog_api_key"
 LOCAL_KEY_FILE="$WORK_DIR/.catalog_local_api_key"
+JOBS_DIR="$WORK_DIR/.jobs"
+TUI_NOTICE=""
 LAST_BACKUP=""
+SCP_SECRET=""
 INTERACTIVE="false"
 GENERATE_CANCELLED="false"
 COMPOSE=()
@@ -1311,32 +1314,40 @@ progress_bar() {
   printf '\r       %-5s [%s%s] %3d%%  %s / %s    ' "$label" "${bar// /#}" "${pad// /-}" "$pct" "$(human_size "$cur")" "$(human_size "$total")"
 }
 
-# save_image ENGINE REF FILE EXPECTED_BYTES
+# save_image ENGINE REF FILE EXPECTED_BYTES [LABEL]
 save_image() {
-  local engine="$1" ref="$2" out="$3" total="$4" pid cur
+  local engine="$1" ref="$2" out="$3" total="$4" label="${5:-Saving}" pid cur
   if [ "$engine" = "podman" ]; then
     podman save --format docker-archive -o "$out" "$ref" &
   else
     docker save -o "$out" "$ref" &
   fi
   pid=$!
-  trap 'kill "$pid" 2>/dev/null || true; wait "$pid" 2>/dev/null || true; exit 130' INT TERM
-  while kill -0 "$pid" 2>/dev/null; do
-    if [ -t 1 ]; then
-      cur="$(stat -c %s -- "$out" 2>/dev/null)" || cur=0
-      progress_bar save "${cur:-0}" "$total"
-    fi
-    sleep 1
-  done
-  trap - INT TERM
+  if [ -n "$JOB_DIR" ]; then
+    job_watch_bytes "$pid" "$out" "$total" "$label"
+  else
+    trap 'kill "$pid" 2>/dev/null || true; wait "$pid" 2>/dev/null || true; exit 130' INT TERM
+    while kill -0 "$pid" 2>/dev/null; do
+      if [ -t 1 ]; then
+        cur="$(stat -c %s -- "$out" 2>/dev/null)" || cur=0
+        progress_bar save "${cur:-0}" "$total"
+      fi
+      sleep 1
+    done
+    trap - INT TERM
+  fi
   if ! wait "$pid"; then
     echo
     err "Saving $ref failed."
     return 1
   fi
   cur="$(stat -c %s -- "$out")"
-  progress_bar save "$cur" "$cur"
-  echo
+  if [ -z "$JOB_DIR" ]; then
+    progress_bar save "$cur" "$cur"
+    echo
+  else
+    echo "  saved $(human_size "$cur")"
+  fi
 }
 
 write_import_script() {
@@ -1420,6 +1431,10 @@ make_archive() {
   free_kb="$(df -Pk -- "$base" | awk 'NR == 2 { print $4 }')" || free_kb=0
   if [ "$total" -gt $((free_kb * 1024)) ]; then
     warn "Only $(human_size "$((free_kb * 1024))") free in $base; the archive can need up to $(human_size "$total")."
+    if [ -n "$JOB_DIR" ]; then
+      warn "No archive created - the bundle folder is complete and can be copied as it is."
+      return 0
+    fi
     if ! confirm "Create the archive anyway?" n; then
       return 0
     fi
@@ -1428,38 +1443,80 @@ make_archive() {
     compressor="pigz -1"
   fi
   info "Creating $archive"
+  BUNDLE_ARCHIVE="$archive"
   tar -C "$base" -cf - -- "$name" | $compressor > "$archive" &
   pid=$!
-  trap 'kill "$pid" 2>/dev/null || true; wait "$pid" 2>/dev/null || true; rm -f -- "$archive"; exit 130' INT TERM
-  while kill -0 "$pid" 2>/dev/null; do
-    if [ -t 1 ] && [ -r "/proc/$pid/io" ]; then
-      rchar="$(awk '/^rchar:/ { print $2 }' "/proc/$pid/io" 2>/dev/null)" || rchar=0
-      progress_bar pack "${rchar:-0}" "$total"
-    fi
-    sleep 1
-  done
-  trap - INT TERM
+  if [ -n "$JOB_DIR" ]; then
+    job_watch_bytes "$pid" "rchar:$pid" "$total" "Packing"
+  else
+    trap 'kill "$pid" 2>/dev/null || true; wait "$pid" 2>/dev/null || true; rm -f -- "$archive"; exit 130' INT TERM
+    while kill -0 "$pid" 2>/dev/null; do
+      if [ -t 1 ] && [ -r "/proc/$pid/io" ]; then
+        rchar="$(awk '/^rchar:/ { print $2 }' "/proc/$pid/io" 2>/dev/null)" || rchar=0
+        progress_bar pack "${rchar:-0}" "$total"
+      fi
+      sleep 1
+    done
+    trap - INT TERM
+  fi
   if ! wait "$pid"; then
     echo
     rm -f -- "$archive"
+    BUNDLE_ARCHIVE=""
     err "Creating $archive failed."
     return 1
   fi
-  progress_bar pack "$total" "$total"
-  echo
+  if [ -z "$JOB_DIR" ]; then
+    progress_bar pack "$total" "$total"
+    echo
+  fi
+  job_step "Writing the archive checksum"
   (cd -- "$base" && sha256sum -- "$name.tar.gz" > "$name.tar.gz.sha256")
+  BUNDLE_ARCHIVE=""
   ok "Archive: $archive ($(human_size "$(stat -c %s -- "$archive")")), checksum in $name.tar.gz.sha256"
 }
 
-# scp_bundle PATH... -> asks for the target and copies the paths with scp
-scp_bundle() {
-  local host scp_host port user target rt auth key pw ctl f rc=0 verify name kh kf known="$HOME/.ssh/known_hosts"
-  local -a ssh_opts=() pass=() recursive=()
+SCP_HOST=""
+SCP_SCPHOST=""
+SCP_PORT=""
+SCP_USER=""
+SCP_TARGET=""
+SCP_RT=""
+SCP_AUTH=""
+SCP_KEYFILE=""
+SCP_CTL=""
+SCP_USE_SSHPASS="false"
+SCP_PW=""
+SCP_OPTS=()
+SCP_PASS=()
+
+scp_build_opts() {
+  SCP_OPTS=(-o "Port=$SCP_PORT" -o StrictHostKeyChecking=yes -o "UserKnownHostsFile=$HOME/.ssh/known_hosts")
+  if [ "$SCP_AUTH" = "key" ]; then
+    if [ -n "$SCP_KEYFILE" ]; then
+      SCP_OPTS+=(-i "$SCP_KEYFILE")
+    fi
+  else
+    SCP_OPTS+=(-o PubkeyAuthentication=no)
+  fi
+  if [ -n "$SCP_CTL" ]; then
+    SCP_OPTS+=(-o ControlMaster=auto -o "ControlPath=$SCP_CTL/%C" -o ControlPersist=12h)
+  fi
+  SCP_PASS=()
+  if [ "$SCP_USE_SSHPASS" = "true" ]; then
+    SCP_PASS=(sshpass -e)
+  fi
+}
+
+# Asks for the scp target, confirms a new host key and opens the connection (the password is
+# asked here, so the copy can run later in the background). Returns 0 ready, 1 error, 2 cancelled.
+scp_prepare() {
+  local host scp_host port user target rt auth key pw kh kf known="$HOME/.ssh/known_hosts"
   echo
   read -r -p "  Host (IP or DNS)  : " host || host=""
   if [ -z "$host" ]; then
     info "Cancelled."
-    return 0
+    return 2
   fi
   host="${host#[}"
   host="${host%]}"
@@ -1492,7 +1549,6 @@ scp_bundle() {
   esac
   echo "  Authentication    : 1) SSH key  2) Password"
   read -r -p "  Choice [2]        : " auth || auth=""
-  ssh_opts=(-o "Port=$port" -o StrictHostKeyChecking=yes -o "UserKnownHostsFile=$known")
   kh="$host"
   if [ "$port" != "22" ]; then
     kh="[$host]:$port"
@@ -1510,80 +1566,116 @@ scp_bundle() {
     if ! confirm "  Do they match the target (ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub there)?" n; then
       rm -f -- "$kf"
       info "Cancelled."
-      return 0
+      return 2
     fi
     mkdir -p -- "$HOME/.ssh"
     chmod 700 -- "$HOME/.ssh"
     cat -- "$kf" >> "$known"
     rm -f -- "$kf"
   fi
+  SCP_HOST="$host"
+  SCP_SCPHOST="$scp_host"
+  SCP_PORT="$port"
+  SCP_USER="$user"
+  SCP_TARGET="$target"
+  SCP_RT="$rt"
+  SCP_KEYFILE=""
+  SCP_CTL=""
+  SCP_USE_SSHPASS="false"
+  SCP_PW=""
   if [ "${auth:-2}" = "1" ]; then
+    SCP_AUTH="key"
     read -r -p "  Key file [default]: " key || key=""
+    case "$key" in
+      "~/"*) key="$HOME/${key#\~/}" ;;
+    esac
     if [ -n "$key" ]; then
-      ssh_opts+=(-i "$key")
+      SCP_KEYFILE="$(cd -- "$(dirname -- "$key")" 2>/dev/null && pwd -P)/$(basename -- "$key")" || SCP_KEYFILE="$key"
     fi
   else
-    ssh_opts+=(-o PubkeyAuthentication=no)
+    SCP_AUTH="password"
     if command -v sshpass >/dev/null 2>&1; then
       read -r -s -p "  Password          : " pw || pw=""
       echo
-      export SSHPASS="$pw"
+      SCP_PW="$pw"
       pw=""
-      pass=(sshpass -e)
+      SCP_USE_SSHPASS="true"
     else
       info "sshpass is not installed - ssh asks for the password itself (once)."
     fi
   fi
-  if [ "${#pass[@]}" -eq 0 ]; then
-    ctl="$(mktemp -d)"
-    ssh_opts+=(-o ControlMaster=auto -o "ControlPath=$ctl/%C" -o ControlPersist=300)
+  if [ "$SCP_USE_SSHPASS" != "true" ]; then
+    SCP_CTL="$(mktemp -d)"
   fi
-
+  scp_build_opts
+  if [ "$SCP_USE_SSHPASS" = "true" ]; then
+    export SSHPASS="$SCP_PW"
+  fi
   info "Connecting to $user@$host:$port"
-  if ! ${pass[@]+"${pass[@]}"} ssh "${ssh_opts[@]}" "$user@$host" "mkdir -p -- '$rt'"; then
+  if ! ${SCP_PASS[@]+"${SCP_PASS[@]}"} ssh "${SCP_OPTS[@]}" "$user@$host" "mkdir -p -- '$rt'"; then
+    unset SSHPASS
     err "Could not connect to $host or create $target there."
-    rc=1
+    scp_close
+    return 1
   fi
-  if [ "$rc" -eq 0 ]; then
-    for f in "$@"; do
-      recursive=()
-      if [ -d "$f" ]; then
-        recursive=(-r)
-      fi
-      info "Copying $(basename -- "$f")"
-      if ! ${pass[@]+"${pass[@]}"} scp "${ssh_opts[@]}" ${recursive[@]+"${recursive[@]}"} -- "$f" "$user@$scp_host:$rt/"; then
-        err "Copying $f failed."
-        rc=1
-        break
-      fi
-    done
+  unset SSHPASS
+}
+
+scp_close() {
+  if [ -n "$SCP_CTL" ]; then
+    ssh "${SCP_OPTS[@]}" -O exit "$SCP_USER@$SCP_HOST" >/dev/null 2>&1 || true
+    rm -rf -- "$SCP_CTL"
+    SCP_CTL=""
   fi
+}
+
+# scp_copy PATH... -> copies the paths to the prepared target and verifies the checksums there
+scp_copy() {
+  local f rc=0 verify name size pid
+  local -a recursive=()
+  scp_build_opts
+  for f in "$@"; do
+    recursive=()
+    if [ -d "$f" ]; then
+      recursive=(-r)
+    fi
+    info "Copying $(basename -- "$f")"
+    if [ -n "$JOB_DIR" ]; then
+      size="$(du -sb -- "$f" | cut -f1)"
+      ${SCP_PASS[@]+"${SCP_PASS[@]}"} scp "${SCP_OPTS[@]}" ${recursive[@]+"${recursive[@]}"} -- "$f" "$SCP_USER@$SCP_SCPHOST:$SCP_RT/" &
+      pid=$!
+      job_watch_bytes "$pid" "proc:$pid:scp" "$size" "Copying $(basename -- "$f") to $SCP_HOST"
+      wait "$pid" || rc=1
+    else
+      ${SCP_PASS[@]+"${SCP_PASS[@]}"} scp "${SCP_OPTS[@]}" ${recursive[@]+"${recursive[@]}"} -- "$f" "$SCP_USER@$SCP_SCPHOST:$SCP_RT/" || rc=1
+    fi
+    if [ "$rc" -ne 0 ]; then
+      err "Copying $f failed."
+      break
+    fi
+  done
   if [ "$rc" -eq 0 ]; then
     name="$(basename -- "$1")"
     if [ -d "$1" ]; then
-      verify="cd -- '$rt/$name' && sha256sum -c --quiet SHA256SUMS"
+      verify="cd -- '$SCP_RT/$name' && sha256sum -c --quiet SHA256SUMS"
     else
-      verify="cd -- '$rt' && sha256sum -c --quiet -- '$name.sha256'"
+      verify="cd -- '$SCP_RT' && sha256sum -c --quiet -- '$name.sha256'"
     fi
-    info "Verifying the copy on $host"
-    if ${pass[@]+"${pass[@]}"} ssh "${ssh_opts[@]}" "$user@$host" "$verify"; then
-      ok "Copied to $user@$host:$target - checksums match."
+    job_step "Verifying the copy on $SCP_HOST"
+    info "Verifying the copy on $SCP_HOST"
+    if ${SCP_PASS[@]+"${SCP_PASS[@]}"} ssh "${SCP_OPTS[@]}" "$SCP_USER@$SCP_HOST" "$verify"; then
+      ok "Copied to $SCP_USER@$SCP_HOST:$SCP_TARGET - checksums match."
       if [ -d "$1" ]; then
-        echo "  On $host: cd $target/$name && ./import-images.sh"
+        echo "  On $SCP_HOST: cd $SCP_TARGET/$name && ./import-images.sh"
       else
-        echo "  On $host: cd $target && tar -xzf $name && cd ${name%.tar.gz} && ./import-images.sh"
+        echo "  On $SCP_HOST: cd $SCP_TARGET && tar -xzf $name && cd ${name%.tar.gz} && ./import-images.sh"
       fi
     else
-      err "Checksum verification on $host failed - copy again."
+      err "Checksum verification on $SCP_HOST failed - copy again."
       rc=1
     fi
   fi
-
-  unset SSHPASS
-  if [ -n "${ctl:-}" ]; then
-    ssh "${ssh_opts[@]}" -O exit "$user@$host" >/dev/null 2>&1 || true
-    rm -rf -- "$ctl"
-  fi
+  scp_close
   return "$rc"
 }
 
@@ -1601,8 +1693,8 @@ qualify_ref() {
 
 # download_bundle [interactive|all]
 download_bundle() {
-  local mode="${1:-interactive}" engine ref pref choice tok base name dir file id size free_kb count=0 n=0 i floating=0 installer archive
-  local -a images=() picked=() toks=()
+  local mode="${1:-interactive}" engine ref choice tok base name dir count=0 i floating=0 archive_wanted="no" scp_wanted="no" scp_rc
+  local -a images=() picked=() toks=() refs=()
   if ! engine="$(container_engine)"; then
     err "Downloading needs docker or podman on this machine."
     return 1
@@ -1666,6 +1758,7 @@ download_bundle() {
   fi
   for i in "${!images[@]}"; do
     if [ "${picked[i]}" = "1" ]; then
+      refs+=("${images[i]}")
       count=$((count + 1))
     fi
   done
@@ -1683,23 +1776,95 @@ download_bundle() {
   base="$(cd -- "$base" && pwd -P)"
   name="RN1-Technology-Catalog-$(date +%Y%m%d-%H%M%S)"
   dir="$base/$name"
+
+  if [ "$mode" = "all" ]; then
+    archive_wanted="yes"
+  elif confirm "Create $name.tar.gz when the bundle is ready?" y; then
+    archive_wanted="yes"
+  fi
+  if [ "$mode" = "interactive" ] && confirm "Copy the bundle to another machine with scp?" n; then
+    scp_rc=0
+    scp_prepare || scp_rc=$?
+    if [ "$scp_rc" -eq 0 ]; then
+      scp_wanted="yes"
+    else
+      info "The bundle is created without copying it."
+    fi
+  fi
+  if [ "$mode" = "interactive" ] && [ -n "$SCRIPT_PATH" ]; then
+    run_job "Offline bundle ($count image(s))" "$SCP_PW" -- bundle_build "$engine" "$dir" "$archive_wanted" "$scp_wanted" \
+      "$SCP_HOST" "$SCP_SCPHOST" "$SCP_PORT" "$SCP_USER" "$SCP_TARGET" "$SCP_RT" "$SCP_AUTH" "$SCP_KEYFILE" "$SCP_CTL" "$SCP_USE_SSHPASS" \
+      "${refs[@]}"
+  else
+    SCP_SECRET="$SCP_PW" bundle_build "$engine" "$dir" "$archive_wanted" "$scp_wanted" \
+      "$SCP_HOST" "$SCP_SCPHOST" "$SCP_PORT" "$SCP_USER" "$SCP_TARGET" "$SCP_RT" "$SCP_AUTH" "$SCP_KEYFILE" "$SCP_CTL" "$SCP_USE_SSHPASS" \
+      "${refs[@]}"
+  fi
+}
+
+BUNDLE_PARTIAL=""
+BUNDLE_ARCHIVE=""
+
+bundle_cleanup() {
+  if [ -n "$BUNDLE_ARCHIVE" ]; then
+    rm -f -- "$BUNDLE_ARCHIVE"
+    echo "Incomplete archive removed: $BUNDLE_ARCHIVE"
+    BUNDLE_ARCHIVE=""
+  fi
+  if [ -n "$BUNDLE_PARTIAL" ]; then
+    rm -rf -- "$BUNDLE_PARTIAL"
+    echo
+    warn "Incomplete bundle removed: $BUNDLE_PARTIAL"
+    BUNDLE_PARTIAL=""
+  fi
+  scp_close
+}
+
+# Worker: bundle_build ENGINE DIR ARCHIVE SCP HOST SCPHOST PORT USER TARGET RT AUTH KEYFILE CTL SSHPASS REF...
+bundle_build() {
+  local engine="$1" dir="$2" archive_wanted="$3" scp_wanted="$4" base name ref pref id size free_kb file n=0 count installer archive="" secret
+  SCP_HOST="$5"
+  SCP_SCPHOST="$6"
+  SCP_PORT="$7"
+  SCP_USER="$8"
+  SCP_TARGET="$9"
+  SCP_RT="${10}"
+  SCP_AUTH="${11}"
+  SCP_KEYFILE="${12}"
+  SCP_CTL="${13}"
+  SCP_USE_SSHPASS="${14}"
+  shift 14
+  count=$#
+  secret="$(job_secret_take)"
+  secret="${secret:-${SCP_SECRET:-}}"
+  if [ -n "$secret" ]; then
+    export SSHPASS="$secret"
+  fi
+  scp_build_opts
+  base="$(dirname -- "$dir")"
+  name="$(basename -- "$dir")"
   mkdir -p -- "$dir/images"
   BUNDLE_PARTIAL="$dir"
-  trap 'if [ -n "${BUNDLE_PARTIAL:-}" ]; then rm -rf -- "$BUNDLE_PARTIAL"; echo; warn "Incomplete bundle removed: $BUNDLE_PARTIAL"; fi' EXIT
+  if [ -n "$JOB_DIR" ]; then
+    JOB_CLEANUP="bundle_cleanup"
+  else
+    trap 'bundle_cleanup' EXIT
+  fi
   : > "$dir/images.txt"
   free_kb="$(df -Pk -- "$base" | awk 'NR == 2 { print $4 }')" || free_kb=0
   info "Bundle folder: $dir (free space: $(human_size "$((free_kb * 1024))"))"
 
-  for i in "${!images[@]}"; do
-    if [ "${picked[i]}" != "1" ]; then
-      continue
-    fi
+  for ref in "$@"; do
     n=$((n + 1))
-    ref="${images[i]}"
     echo
     info "[$n/$count] $ref"
     pref="$(qualify_ref "$ref")"
-    "$engine" pull --platform linux/amd64 "$pref"
+    job_step "[$n/$count] Pulling $ref"
+    if [ -n "$JOB_DIR" ]; then
+      "$engine" pull -q --platform linux/amd64 "$pref"
+    else
+      "$engine" pull --platform linux/amd64 "$pref"
+    fi
     id="$("$engine" image inspect --format '{{.Id}}' "$pref")"
     id="${id#sha256:}"
     size="$("$engine" image inspect --format '{{.Size}}' "$pref")"
@@ -1709,7 +1874,7 @@ download_bundle() {
       return 1
     fi
     file="images/$(printf '%s' "$ref" | tr '/:' '__').tar"
-    save_image "$engine" "$pref" "$dir/$file" "$size"
+    save_image "$engine" "$pref" "$dir/$file" "$size" "[$n/$count] Saving $ref"
     printf '%s|%s|%s\n' "$ref" "$file" "$id" >> "$dir/images.txt"
   done
 
@@ -1721,26 +1886,28 @@ download_bundle() {
     chmod +x "$dir/$installer"
   fi
   write_import_script "$dir/import-images.sh" "${installer:-catalog.sh}"
+  job_step "Writing SHA256SUMS"
   (cd -- "$dir" && sha256sum -- images/*.tar images.txt import-images.sh ${installer:+"$installer"} > SHA256SUMS)
   BUNDLE_PARTIAL=""
-  trap - EXIT
+  if [ -z "$JOB_DIR" ]; then
+    trap - EXIT
+  fi
   echo
   ok "Bundle ready: $dir ($(du -sh -- "$dir" | cut -f1))"
   echo "  images/ ($count image(s)), images.txt, SHA256SUMS, import-images.sh${installer:+, $installer}"
   echo "  No $ENV_FILE / $COMPOSE_FILE inside - the target machine generates its own (with new passwords)."
 
-  archive=""
-  if [ "$mode" = "all" ] || confirm "Create $name.tar.gz?" y; then
+  if [ "$archive_wanted" = "yes" ]; then
     make_archive "$dir"
     if [ -f "$base/$name.tar.gz" ]; then
       archive="$base/$name.tar.gz"
     fi
   fi
-  if [ "$mode" = "interactive" ] && confirm "Copy the bundle to another machine with scp?" n; then
+  if [ "$scp_wanted" = "yes" ]; then
     if [ -n "$archive" ]; then
-      scp_bundle "$archive" "$archive.sha256"
+      scp_copy "$archive" "$archive.sha256"
     else
-      scp_bundle "$dir"
+      scp_copy "$dir"
     fi
   fi
 }
@@ -1997,7 +2164,7 @@ for r in rows:
 # download_snapshot [daily|full] [interactive|cli]
 download_snapshot() {
   local kind="${1:-}" mode="${2:-interactive}" key rows daily full row choice
-  local type date size checksum path based dir dest code actual free_kb
+  local type date size checksum path based dir dest free_kb rc
   if ! command -v curl >/dev/null 2>&1; then
     err "curl is needed (apt-get install curl)."
     return 1
@@ -2095,12 +2262,70 @@ download_snapshot() {
     return 1
   fi
 
-  info "Downloading the $type snapshot of $date ($(human_size "$size"))"
-  trap 'rm -f -- "$dest.part"; exit 130' INT TERM
-  code="$(cloud_get "$key" "/v3/synchronization/snapshot/$path" "$dest.part" download)"
-  trap - INT TERM
+  if [ "$mode" = "interactive" ] && [ -n "$SCRIPT_PATH" ]; then
+    rc=0
+    run_job "Snapshot download ($type $date, $(human_size "$size"))" "$key" -- snapshot_fetch "$type" "$date" "$size" "$checksum" "$path" "$based" || rc=$?
+    case "$rc" in
+      0)
+        if confirm "Import $dest into the local catalog now?" n; then
+          import_snapshot "$dest"
+        else
+          echo "  Import it later with option 19."
+        fi
+        ;;
+      3) return 3 ;;
+      *) return 1 ;;
+    esac
+  else
+    trap 'snapshot_cleanup; exit 130' INT TERM
+    SNAP_KEY="$key" snapshot_fetch "$type" "$date" "$size" "$checksum" "$path" "$based"
+    trap - INT TERM
+  fi
+}
+
+SNAP_PART=""
+
+snapshot_cleanup() {
+  if [ -n "$SNAP_PART" ] && [ -e "$SNAP_PART" ]; then
+    rm -f -- "$SNAP_PART"
+    echo "Partial download removed: $SNAP_PART"
+  fi
+  SNAP_PART=""
+}
+
+# Worker: snapshot_fetch TYPE DATE SIZE CHECKSUM PATH BASED (key from the job secret or SNAP_KEY)
+snapshot_fetch() {
+  local type="$1" date="$2" size="$3" checksum="$4" path="$5" based="$6" key dir dest code actual pid codefile
+  key="$(job_secret_take)"
+  key="${key:-${SNAP_KEY:-}}"
+  if [ -z "$key" ]; then
+    err "No API key given."
+    return 1
+  fi
+  dir="$WORK_DIR/snapshots"
+  mkdir -p -- "$dir"
+  dest="$dir/$date-$type.tar.gz"
+  if [ -f "$dest" ] && [ -n "$checksum" ] && [ "$(sha256sum -- "$dest" | cut -d' ' -f1)" = "${checksum#sha256:}" ]; then
+    ok "Already downloaded: $dest"
+    return 0
+  fi
+  info "Downloading the $type snapshot of $date ($(human_size "$size")) to $dest"
+  SNAP_PART="$dest.part"
+  JOB_CLEANUP="snapshot_cleanup"
+  codefile="$(mktemp)"
+  curl -sS -K - --proto '=https' --connect-timeout 10 --retry 2 --retry-delay 3 -H 'Accept: */*' \
+    -o "$dest.part" -w '%{http_code}' "${CATALOG_CLOUD_URL%/}/v3/synchronization/snapshot/$path" \
+    <<< "header = \"X-Api-Key: $key\"" > "$codefile" &
+  pid=$!
+  job_watch_bytes "$pid" "$dest.part" "$size" "Downloading"
+  wait "$pid" || true
+  code="$(cat -- "$codefile")"
+  rm -f -- "$codefile"
+  if [ -t 1 ] && [ -z "$JOB_DIR" ]; then
+    echo
+  fi
   if [ "$code" != "200" ]; then
-    rm -f -- "$dest.part"
+    snapshot_cleanup
     case "$code" in
       401|403) err "Download refused (HTTP $code) - check the API key (menu option 18)." ;;
       000) err "Download failed: $CATALOG_CLOUD_URL is not reachable." ;;
@@ -2109,9 +2334,11 @@ download_snapshot() {
     return 1
   fi
   if [ -n "$checksum" ]; then
+    job_progress "" "Verifying the sha256 checksum"
+    info "Verifying the sha256 checksum"
     actual="$(sha256sum -- "$dest.part" | cut -d' ' -f1)"
     if [ "$actual" != "${checksum#sha256:}" ]; then
-      rm -f -- "$dest.part"
+      snapshot_cleanup
       err "Checksum mismatch - the download is broken, try again."
       return 1
     fi
@@ -2119,21 +2346,15 @@ download_snapshot() {
     warn "The manifest has no checksum for this snapshot - not verified."
   fi
   if [ "$(head -c 2 -- "$dest.part" | od -An -tx1 | tr -d ' \n')" != "1f8b" ]; then
-    rm -f -- "$dest.part"
+    snapshot_cleanup
     err "The download is not a .tar.gz archive."
     return 1
   fi
   mv -f -- "$dest.part" "$dest"
+  JOB_CLEANUP=""
   ok "Snapshot saved: $dest ($(human_size "$(stat -c %s -- "$dest")"), sha256 verified)"
   if [ "$type" = "daily" ]; then
     echo "  A daily snapshot applies on top of a catalog at ${based:-the previous day}; a new installation needs the full snapshot."
-  fi
-  if [ "$mode" = "interactive" ]; then
-    if confirm "Import it into the local catalog now?" n; then
-      import_snapshot "$dest"
-    else
-      echo "  Import it later with option 19."
-    fi
   fi
 }
 
@@ -2324,8 +2545,10 @@ watch_operation() {
     status="$(json_field status "$out")"
     progress="$(json_field progress "$out")"
     message="$(json_field message "$out")"
-    if [[ "$progress" =~ ^[0-9]+$ ]] && [ -t 1 ]; then
-      progress_bar import "$progress" 100
+    if [[ "$progress" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
+      job_progress "$progress" "Import ${status:-running}${message:+: $message}"
+    else
+      job_progress "" "Import ${status:-running}${message:+: $message}"
     fi
     case "$status" in
       finished|Finished)
@@ -2352,8 +2575,7 @@ watch_operation() {
 
 # import_snapshot FILE [interactive|cli]
 import_snapshot() {
-  local file="$1" mode="${2:-interactive}" resp code opid size
-  local -a progress=(-sS)
+  local file="$1" mode="${2:-interactive}" size
   if [ ! -f "$file" ]; then
     err "File not found: $file"
     return 1
@@ -2374,17 +2596,31 @@ import_snapshot() {
     fi
   fi
   local_auth_obtain "$mode" || return 1
-
-  info "Uploading $(basename -- "$file") ($(human_size "$size")) to $(local_url)"
-  if [ -t 2 ]; then
-    progress=(--progress-bar)
+  if [ "$mode" = "interactive" ] && [ -n "$SCRIPT_PATH" ]; then
+    run_job "Snapshot import ($(basename -- "$file"))" "$LOCAL_AUTH" -- import_upload "$file"
+  else
+    import_upload "$file"
   fi
+}
+
+# Worker: import_upload FILE (credentials from the job secret or LOCAL_AUTH)
+import_upload() {
+  local file="$1" resp code opid size pid codefile auth
+  auth="$(job_secret_take)"
+  auth="${auth:-$LOCAL_AUTH}"
+  size="$(stat -c %s -- "$file")"
+  info "Uploading $(basename -- "$file") ($(human_size "$size")) to $(local_url)"
   resp="$(mktemp)"
-  code="$(printf 'header = "%s"\n' "$LOCAL_AUTH" | curl "${progress[@]}" -K - -H 'Accept: application/json' \
-    --connect-timeout 5 -F "file=@$file;type=application/gzip" -o "$resp" -w '%{http_code}' \
-    "$(local_url)/v1/synchronization/snapshot" || true)"
+  codefile="$(mktemp)"
+  curl -sS -K - -H 'Accept: application/json' --connect-timeout 5 -F "file=@$file;type=application/gzip" \
+    -o "$resp" -w '%{http_code}' "$(local_url)/v1/synchronization/snapshot" <<< "header = \"$auth\"" > "$codefile" &
+  pid=$!
+  job_watch_bytes "$pid" "rchar:$pid" "$size" "Uploading"
+  wait "$pid" || true
+  code="$(cat -- "$codefile")"
   opid="$(json_field operationId "$resp")"
-  rm -f -- "$resp"
+  rm -f -- "$resp" "$codefile"
+  LOCAL_AUTH="$auth"
   case "$code" in
     202)
       if [ -z "$opid" ]; then
@@ -2428,7 +2664,7 @@ import_snapshot_menu() {
 # Online servers: the local catalog gets the online catalog URL and key and synchronizes itself
 # (daily by AUTOSYNC_CRON afterwards).
 local_self_sync() {
-  local key cur body out code tmp opid
+  local key cur body out code
   key="$(api_key_stored)"
   if [ -z "$key" ]; then
     echo "  The local catalog needs your API key for $CATALOG_CLOUD_URL."
@@ -2493,7 +2729,21 @@ print(json.dumps(cur))
     rm -f -- "$out"
     return 0
   fi
+  rm -f -- "$out"
+  if [ -n "$SCRIPT_PATH" ]; then
+    run_job "Synchronization from the online catalog" "$LOCAL_AUTH" -- self_sync_run
+  else
+    self_sync_run
+  fi
+}
+
+# Worker: starts the synchronization of the local catalog and follows it.
+self_sync_run() {
+  local tmp out code opid auth
+  auth="$(job_secret_take)"
+  LOCAL_AUTH="${auth:-$LOCAL_AUTH}"
   tmp="$(mktemp)"
+  out="$(mktemp)"
   printf -- '--rvcboundary--\r\n' > "$tmp"
   code="$(local_call POST /v1/synchronization/synchronize "$out" -H 'Content-Type: multipart/form-data; boundary=rvcboundary' --data-binary "@$tmp")"
   rm -f -- "$tmp"
@@ -2577,7 +2827,9 @@ stack_health() {
       err "Not healthy after $((timeout / 60)) minutes:${bad} Catalog Web: HTTP $code"
       return 1
     fi
-    if [ -t 1 ]; then
+    if [ -n "$JOB_DIR" ]; then
+      job_progress "$((timeout > 0 ? waited * 100 / timeout : 0))" "Health check ${waited}s: waiting for${bad:- -} web=$code"
+    elif [ -t 1 ]; then
       printf '\r       %4ss  waiting for:%s web=%s          ' "$waited" "${bad:- -}" "$code"
     fi
     sleep 5
@@ -2592,6 +2844,8 @@ mongo_backup() {
   mkdir -p -- "$dir"
   file="$dir/mongo-$(date +%Y%m%d-%H%M%S).archive.gz"
   info "MongoDB backup -> $file"
+  job_step "MongoDB backup"
+  BACKUP_PARTIAL="$file"
   if (umask 077 && compose exec -T mongo sh -c '
       umask 077
       printf "password: \"%s\"\n" "$MONGO_INITDB_ROOT_PASSWORD" > /tmp/.rvc-dump.yml
@@ -2601,9 +2855,11 @@ mongo_backup() {
       rm -f /tmp/.rvc-dump.yml
       exit $rc' > "$file") && [ -s "$file" ]; then
     chmod 600 "$file"
+    BACKUP_PARTIAL=""
     ok "Backup written ($(human_size "$(stat -c %s -- "$file")"))."
     LAST_BACKUP="$file"
   else
+    BACKUP_PARTIAL=""
     rm -f -- "$file"
     err "The MongoDB backup failed."
     return 1
@@ -2624,7 +2880,7 @@ version_series() {
 # Same-series updates of the infrastructure components (MongoDB 8.0.4 -> 8.0.32 and so on).
 offer_patch_updates() {
   local key first tag current series newest v count=0 i choice tok mongo_running
-  local -a keys=() froms=() tos=() picked=() toks=()
+  local -a keys=() froms=() tos=() picked=() toks=() specs=()
   mongo_running="$(mongo_running_version)"
   for key in "${UPD_KEYS[@]}"; do
     component_info "$key"
@@ -2688,8 +2944,7 @@ offer_patch_updates() {
     if [ "${picked[i]}" = 1 ]; then
       component_info "${keys[i]}"
       for first in $C_SETTINGS; do
-        set_setting "$first" "${tos[i]}"
-        printf -v "$first" '%s' "${tos[i]}"
+        specs+=("$first|${!first}|${tos[i]}")
       done
       count=$((count + 1))
     fi
@@ -2698,18 +2953,80 @@ offer_patch_updates() {
     info "No patch updates applied."
     return 0
   fi
+  run_job "Patch updates ($count component(s))" -- patch_apply "${specs[@]}"
+}
+
+PATCH_CHANGES=()
+PATCH_STAGE=""
+
+# Worker: patch_apply NAME|OLD|NEW... - a cancel or an error before the services run goes back
+patch_apply() {
+  local spec name old new
+  require_docker || return 1
+  PATCH_CHANGES=("$@")
+  JOB_CLEANUP="patch_cleanup"
+  PATCH_STAGE="pull"
+  for spec in "$@"; do
+    IFS='|' read -r name old new <<< "$spec"
+    set_setting "$name" "$new"
+    printf -v "$name" '%s' "$new"
+  done
   do_generate keep no-next
+  job_step "Pulling the new images"
   info "Pulling the new images"
   compose pull
+  PATCH_STAGE="switch"
+  job_step "Recreating the changed services"
   info "Recreating the changed services"
   compose up -d --remove-orphans
+  PATCH_STAGE=""
   stack_health
 }
 
+patch_cleanup() {
+  local spec name old new
+  if [ -z "$PATCH_STAGE" ]; then
+    return 0
+  fi
+  warn "Going back to the previous versions."
+  for spec in "${PATCH_CHANGES[@]}"; do
+    IFS='|' read -r name old new <<< "$spec"
+    set_setting "$name" "$old"
+    printf -v "$name" '%s' "$old"
+  done
+  do_generate keep no-next
+  if [ "$PATCH_STAGE" = "switch" ]; then
+    compose up -d --remove-orphans || true
+  fi
+  PATCH_STAGE=""
+}
+
+UPGRADE_FAILED_FILE="$WORK_DIR/.upgrade-failed"
+UPG_STAGE=""
+UPG_OLD=""
+BACKUP_PARTIAL=""
+
+# Asks about going back after an upgrade that did not become healthy. Returns 1 when it went back.
+upgrade_offer_rollback() {
+  local old target backup
+  if [ ! -f "$UPGRADE_FAILED_FILE" ]; then
+    return 0
+  fi
+  IFS='|' read -r old target backup < "$UPGRADE_FAILED_FILE" || true
+  warn "The upgrade to $target did not become healthy."
+  if confirm "Go back to $old?" n; then
+    run_job "Go back to Catalog $old" -- upgrade_rollback "$old" "$target" "$backup" || true
+    reload_settings
+    return 1
+  fi
+  echo "  Option 21 offers going back later."
+}
+
 do_upgrade() {
-  local installed target old_version answer
+  local installed target backup="no" rc
   require_files || return 1
   require_docker || return 1
+  upgrade_offer_rollback || return 0
   if ! command -v curl >/dev/null 2>&1; then
     err "curl is needed (apt-get install curl)."
     return 1
@@ -2741,56 +3058,128 @@ do_upgrade() {
    4. CATALOG_VERSION $installed -> $target, regenerate the files (passwords are kept)
    5. docker compose up -d
    6. Health check of all services and Catalog Web
+ It runs as a background job: closing the SSH session does not stop it, and a cancel
+ before step 3 changes nothing while a cancel after it goes back to $installed.
 EOF
     if ! confirm "Upgrade the Catalog to $target now? (the Catalog is offline during steps 3 to 6)" n; then
       info "Cancelled - nothing was changed."
       return 0
     fi
-    LAST_BACKUP=""
     if confirm "Create the MongoDB backup first?" y; then
-      if ! mongo_backup && ! confirm "Continue without a backup?" n; then
-        info "Cancelled - nothing was changed."
+      backup="yes"
+    fi
+    rc=0
+    run_job "Upgrade to Catalog $target" -- upgrade_run "$target" "$installed" "$backup" || rc=$?
+    reload_settings
+    case "$rc" in
+      0) ;;
+      3)
+        echo "  Option 21 offers the patch updates of MongoDB, OpenSearch and RabbitMQ when the job is done."
         return 0
+        ;;
+      *)
+        upgrade_offer_rollback || true
+        return 1
+        ;;
+    esac
+  fi
+  offer_patch_updates
+}
+
+upgrade_revert_settings() {
+  set_setting CATALOG_VERSION "$UPG_OLD"
+  CATALOG_VERSION="$UPG_OLD"
+  do_generate keep no-next
+}
+
+upgrade_cleanup() {
+  case "$UPG_STAGE" in
+    backup)
+      if [ -n "$BACKUP_PARTIAL" ]; then
+        rm -f -- "$BACKUP_PARTIAL"
+        echo "Incomplete backup removed: $BACKUP_PARTIAL"
       fi
-    fi
-    old_version="$CATALOG_VERSION"
-    set_setting CATALOG_VERSION "$target"
-    CATALOG_VERSION="$target"
-    do_generate keep no-next
-    info "Pulling the images of $target"
-    if ! compose pull catalog-web worker-recognition-1 worker-recognition-2 worker-other worker-search; then
-      err "Pulling the images failed - the running version was not touched."
-      set_setting CATALOG_VERSION "$old_version"
-      CATALOG_VERSION="$old_version"
-      do_generate keep no-next
-      return 1
-    fi
-    info "Stopping the stack (docker compose down)"
-    compose down --remove-orphans
-    info "Starting $target (docker compose up -d)"
-    compose up -d --remove-orphans
-    if stack_health && [ "$(running_tag catalog-web)" = "$target" ]; then
-      ok "Catalog upgraded: $installed -> $target."
-    else
-      err "The upgrade to $target is not healthy."
-      compose ps || true
-      echo "  Last log lines of catalog-web:"
-      compose logs --tail=30 catalog-web 2>/dev/null | sed 's/^/    /' || true
-      if confirm "Go back to $old_version?" n; then
-        set_setting CATALOG_VERSION "$old_version"
-        CATALOG_VERSION="$old_version"
-        do_generate keep no-next
-        compose up -d --remove-orphans
-        stack_health || true
-        if [ -n "$LAST_BACKUP" ]; then
-          warn "If $target already migrated the database, restore the backup:"
-          echo "      docker compose exec -T mongo sh -c 'mongorestore --drop --archive --gzip -u \"\$MONGO_INITDB_ROOT_USERNAME\" -p \"\$MONGO_INITDB_ROOT_PASSWORD\" --authenticationDatabase admin' < $LAST_BACKUP"
-        fi
+      warn "Stopped before the upgrade - nothing was changed."
+      ;;
+    pull)
+      upgrade_revert_settings
+      warn "Stopped before the switch - Catalog $UPG_OLD keeps running."
+      ;;
+    switch)
+      warn "Stopped during the switch - going back to Catalog $UPG_OLD."
+      upgrade_revert_settings
+      compose up -d --remove-orphans || true
+      if [ -n "$LAST_BACKUP" ]; then
+        echo "  If the new version already migrated the database, restore $LAST_BACKUP (see option 21)."
       fi
+      ;;
+  esac
+  UPG_STAGE=""
+}
+
+# Worker: upgrade_run TARGET INSTALLED BACKUP(yes|no)
+upgrade_run() {
+  local target="$1" installed="$2" backup="$3"
+  require_docker || return 1
+  UPG_OLD="$CATALOG_VERSION"
+  JOB_CLEANUP="upgrade_cleanup"
+  rm -f -- "$UPGRADE_FAILED_FILE"
+  LAST_BACKUP=""
+  if [ "$backup" = "yes" ]; then
+    UPG_STAGE="backup"
+    if ! mongo_backup; then
+      UPG_STAGE=""
+      err "Upgrade stopped - nothing was changed. Start it again without the backup to upgrade anyway."
       return 1
     fi
   fi
-  offer_patch_updates
+  UPG_STAGE="pull"
+  set_setting CATALOG_VERSION "$target"
+  CATALOG_VERSION="$target"
+  do_generate keep no-next
+  job_step "Pulling the images of $target"
+  info "Pulling the images of $target"
+  if ! compose pull catalog-web worker-recognition-1 worker-recognition-2 worker-other worker-search; then
+    err "Pulling the images failed - the running version was not touched."
+    upgrade_revert_settings
+    UPG_STAGE=""
+    return 1
+  fi
+  UPG_STAGE="switch"
+  job_step "docker compose down"
+  info "Stopping the stack (docker compose down)"
+  compose down --remove-orphans
+  job_step "Starting $target"
+  info "Starting $target (docker compose up -d)"
+  compose up -d --remove-orphans
+  if stack_health && [ "$(running_tag catalog-web)" = "$target" ]; then
+    UPG_STAGE=""
+    ok "Catalog upgraded: $installed -> $target."
+    return 0
+  fi
+  UPG_STAGE=""
+  err "The upgrade to $target is not healthy."
+  compose ps || true
+  echo "  Last log lines of catalog-web:"
+  compose logs --tail=30 catalog-web 2>/dev/null | sed 's/^/    /' || true
+  printf '%s|%s|%s\n' "$UPG_OLD" "$target" "$LAST_BACKUP" > "$UPGRADE_FAILED_FILE"
+  return 1
+}
+
+# Worker: upgrade_rollback OLD TARGET BACKUP
+upgrade_rollback() {
+  local old="$1" target="$2" backup="$3"
+  require_docker || return 1
+  rm -f -- "$UPGRADE_FAILED_FILE"
+  UPG_OLD="$old"
+  upgrade_revert_settings
+  job_step "Starting $old"
+  compose up -d --remove-orphans
+  stack_health || true
+  if [ -n "$backup" ]; then
+    warn "If $target already migrated the database, restore the backup:"
+    echo "      docker compose exec -T mongo sh -c 'mongorestore --drop --archive --gzip -u \"\$MONGO_INITDB_ROOT_USERNAME\" -p \"\$MONGO_INITDB_ROOT_PASSWORD\" --authenticationDatabase admin' < $backup"
+  fi
 }
 
 ###############################################################################
@@ -3049,6 +3438,730 @@ adopt_installation() {
     export RVC_NOTICE="Installation in $dir taken over."
     exec bash "$SCRIPT_PATH" menu
   fi
+}
+
+###############################################################################
+# User interface
+###############################################################################
+
+UI_UTF="false"
+case "${LC_ALL:-${LC_CTYPE:-${LANG:-}}}" in
+  *[Uu][Tt][Ff]-8*|*[Uu][Tt][Ff]8*) UI_UTF="true" ;;
+esac
+UI_LINES=0
+UI_JOB_SEL=""
+UI_HOLD_START=""
+UI_HOLD_LAST=""
+UI_HOLD_MS=2000
+UI_PANEL_W=80
+UI_RUNNING_IDS=""
+UI_BOX_ROW=0
+UI_BOX_COL=0
+UI_BOX_HOLD=-1
+
+if [ "$UI_UTF" = "true" ]; then
+  UI_TL="╭"; UI_TR="╮"; UI_BL="╰"; UI_BR="╯"; UI_H="─"; UI_V="│"
+  UI_FULL="█"; UI_EMPTY="░"; UI_OK="✔"; UI_NO="✖"; UI_DOT="●"; UI_UP="▲"; UI_SEP="·"; UI_ARROW="›"
+  UI_HOLD_ON="▰"; UI_HOLD_OFF="▱"
+else
+  UI_TL="+"; UI_TR="+"; UI_BL="+"; UI_BR="+"; UI_H="-"; UI_V="|"
+  UI_FULL="#"; UI_EMPTY="-"; UI_OK="ok"; UI_NO="x"; UI_DOT="*"; UI_UP="^"; UI_SEP="-"; UI_ARROW=">"
+  UI_HOLD_ON="#"; UI_HOLD_OFF="-"
+fi
+C_DIM=""
+C_CYN=""
+if [ -n "$C_RST" ]; then
+  C_DIM=$'\033[2m'
+  C_CYN=$'\033[1;36m'
+fi
+
+ui_fancy() {
+  [ -t 0 ] && [ -t 1 ] && [ "${TERM:-dumb}" != "dumb" ] && [ "${RVC_UI:-}" != "plain" ]
+}
+
+ui_cols() {
+  local c
+  c="$(tput cols 2>/dev/null)" || c=""
+  printf '%s' "${c:-${COLUMNS:-80}}"
+}
+
+ui_rows() {
+  local r
+  r="$(tput lines 2>/dev/null)" || r=""
+  printf '%s' "${r:-${LINES:-24}}"
+}
+
+ui_repeat() {
+  local s="" i
+  for ((i = 0; i < $2; i++)); do
+    s="$s$1"
+  done
+  printf '%s' "$s"
+}
+
+# Visible length of a string (ANSI color codes do not count).
+ui_len() {
+  local s
+  s="$(printf '%s' "$1" | sed 's/\x1b\[[0-9;]*m//g')"
+  printf '%s' "${#s}"
+}
+
+# ui_pad TEXT WIDTH -> TEXT cut or padded to exactly WIDTH visible characters
+ui_pad() {
+  local text="$1" width="$2" len
+  len="$(ui_len "$text")"
+  if [ "$len" -gt "$width" ]; then
+    text="$(printf '%s' "$text" | sed 's/\x1b\[[0-9;]*m//g')"
+    printf '%s' "${text:0:$((width - 1))}~"
+  else
+    printf '%s%s' "$text" "$(ui_repeat ' ' $((width - len)))"
+  fi
+}
+
+ui_bar() {
+  local pct="${1:-0}" width="$2" fill
+  pct="${pct%%.*}"
+  if ! [[ "$pct" =~ ^[0-9]+$ ]]; then
+    pct=0
+  fi
+  if [ "$pct" -gt 100 ]; then
+    pct=100
+  fi
+  fill=$((pct * width / 100))
+  printf '%s%s%s%s' "$C_GRN" "$(ui_repeat "$UI_FULL" "$fill")" "$C_DIM$(ui_repeat "$UI_EMPTY" $((width - fill)))" "$C_RST"
+}
+
+# ui_box WIDTH TITLE LINE... -> a rounded box, sets UI_LINES
+ui_box() {
+  local width="$1" title="$2" line inner
+  shift 2
+  inner=$((width - 2))
+  printf '%s%s %s %s%s\n' "$C_DIM$UI_TL$UI_H$C_RST" "" "$C_BLD$title$C_RST" "$C_DIM$(ui_repeat "$UI_H" $((inner - $(ui_len "$title") - 3)))" "$UI_TR$C_RST"
+  for line in "$@"; do
+    printf '%s %s %s\n' "$C_DIM$UI_V$C_RST" "$(ui_pad "$line" $((inner - 2)))" "$C_DIM$UI_V$C_RST"
+  done
+  printf '%s\n' "$C_DIM$UI_BL$(ui_repeat "$UI_H" "$inner")$UI_BR$C_RST"
+  UI_LINES=$(($# + 2))
+}
+
+# ui_box_line WIDTH TEXT -> one inner line of a ui_box
+ui_box_line() {
+  printf '%s %s %s' "$C_DIM$UI_V$C_RST" "$(ui_pad "$2" $(($1 - 4)))" "$C_DIM$UI_V$C_RST"
+}
+
+ui_noecho() {
+  stty -echo 2>/dev/null || true
+}
+
+ui_echo() {
+  stty echo 2>/dev/null || true
+}
+
+ui_now_ms() {
+  local t
+  if [ -n "${EPOCHREALTIME:-}" ]; then
+    t="${EPOCHREALTIME/[.,]/}"
+    printf '%s' "$((10#$t / 1000))"
+  else
+    date +%s%3N
+  fi
+}
+
+# Hold-to-cancel: call with every key; returns 0 when X was held long enough.
+# UI_HOLD_PCT tells how far the hold is (0-100).
+UI_HOLD_PCT=0
+ui_hold_key() {
+  local key="$1" now
+  now="$(ui_now_ms)"
+  if [ "$key" = "x" ] || [ "$key" = "X" ]; then
+    if [ -z "$UI_HOLD_START" ] || [ $((now - UI_HOLD_LAST)) -gt 900 ]; then
+      UI_HOLD_START="$now"
+    fi
+    UI_HOLD_LAST="$now"
+  elif [ -n "$UI_HOLD_LAST" ] && [ $((now - UI_HOLD_LAST)) -gt 900 ]; then
+    UI_HOLD_START=""
+    UI_HOLD_LAST=""
+  fi
+  if [ -z "$UI_HOLD_START" ]; then
+    UI_HOLD_PCT=0
+    return 1
+  fi
+  UI_HOLD_PCT=$(( (now - UI_HOLD_START) * 100 / UI_HOLD_MS ))
+  if [ "$UI_HOLD_PCT" -ge 100 ]; then
+    UI_HOLD_START=""
+    UI_HOLD_LAST=""
+    UI_HOLD_PCT=0
+    return 0
+  fi
+  return 1
+}
+
+ui_hold_line() {
+  local n=$((UI_HOLD_PCT * 12 / 100))
+  if [ "$UI_HOLD_PCT" -gt 0 ]; then
+    printf '%sCancelling %s%s%s keep holding X%s' "$C_RED" "$(ui_repeat "$UI_HOLD_ON" "$n")" "$C_DIM$(ui_repeat "$UI_HOLD_OFF" $((12 - n)))$C_RST$C_RED" "" "$C_RST"
+  else
+    printf '%sq back to the menu (the job continues) %s hold X for 2 s to cancel%s' "$C_DIM" "$UI_SEP" "$C_RST"
+  fi
+}
+
+# The live panel of one job.
+ui_job_panel() {
+  local id="$1" state="$2" pct="$3" text="$4" width last badge
+  width="$(ui_cols)"
+  if [ "$width" -gt 100 ]; then
+    width=100
+  fi
+  UI_PANEL_W="$width"
+  last="$(grep -v '^[[:space:]]*$' "$JOBS_DIR/$id/log" 2>/dev/null | tail -n 1 | sed 's/\x1b\[[0-9;]*m//g; s/\r.*//; s/^==> //')" || last=""
+  case "$state" in
+    running) badge="$C_CYN$UI_DOT running$C_RST" ;;
+    done) badge="$C_GRN$UI_OK done$C_RST" ;;
+    cancelled) badge="$C_YLW$UI_NO cancelled$C_RST" ;;
+    *) badge="$C_RED$UI_NO $state$C_RST" ;;
+  esac
+  ui_box "$width" "Job #$id $UI_SEP $(cat -- "$JOBS_DIR/$id/title")" \
+    "$badge   $(if [ -n "$pct" ]; then printf '%s %5s%%' "$(ui_bar "$pct" $((width - 30)))" "$pct"; else printf '%s' "${text:-working}"; fi)" \
+    "$(if [ -n "$pct" ]; then printf '%s' "$text"; else printf '%s' ""; fi)" \
+    "$C_DIM$UI_ARROW ${last:-...}$C_RST" \
+    "$(ui_hold_line)"
+}
+
+# Bottom-right "Current processes" box of the menu (at most 9 lines high).
+ui_processes_box() {
+  local width="$1" id pct text detail state title i first=0 count
+  local -a ids=() lines=()
+  if [ -n "$UI_RUNNING_IDS" ]; then
+    mapfile -t ids <<< "$UI_RUNNING_IDS"
+  fi
+  count=${#ids[@]}
+  if [ "$count" -eq 0 ]; then
+    lines=("${C_DIM}No running processes${C_RST}")
+    id="$(job_unseen_id)"
+    if [ -n "$id" ]; then
+      title="$(cat -- "$JOBS_DIR/$id/title")"
+      state="$(job_state "$id")"
+      lines+=("")
+      case "$state" in
+        done) lines+=("$C_GRN$UI_OK #$id $title$C_RST" "  ${C_DIM}finished $UI_SEP J shows the result$C_RST") ;;
+        *) lines+=("$C_RED$UI_NO #$id $title$C_RST" "  ${C_DIM}$state $UI_SEP J shows the log$C_RST") ;;
+      esac
+    else
+      lines+=("" "${C_DIM}Long tasks run here and keep running$C_RST" "${C_DIM}when you leave or the SSH session ends$C_RST")
+    fi
+  else
+    for i in "${!ids[@]}"; do
+      if [ "${ids[i]}" = "$UI_JOB_SEL" ] && [ "$i" -ge 2 ]; then
+        first=$((i - 1))
+      fi
+    done
+    for ((i = first; i < count && i < first + 2; i++)); do
+      id="${ids[i]}"
+      IFS='|' read -r pct text detail < "$JOBS_DIR/$id/progress" 2>/dev/null || { pct=""; text=""; detail=""; }
+      title="$(cat -- "$JOBS_DIR/$id/title")"
+      if [ "$id" = "$UI_JOB_SEL" ]; then
+        lines+=("$C_BLD$UI_ARROW #$id $title$C_RST")
+      else
+        lines+=("  #$id $title")
+      fi
+      if [ -n "$pct" ]; then
+        lines+=("  $(ui_bar "$pct" $((width - 14))) $(printf '%5s%%' "$pct")")
+        if [ "$count" -eq 1 ]; then
+          lines+=("  $C_DIM${detail:-$text}$C_RST")
+        fi
+      else
+        lines+=("  $C_DIM${text:-working}$C_RST")
+      fi
+    done
+    if [ "$count" -gt 2 ]; then
+      lines+=("  $C_DIM+ $((count - 2)) more $UI_SEP Tab shows them$C_RST")
+    fi
+    if [ "$UI_HOLD_PCT" -gt 0 ]; then
+      lines+=("$(ui_hold_line)")
+    elif [ -n "$UI_JOB_SEL" ] && [ -f "$JOBS_DIR/$UI_JOB_SEL/cancel" ]; then
+      lines+=("${C_YLW}Cleaning up $UI_SEP hold X again to force$C_RST")
+    else
+      lines+=("${C_DIM}J follow $UI_SEP Tab select $UI_SEP hold X cancel$C_RST")
+    fi
+  fi
+  ui_box "$width" "Current processes" "${lines[@]}"
+}
+
+###############################################################################
+# Background jobs
+###############################################################################
+
+JOB_DIR=""
+JOB_CANCELLED="false"
+JOB_CLEANUP=""
+
+# Progress of the running job: PERCENT (empty when unknown), a status text and an optional
+# detail (size, speed, remaining time).
+job_progress() {
+  if [ -n "$JOB_DIR" ] && [ -d "$JOB_DIR" ]; then
+    printf '%s|%s|%s\n' "$1" "$2" "${3:-}" > "$JOB_DIR/progress.tmp" && mv -f -- "$JOB_DIR/progress.tmp" "$JOB_DIR/progress"
+  elif [ -t 1 ]; then
+    printf '\r       %s%s%s    ' "$(if [ -n "$1" ]; then printf '%5s%%  ' "$1"; fi)" "$2" "${3:+ $UI_SEP $3}"
+  fi
+}
+
+# A status text for the "Current processes" box (only inside a job).
+job_step() {
+  if [ -n "$JOB_DIR" ]; then
+    job_progress "" "$1"
+  fi
+}
+
+# A secret for a job travels in a file that only the owner can read, never on a command line.
+job_secret_take() {
+  local value=""
+  if [ -n "$JOB_DIR" ] && [ -f "$JOB_DIR/secret" ]; then
+    value="$(cat -- "$JOB_DIR/secret")"
+    rm -f -- "$JOB_DIR/secret"
+  fi
+  printf '%s' "$value"
+}
+
+fmt_duration() {
+  local s="${1:-0}"
+  if [ "$s" -ge 3600 ]; then
+    printf '%dh%02dm' $((s / 3600)) $((s % 3600 / 60))
+  elif [ "$s" -ge 60 ]; then
+    printf '%dm%02ds' $((s / 60)) $((s % 60))
+  else
+    printf '%ds' "$s"
+  fi
+}
+
+# Watches a growing amount of bytes (a file size, or "rchar:PID" for bytes read by a process)
+# until PID ends and reports percent, size, speed and remaining time.
+# job_watch_bytes PID SOURCE TOTAL LABEL
+job_watch_bytes() {
+  local pid="$1" src="$2" total="$3" label="$4" cur last=0 t0 t1 rate=0 eta pct
+  t0="$(date +%s)"
+  while kill -0 "$pid" 2>/dev/null; do
+    cur="$(job_bytes "$src")" || cur=0
+    cur="${cur:-0}"
+    t1="$(date +%s)"
+    if [ "$t1" -gt "$t0" ]; then
+      rate=$(( cur / (t1 - t0) ))
+    fi
+    pct=""
+    eta=""
+    if [ "${total:-0}" -gt 0 ]; then
+      pct="$(awk -v c="$cur" -v t="$total" 'BEGIN { p = c * 100 / t; if (p > 100) p = 100; printf "%.1f", p }')"
+      if [ "$rate" -gt 0 ] && [ "$cur" -lt "$total" ]; then
+        eta=" $UI_SEP ETA $(fmt_duration $(( (total - cur) / rate )))"
+      fi
+    fi
+    job_progress "$pct" "$label" "$(human_size "$cur")$(if [ "${total:-0}" -gt 0 ]; then printf ' / %s' "$(human_size "$total")"; fi) $UI_SEP $(human_size "$rate")/s$eta"
+    last="$cur"
+    sleep 1
+  done
+}
+
+# Bytes so far: a file size, "rchar:PID" (bytes read by PID) or "proc:PID:NAME" (bytes read by
+# PID or by its child process NAME, e.g. scp under sshpass).
+job_bytes() {
+  local src="$1" pid comm
+  case "$src" in
+    rchar:*)
+      pid="${src#rchar:}"
+      ;;
+    proc:*)
+      pid="${src#proc:}"
+      comm="${pid#*:}"
+      pid="${pid%%:*}"
+      if [ "$(cat -- "/proc/$pid/comm" 2>/dev/null)" != "$comm" ]; then
+        pid="$(awk -v pp="$pid" -v c="$comm" 'FNR == 1 { name = "" } /^Name:/ { name = $2 } /^PPid:/ && $2 == pp && name == c { split(FILENAME, a, "/"); print a[3]; exit }' /proc/[0-9]*/status 2>/dev/null)" || pid=""
+      fi
+      ;;
+    *)
+      stat -c %s -- "$src" 2>/dev/null || echo 0
+      return 0
+      ;;
+  esac
+  awk '/^rchar:/ { print $2 }' "/proc/${pid:-0}/io" 2>/dev/null || echo 0
+}
+
+# Jobs of one class do not run at the same time (two of them changing the stack would collide).
+job_class() {
+  case "$1" in
+    do_up|do_down|do_restart|do_pull|do_reset|upgrade_run|upgrade_rollback|patch_apply) printf 'stack' ;;
+    snapshot_fetch) printf 'snapshot' ;;
+    import_upload|self_sync_run) printf 'import' ;;
+  esac
+}
+
+# job_busy TITLE [SECRET] -- FUNCTION ... -> number of a running job of the same class
+job_busy() {
+  local class id
+  shift
+  if [ "$1" != "--" ]; then
+    shift
+  fi
+  shift
+  class="$(job_class "$1")"
+  if [ -z "$class" ]; then
+    return 0
+  fi
+  while IFS= read -r id; do
+    if [ -n "$id" ] && [ "$(cat -- "$JOBS_DIR/$id/class" 2>/dev/null)" = "$class" ]; then
+      printf '%s' "$id"
+      return 0
+    fi
+  done < <(job_running_ids)
+}
+
+# Keeps the newest 25 finished jobs.
+job_prune() {
+  local id
+  local -a done_ids=()
+  while IFS= read -r id; do
+    if [ -n "$id" ] && [ "$(job_state "$id")" != "running" ]; then
+      done_ids+=("$id")
+    fi
+  done < <(job_ids)
+  while [ "${#done_ids[@]}" -gt 25 ]; do
+    rm -rf -- "${JOBS_DIR:?}/${done_ids[0]}"
+    done_ids=("${done_ids[@]:1}")
+  done
+}
+
+# job_start TITLE [SECRET] -- FUNCTION [ARGS...]: runs FUNCTION in its own session, detached
+# from the terminal, so it survives a closed SSH session. Prints the job number.
+job_start() {
+  local title="$1" secret="" id dir
+  shift
+  if [ "$1" != "--" ]; then
+    secret="$1"
+    shift
+  fi
+  shift
+  mkdir -p -- "$JOBS_DIR"
+  chmod 700 "$JOBS_DIR"
+  job_prune
+  id=$(( $(cat -- "$JOBS_DIR/seq" 2>/dev/null || echo 0) + 1 ))
+  while ! mkdir -- "$JOBS_DIR/$id" 2>/dev/null; do
+    id=$((id + 1))
+  done
+  echo "$id" > "$JOBS_DIR/seq"
+  dir="$JOBS_DIR/$id"
+  printf '%s\n' "$title" > "$dir/title"
+  date '+%Y-%m-%d %H:%M:%S' > "$dir/started"
+  echo "running" > "$dir/state"
+  echo "|starting" > "$dir/progress"
+  job_class "$1" > "$dir/class"
+  if [ -n "$secret" ]; then
+    (umask 077 && printf '%s' "$secret" > "$dir/secret")
+  fi
+  if command -v setsid >/dev/null 2>&1; then
+    setsid nohup bash "$SCRIPT_PATH" __job "$id" "$@" > "$dir/log" 2>&1 < /dev/null &
+  else
+    nohup bash "$SCRIPT_PATH" __job "$id" "$@" > "$dir/log" 2>&1 < /dev/null &
+  fi
+  echo "$!" > "$dir/pid"
+  printf '%s' "$id"
+}
+
+# Entry point of a job process: main -> __job ID FUNCTION ARGS...
+job_run() {
+  local id="$1"
+  shift
+  JOB_DIR="$JOBS_DIR/$id"
+  INTERACTIVE="false"
+  echo "$$" > "$JOB_DIR/pid"
+  trap 'job_finish' EXIT
+  trap 'job_on_signal' TERM INT HUP
+  "$@"
+}
+
+job_on_signal() {
+  trap '' TERM INT HUP
+  JOB_CANCELLED="true"
+  job_progress "" "cancelling"
+  echo
+  echo "Cancel requested."
+  kill -TERM -- "-$$" 2>/dev/null || true
+  kill -TERM $(jobs -p) 2>/dev/null || true
+  exit 130
+}
+
+# EXIT trap of a job: a cancelled or failed job runs its JOB_CLEANUP first.
+job_finish() {
+  local rc=$? state
+  trap '' TERM INT HUP
+  if [ "$rc" -ne 0 ] && [ -n "$JOB_CLEANUP" ]; then
+    job_progress "" "cleaning up"
+    $JOB_CLEANUP || true
+  fi
+  if [ "$JOB_CANCELLED" = "true" ]; then
+    state="cancelled"
+  elif [ "$rc" -eq 0 ]; then
+    state="done"
+  else
+    state="failed"
+  fi
+  rm -f -- "$JOB_DIR/secret"
+  echo "$rc" > "$JOB_DIR/exit"
+  date '+%Y-%m-%d %H:%M:%S' > "$JOB_DIR/ended"
+  if [ "$state" = "done" ]; then
+    job_progress "100" "finished"
+  fi
+  echo "$state" > "$JOB_DIR/state"
+}
+
+job_state() {
+  local dir="$JOBS_DIR/$1" state pid
+  state="$(cat -- "$dir/state" 2>/dev/null)" || state="unknown"
+  if [ "$state" = "running" ]; then
+    pid="$(cat -- "$dir/pid" 2>/dev/null)" || pid=""
+    if [ -z "$pid" ] || ! kill -0 "$pid" 2>/dev/null; then
+      sleep 0.3
+      state="$(cat -- "$dir/state" 2>/dev/null)" || state="unknown"
+      pid="$(cat -- "$dir/pid" 2>/dev/null)" || pid=""
+      if [ "$state" = "running" ] && { [ -z "$pid" ] || ! kill -0 "$pid" 2>/dev/null; }; then
+        state="stopped"
+      fi
+    fi
+  fi
+  printf '%s' "$state"
+}
+
+# job_cancel ID [wait|nowait]: the job cleans up first (partial files, previous state);
+# a second cancel stops it at once.
+job_cancel() {
+  local id="$1" mode="${2:-wait}" dir="$JOBS_DIR/$1" pid i
+  pid="$(cat -- "$dir/pid" 2>/dev/null)" || pid=""
+  if [ "$(job_state "$id")" != "running" ] || [ -z "$pid" ]; then
+    warn "Job #$id is not running."
+    return 1
+  fi
+  if [ -f "$dir/cancel" ]; then
+    kill -KILL -- "-$pid" 2>/dev/null || kill -KILL "$pid" 2>/dev/null || true
+    echo "cancelled" > "$dir/state"
+    warn "Job #$id stopped at once (without cleaning up)."
+    return 0
+  fi
+  touch "$dir/cancel"
+  kill -TERM -- "-$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null || true
+  if [ "$mode" = "nowait" ]; then
+    return 0
+  fi
+  info "Cancelling job #$id - it removes partial files and restores the previous state first."
+  for i in $(seq 1 1200); do
+    if ! kill -0 "$pid" 2>/dev/null; then
+      break
+    fi
+    sleep 0.5
+  done
+  if kill -0 "$pid" 2>/dev/null; then
+    warn "Job #$id is still cleaning up - cancel it again to stop it at once."
+    return 1
+  fi
+  ok "Job #$id cancelled."
+}
+
+job_ids() {
+  local d
+  for d in "$JOBS_DIR"/*/; do
+    if [ -f "$d/title" ]; then
+      d="${d%/}"
+      printf '%s\n' "${d##*/}"
+    fi
+  done | sort -n
+}
+
+job_running_ids() {
+  local id
+  while IFS= read -r id; do
+    if [ -n "$id" ] && [ "$(job_state "$id")" = "running" ]; then
+      printf '%s\n' "$id"
+    fi
+  done < <(job_ids)
+}
+
+job_summary() {
+  local id="$1" pct text detail
+  IFS='|' read -r pct text detail < "$JOBS_DIR/$id/progress" 2>/dev/null || { pct=""; text=""; detail=""; }
+  printf '%s%s%s' "$(if [ -n "$pct" ]; then printf '%s%%  ' "$pct"; fi)" "$text" "${detail:+ $UI_SEP $detail}"
+}
+
+# Live view of a job. q: back to the menu (the job continues), hold X: cancel.
+job_follow() {
+  local id="$1" dir="$JOBS_DIR/$1" state pct text detail key shown=0 n lines=0 last_draw=0 now
+  UI_HOLD_START=""
+  UI_HOLD_PCT=0
+  if [ ! -d "$dir" ]; then
+    err "Job #$id not found."
+    return 1
+  fi
+  if ! ui_fancy; then
+    while true; do
+      state="$(job_state "$id")"
+      n="$(wc -l < "$dir/log" 2>/dev/null)" || n=0
+      if [ "$n" -gt "$shown" ]; then
+        sed -n "$((shown + 1)),${n}p" "$dir/log"
+        shown="$n"
+      fi
+      if [ "$state" != "running" ]; then
+        n="$(wc -l < "$dir/log" 2>/dev/null)" || n=0
+        if [ "$n" -gt "$shown" ]; then
+          sed -n "$((shown + 1)),${n}p" "$dir/log"
+        fi
+        break
+      fi
+      sleep 1
+    done
+    job_report "$id"
+    [ "$(job_state "$id")" = "done" ]
+    return
+  fi
+  tput civis 2>/dev/null || true
+  ui_noecho
+  while true; do
+    state="$(job_state "$id")"
+    now="$(ui_now_ms)"
+    if [ "$state" != "running" ] || { [ "$UI_HOLD_PCT" -eq 0 ] && [ $((now - last_draw)) -ge 500 ]; }; then
+      IFS='|' read -r pct text detail < "$dir/progress" 2>/dev/null || { pct=""; text=""; detail=""; }
+      if [ "$lines" -gt 0 ]; then
+        printf '\033[%dA\033[J' "$lines"
+      fi
+      ui_job_panel "$id" "$state" "$pct" "$text${detail:+ $UI_SEP $detail}"
+      lines="$UI_LINES"
+      last_draw="$now"
+    elif [ "$UI_HOLD_PCT" -gt 0 ] && [ "$lines" -gt 0 ]; then
+      printf '\033[2A\r%s\033[2B\r' "$(ui_box_line "$UI_PANEL_W" "$(ui_hold_line)")"
+      last_draw=0
+    fi
+    if [ "$state" != "running" ]; then
+      break
+    fi
+    key=""
+    read -rsn1 -t 0.1 key || true
+    if ui_hold_key "$key"; then
+      job_cancel "$id" nowait >/dev/null 2>&1 || true
+      continue
+    fi
+    case "$key" in
+      q|Q)
+        tput cnorm 2>/dev/null || true
+        ui_echo
+        echo
+        info "Job #$id keeps running in the background - the menu shows it under Current processes."
+        return 3
+        ;;
+    esac
+  done
+  tput cnorm 2>/dev/null || true
+  ui_echo
+  job_report "$id"
+  [ "$(job_state "$id")" = "done" ]
+}
+
+job_report() {
+  local id="$1" dir="$JOBS_DIR/$1" state
+  state="$(job_state "$id")"
+  echo
+  case "$state" in
+    done) ok "Job #$id finished: $(cat -- "$dir/title")" ;;
+    cancelled) warn "Job #$id was cancelled: $(cat -- "$dir/title")" ;;
+    *)
+      err "Job #$id $state: $(cat -- "$dir/title")"
+      if ui_fancy; then
+        echo "  Last lines of its log:"
+        tail -n 15 "$dir/log" | sed 's/^/    /'
+      fi
+      ;;
+  esac
+  touch "$dir/seen"
+}
+
+jobs_list() {
+  local id state
+  if [ -z "$(job_ids)" ]; then
+    echo "   No jobs yet."
+    return 0
+  fi
+  printf '   %-5s %-10s %-19s %s\n' "#" "State" "Started" "Task"
+  while IFS= read -r id; do
+    state="$(job_state "$id")"
+    printf '   %-5s %-10s %-19s %s  %s\n' "$id" "$state" "$(cat -- "$JOBS_DIR/$id/started")" "$(cat -- "$JOBS_DIR/$id/title")" "$(if [ "$state" = "running" ]; then job_summary "$id"; fi)"
+    if [ "$state" != "running" ]; then
+      touch "$JOBS_DIR/$id/seen"
+    fi
+  done < <(job_ids | tail -n 15)
+}
+
+# Newest finished job nobody has looked at yet.
+job_unseen_id() {
+  local id last=""
+  while IFS= read -r id; do
+    if [ -n "$id" ] && [ ! -f "$JOBS_DIR/$id/seen" ] && [ "$(job_state "$id")" != "running" ]; then
+      last="$id"
+    fi
+  done < <(job_ids)
+  printf '%s' "$last"
+}
+
+jobs_menu() {
+  local choice id
+  while true; do
+    echo
+    echo " Jobs - they keep running when you leave the menu or the SSH session ends"
+    jobs_list
+    echo " f N) follow   c N) cancel   l N) log   d) delete finished jobs   0) back"
+    read -r -p " > " choice || choice="0"
+    id="${choice#* }"
+    case "$choice" in
+      f\ *|F\ *) job_follow "$id" || true ;;
+      c\ *|C\ *) if confirm "Cancel job #$id ($(cat -- "$JOBS_DIR/$id/title" 2>/dev/null))?" n; then job_cancel "$id" || true; fi ;;
+      l\ *|L\ *) if [ -f "$JOBS_DIR/$id/log" ]; then page cat -- "$JOBS_DIR/$id/log"; fi ;;
+      d|D)
+        while IFS= read -r id; do
+          if [ "$(job_state "$id")" != "running" ]; then
+            rm -rf -- "${JOBS_DIR:?}/$id"
+          fi
+        done < <(job_ids)
+        ok "Finished jobs deleted."
+        ;;
+      0|"") return 0 ;;
+      *) warn "Unknown entry: $choice" ;;
+    esac
+  done
+}
+
+jobs_cli() {
+  local action="${1:-list}" id="${2:-}"
+  case "$action" in
+    list) jobs_list ;;
+    follow) job_follow "$id" ;;
+    cancel) job_cancel "$id" ;;
+    log) cat -- "$JOBS_DIR/$id/log" ;;
+    *) err "Usage: $SCRIPT_NAME jobs [list | follow N | cancel N | log N]"; return 2 ;;
+  esac
+}
+
+# Runs FUNCTION as a job and follows it: run_job TITLE [SECRET] -- FUNCTION ARGS...
+run_job() {
+  local id busy
+  if [ -z "$SCRIPT_PATH" ]; then
+    shift
+    if [ "$1" != "--" ]; then
+      shift
+    fi
+    shift
+    "$@"
+    return
+  fi
+  busy="$(job_busy "$@")"
+  if [ -n "$busy" ]; then
+    err "Job #$busy ($(cat -- "$JOBS_DIR/$busy/title")) is still running - follow or cancel it first (J)."
+    return 1
+  fi
+  id="$(job_start "$@")"
+  info "Started as job #$id - it keeps running when you leave this view or the SSH session ends."
+  job_follow "$id"
 }
 
 ###############################################################################
@@ -3774,10 +4887,12 @@ do_reset() {
   warn "  MongoDB data, MinIO files, RabbitMQ data, OpenSearch index, license volume,"
   warn "  worker tokens and Nginx Proxy Manager data / certificates."
   warn "This cannot be undone."
-  read -r -p "Type DELETE to continue: " answer || answer=""
-  if [ "$answer" != "DELETE" ]; then
-    info "Cancelled."
-    return 0
+  if [ "$INTERACTIVE" = "true" ]; then
+    read -r -p "Type DELETE to continue: " answer || answer=""
+    if [ "$answer" != "DELETE" ]; then
+      info "Cancelled."
+      return 0
+    fi
   fi
   compose down -v --remove-orphans
   ok "Containers and data volumes removed."
@@ -3927,7 +5042,7 @@ run_action() {
   rc=$?
   set -e
   case "$rc" in
-    0) ;;
+    0|3) ;;
     130) echo; warn "Interrupted." ;;
     *) warn "The step did not finish successfully (exit code $rc)." ;;
   esac
@@ -4011,14 +5126,322 @@ show_menu() {
   23) Take over an existing installation on this host (reads its .env and docker-compose.yml)
 
   99) Reset: remove containers AND all data volumes
+   J) Jobs: running and finished tasks (follow, cancel, log)
    0) Exit
 
 EOF
 }
 
+menu_up() {
+  if [ -f "$ENV_FILE" ] && [ -f "$COMPOSE_FILE" ] && settings_stale; then
+    warn "$ENV_FILE / $COMPOSE_FILE do not match the settings at the top of $SCRIPT_NAME."
+    if ! confirm "Start with the files as they are?" n; then
+      info "Cancelled."
+      return 0
+    fi
+  fi
+  run_job "Start / apply changes" -- do_up
+}
+
+menu_full_setup() {
+  do_generate ask no-next
+  if [ "$GENERATE_CANCELLED" = "true" ]; then
+    return 0
+  fi
+  echo
+  run_job "Full setup: start the stack" -- do_up
+}
+
+menu_down() {
+  if ! confirm "Stop and remove all containers of this stack? (data volumes are kept)" n; then
+    info "Cancelled."
+    return 0
+  fi
+  run_job "Stop the stack" -- do_down
+}
+
+menu_reset() {
+  local answer
+  warn "This removes ALL containers AND ALL data volumes of this stack:"
+  warn "  MongoDB data, MinIO files, RabbitMQ data, OpenSearch index, license volume,"
+  warn "  worker tokens and Nginx Proxy Manager data / certificates."
+  warn "This cannot be undone."
+  read -r -p "Type DELETE to continue: " answer || answer=""
+  if [ "$answer" != "DELETE" ]; then
+    info "Cancelled."
+    return 0
+  fi
+  run_job "Reset: remove containers and data volumes" -- do_reset
+}
+
+# Runs one menu choice. Returns 1 when the choice is unknown.
+menu_dispatch() {
+  reload_settings
+  case "$1" in
+    1)  edit_config ;;
+    2)  run_action do_generate ask ;;
+    3)  run_action edit_generated "$ENV_FILE" ;;
+    4)  run_action edit_generated "$COMPOSE_FILE" ;;
+    5)  run_action do_validate ;;
+    6)  run_action menu_up ;;
+    7)  run_action menu_full_setup ;;
+    8)  run_action do_updates; reload_settings ;;
+    9)  run_action do_status ;;
+    10) run_action do_logs ;;
+    11) run_action run_job "Pull images" -- do_pull ;;
+    12) run_action run_job "Restart the stack" -- do_restart ;;
+    13) run_action menu_down ;;
+    14) run_action show_credentials ;;
+    15) run_action show_access_info ;;
+    16) run_action do_check ;;
+    17) run_action download_snapshot ;;
+    18) run_action api_key_menu ;;
+    19) run_action import_snapshot_menu ;;
+    20) run_action local_self_sync ;;
+    21) run_action do_upgrade; reload_settings ;;
+    22) update_installer || true ;;
+    23) adopt_installation || true ;;
+    99) run_action menu_reset ;;
+    j|J) run_action jobs_menu ;;
+    *) warn "Unknown option: $1"; return 1 ;;
+  esac
+}
+
+menu_items() {
+  cat <<EOF
+L|SETUP
+1|Edit configuration
+2|Generate .env + docker-compose.yml
+3|Review .env
+4|Review docker-compose.yml
+5|Validate configuration
+6|Start / apply changes
+7|Full setup
+8|Updates and offline bundle
+L|
+L|CATALOG DATA
+17|Download catalog snapshot
+18|API keys
+19|Import snapshot
+20|Daily self-sync
+R|OPERATIONS
+9|Status
+10|Logs
+11|Pull images
+12|Restart the stack
+13|Stop the stack (data kept)
+14|Credentials
+15|URLs and Nginx Proxy Manager
+16|Check prerequisites
+R|
+R|MAINTENANCE
+21|Guided upgrade
+22|Update this installer
+23|Take over an installation
+99|Reset (deletes all data)
+EOF
+}
+
+tui_item() {
+  local num="$1" label="$2" width="$3"
+  if [ -z "$num" ]; then
+    printf '%s' "$(ui_repeat ' ' "$width")"
+  elif [ "$num" = "L" ] || [ "$num" = "R" ]; then
+    ui_pad "$C_CYN$label$C_RST" "$width"
+  elif [ "$num" = "99" ]; then
+    ui_pad "$(printf '%3s' "$num")  $C_RED$label$C_RST" "$width"
+  else
+    ui_pad "$C_BLD$(printf '%3s' "$num")$C_RST  $label" "$width"
+  fi
+}
+
+tui_draw() {
+  local cols="$1" left=() right=() line side num label i n col_w found head2 head3 version
+  version="$(version_label)"
+  head2="Catalog $CATALOG_VERSION"
+  if [[ "$version" == *"update available"* ]]; then
+    head2="$head2   $C_YLW$UI_UP ${version#*update available: }$C_RST"
+    head2="${head2%, option 8*}$C_YLW $UI_SEP option 21$C_RST"
+  elif [[ "$version" == *"up to date"* ]]; then
+    head2="$head2   $C_GRN$UI_OK up to date$C_RST"
+  fi
+  head3="Folder $WORK_DIR"
+  if [ -n "$COMPOSE_PROJECT_NAME" ]; then
+    head3="$head3 $UI_SEP project $COMPOSE_PROJECT_NAME"
+  fi
+  head3="$head3 $UI_SEP .env $(if [ -f "$ENV_FILE" ]; then printf '%s' "$C_GRN$UI_OK$C_RST"; else printf '%s' "$C_YLW$UI_NO$C_RST"; fi)"
+  head3="$head3 $UI_SEP compose $(if [ -f "$COMPOSE_FILE" ]; then printf '%s' "$C_GRN$UI_OK$C_RST"; else printf '%s' "$C_YLW$UI_NO$C_RST"; fi)"
+  head3="$head3 $UI_SEP stack $(stack_state)"
+  local notes=()
+  if [ ! -f "$ENV_FILE" ]; then
+    found="$(find_installations 2>/dev/null | head -n 1 | cut -d'|' -f2)" || found=""
+    if [ -n "$found" ]; then
+      notes+=("$C_YLW$UI_ARROW An installation exists in $found - option 23 takes it over$C_RST")
+    fi
+  fi
+  if [ -f "$UPGRADE_FAILED_FILE" ]; then
+    notes+=("$C_YLW$UI_ARROW The last upgrade did not become healthy - option 21 can go back$C_RST")
+  fi
+  if settings_stale; then
+    notes+=("$C_YLW$UI_ARROW The generated files differ from the settings - option 2 regenerates them$C_RST")
+  fi
+  clear_screen
+  ui_box "$cols" "RAYNET ONE TECHNOLOGY CATALOG $UI_SEP Installation Portal" "$head2" "$head3" ${notes[@]+"${notes[@]}"}
+  echo
+  col_w=$(( (cols - 4) / 2 ))
+  while IFS='|' read -r side label; do
+    case "$side" in
+      L) left+=("L|$label") ;;
+      R) right+=("R|$label") ;;
+      *)
+        if [ ${#right[@]} -gt 0 ]; then
+          right+=("$side|$label")
+        else
+          left+=("$side|$label")
+        fi
+        ;;
+    esac
+  done < <(menu_items)
+  n=${#left[@]}
+  if [ ${#right[@]} -gt "$n" ]; then
+    n=${#right[@]}
+  fi
+  for ((i = 0; i < n; i++)); do
+    printf '  %s%s\n' "$(tui_item "${left[i]%%|*}" "${left[i]#*|}" "$col_w")" "$(tui_item "${right[i]%%|*}" "${right[i]#*|}" "$col_w")"
+  done
+  echo
+  printf '  %s\n' "${C_DIM}Number + Enter $UI_SEP J jobs $UI_SEP Tab next process $UI_SEP hold X cancel process $UI_SEP Q quit$C_RST"
+}
+
+tui_draw_box() {
+  local cols="$1" rows="$2" width=48 row col boxlines=() i blank
+  UI_RUNNING_IDS="$(job_running_ids)"
+  if [ -z "$UI_RUNNING_IDS" ]; then
+    UI_JOB_SEL=""
+  elif [ -z "$UI_JOB_SEL" ] || ! grep -qx "$UI_JOB_SEL" <<< "$UI_RUNNING_IDS"; then
+    UI_JOB_SEL="$(head -n 1 <<< "$UI_RUNNING_IDS")"
+  fi
+  mapfile -t boxlines < <(ui_processes_box "$width")
+  row=$((rows - 10))
+  col=$((cols - width - 1))
+  UI_BOX_ROW="$row"
+  UI_BOX_COL="$col"
+  UI_BOX_HOLD=-1
+  if [ -n "$UI_RUNNING_IDS" ]; then
+    UI_BOX_HOLD=$((${#boxlines[@]} - 2))
+  fi
+  blank="$(ui_repeat ' ' "$width")"
+  printf '\0337'
+  for ((i = 0; i < 9; i++)); do
+    printf '\033[%d;%dH' $((row + i + 1)) $((col + 1))
+    if [ "$i" -lt "${#boxlines[@]}" ]; then
+      printf '%s' "${boxlines[i]}"
+    else
+      printf '%s' "$blank"
+    fi
+  done
+  printf '\0338'
+}
+
+tui_draw_hold() {
+  if [ "$UI_BOX_HOLD" -lt 1 ]; then
+    return 0
+  fi
+  printf '\0337\033[%d;%dH%s\0338' $((UI_BOX_ROW + UI_BOX_HOLD + 1)) $((UI_BOX_COL + 1)) "$(ui_box_line 48 "$(ui_hold_line)")"
+}
+
+# Full screen menu with the live "Current processes" box. Returns 2 when the terminal is too small.
+tui_menu() {
+  local cols rows key buf="" redraw=1 last_box=0 now ids next rest held=0
+  while true; do
+    if [ "$redraw" = 1 ]; then
+      cols="$(ui_cols)"
+      rows="$(ui_rows)"
+      if [ "$cols" -lt 100 ] || [ "$rows" -lt 36 ]; then
+        return 2
+      fi
+      tui_draw "$cols"
+      if [ -n "$TUI_NOTICE" ]; then
+        printf '  %s\n' "$C_GRN$UI_OK $TUI_NOTICE$C_RST"
+        TUI_NOTICE=""
+      fi
+      redraw=0
+      last_box=0
+    fi
+    now="$(ui_now_ms)"
+    if [ "$UI_HOLD_PCT" -gt 0 ]; then
+      tui_draw_hold
+      held=1
+    elif [ $((now - last_box)) -ge 1000 ] || [ "$held" = 1 ]; then
+      tui_draw_box "$cols" "$rows"
+      last_box="$now"
+      held=0
+    fi
+    printf '\033[%d;3H%s Select: %s\033[K' $((rows - 1)) "$C_CYN$UI_ARROW$C_RST" "$buf"
+    key=""
+    if ! read -rsn1 -t 0.1 key; then
+      ui_hold_key "" || true
+      continue
+    fi
+    if [ -n "$UI_JOB_SEL" ] && ui_hold_key "$key"; then
+      job_cancel "$UI_JOB_SEL" nowait >/dev/null 2>&1 || true
+      TUI_NOTICE="Cancelling process #$UI_JOB_SEL - it cleans up and then stops."
+      redraw=1
+      continue
+    fi
+    if [ "$UI_HOLD_PCT" -gt 0 ]; then
+      continue
+    fi
+    case "$key" in
+      [0-9]) buf="$buf$key" ;;
+      $'\x7f'|$'\x08') buf="${buf%?}" ;;
+      $'\t')
+        ids="$(job_running_ids)"
+        next="$(awk -v s="$UI_JOB_SEL" 'found { print; exit } $0 == s { found = 1 }' <<< "$ids")"
+        UI_JOB_SEL="${next:-$(head -n 1 <<< "$ids")}"
+        last_box=0
+        ;;
+      $'\033') read -rsn5 -t 0.01 rest || true ;;
+      j|J) tui_run J; redraw=1 ;;
+      q|Q)
+        tput cup $((rows - 1)) 0
+        echo
+        if [ -n "$(job_running_ids)" ]; then
+          info "Running processes continue in the background; start $SCRIPT_NAME again to see them."
+        fi
+        exit 0
+        ;;
+      "")
+        if [ -n "$buf" ]; then
+          if [ "$buf" = "0" ]; then
+            tput cup $((rows - 1)) 0
+            echo
+            exit 0
+          fi
+          tui_run "$buf"
+          buf=""
+          redraw=1
+        fi
+        ;;
+    esac
+  done
+}
+
+tui_run() {
+  clear_screen
+  tput cnorm 2>/dev/null || true
+  ui_echo
+  menu_dispatch "$1" || true
+  ui_echo
+  echo
+  pause
+  ui_noecho
+}
+
 menu() {
   local choice notice="${RVC_NOTICE:-}"
   INTERACTIVE="true"
+  TUI_NOTICE="$notice"
   unset RVC_NOTICE
   trap 'printf "\n"' INT
 
@@ -4034,6 +5457,13 @@ menu() {
     check_latest_version
   fi
 
+  if ui_fancy; then
+    trap 'tput cnorm 2>/dev/null || true; stty echo 2>/dev/null || true' EXIT
+    ui_noecho
+    tui_menu || true
+    ui_echo
+  fi
+
   while true; do
     clear_screen
     show_menu
@@ -4042,40 +5472,23 @@ menu() {
       echo
       notice=""
     fi
+    if [ -n "$SCRIPT_PATH" ] && [ -n "$(job_running_ids)" ]; then
+      echo " Running processes (J shows, follows and cancels them):"
+      while IFS= read -r choice; do
+        printf '   #%s %s  %s\n' "$choice" "$(cat -- "$JOBS_DIR/$choice/title")" "$(job_summary "$choice")"
+      done < <(job_running_ids)
+      echo
+    fi
     if ! read -r -p "Select an option: " choice; then
       echo
       exit 0
     fi
     echo
     case "$choice" in
-      1)  edit_config ;;
-      2)  run_action do_generate ask ;;
-      3)  run_action edit_generated "$ENV_FILE" ;;
-      4)  run_action edit_generated "$COMPOSE_FILE" ;;
-      5)  run_action do_validate ;;
-      6)  run_action do_up ;;
-      7)  run_action do_full_setup ;;
-      8)  run_action do_updates; reload_settings ;;
-      9)  run_action do_status ;;
-      10) run_action do_logs ;;
-      11) run_action do_pull ;;
-      12) run_action do_restart ;;
-      13) run_action do_down ;;
-      14) run_action show_credentials ;;
-      15) run_action show_access_info ;;
-      16) run_action do_check ;;
-      17) run_action download_snapshot ;;
-      18) run_action api_key_menu ;;
-      19) run_action import_snapshot_menu ;;
-      20) run_action local_self_sync ;;
-      21) run_action do_upgrade ;;
-      22) update_installer || true ;;
-      23) adopt_installation || true ;;
-      99) run_action do_reset ;;
       0|q|Q|exit|quit) exit 0 ;;
       "") continue ;;
-      *)  warn "Unknown option: $choice" ;;
     esac
+    menu_dispatch "$choice" || true
     echo
     pause
   done
@@ -4103,9 +5516,10 @@ Commands:
   info                        Show URLs and Nginx Proxy Manager instructions
   check                       Check prerequisites (Docker, Compose, ports, vm.max_map_count, Docker Hub)
   updates                     Show available updates for all components
-  upgrade                     Guided upgrade (asks before every step)
+  upgrade                     Guided upgrade (asks first, then runs as a background job)
   self-update                 Update this installer from GitHub, keeping the settings
   adopt [FOLDER]              Take over an existing installation (its .env, docker-compose.yml and data)
+  jobs [follow N|cancel N|log N]  Background tasks: list, follow, cancel (cleans up first), log
   download                    Download all images into a new offline bundle folder (+ .tar.gz)
   snapshot [daily|full]       Download the newest catalog snapshot (needs a stored API key)
   import FILE                 Import a snapshot file into the local catalog (needs a stored local key)
@@ -4158,6 +5572,8 @@ main() {
     upgrade) INTERACTIVE="true"; do_upgrade ;;
     self-update) update_installer cli ;;
     adopt) adopt_installation cli "${1:-}" ;;
+    jobs) jobs_cli "$@" ;;
+    __job) job_run "$@" ;;
     download) download_bundle all ;;
     snapshot) download_snapshot "${1:-daily}" cli ;;
     import) import_snapshot "${1:-}" cli ;;
