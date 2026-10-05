@@ -3802,11 +3802,13 @@ if [ "$UI_UTF" = "true" ]; then
   UI_FULL="█"; UI_EMPTY="░"; UI_OK="✔"; UI_NO="✖"; UI_DOT="●"; UI_UP="▲"; UI_SEP="·"; UI_ARROW="›"
   UI_HOLD_ON="▰"; UI_HOLD_OFF="▱"
   UI_STAR="★"; UI_MAJOR="⇧"; UI_RARR="→"; UI_HEART="♥"; UI_ON="■"; UI_OFF="□"
+  UI_EDIT="✎"; UI_RUN="▶"; UI_VIEW="◉"; UI_DEL="✖"
 else
   UI_TL="+"; UI_TR="+"; UI_BL="+"; UI_BR="+"; UI_H="-"; UI_V="|"
   UI_FULL="#"; UI_EMPTY="-"; UI_OK="ok"; UI_NO="x"; UI_DOT="*"; UI_UP="^"; UI_SEP="-"; UI_ARROW=">"
   UI_HOLD_ON="#"; UI_HOLD_OFF="-"
   UI_STAR="*"; UI_MAJOR="^^"; UI_RARR="->"; UI_HEART="<3"; UI_ON="[x]"; UI_OFF="[ ]"
+  UI_EDIT="e"; UI_RUN=">"; UI_VIEW="i"; UI_DEL="!"
 fi
 C_DIM=""
 C_CYN=""
@@ -6002,44 +6004,16 @@ show_menu() {
   if tz_note="$(tz_menu_note)" && [ -n "$tz_note" ]; then
     printf '%s\n' "${C_YLW}$tz_note${C_RST}"
   fi
-  cat <<EOF
-
- Setup
-   1) Edit configuration (opens this script in $(editor_name))
-   2) Generate .env and docker-compose.yml
-   3) Review / edit .env
-   4) Review / edit docker-compose.yml
-   5) Validate configuration (docker compose config)
-   6) Start the stack / apply changes (docker compose up -d)
-   7) Full setup: generate + validate + start
-   8) Updates and offline download (all components)
-
- Operations
-   9) Status (docker compose ps)
-  10) Logs
-  11) Pull images
-  12) Restart the stack
-  13) Stop the stack (docker compose down, data is kept)
-  14) Show credentials
-  15) Show URLs and Nginx Proxy Manager instructions
-  16) Check prerequisites
-
- Catalog data
-  17) Download the daily catalog snapshot (rayventorycatalog.raynet.de)
-  18) API keys: show, change, test, delete
-  19) Import a downloaded snapshot into the local catalog
-  20) Let the local catalog synchronize itself daily (online servers)
-
- Upgrade
-  21) Guided upgrade: Catalog to the newest version, health check, patch updates
-  22) Update this installer from GitHub (your settings are kept)
-  23) Take over an existing installation on this host (reads its .env and docker-compose.yml)
-
-  99) Reset: remove containers AND all data volumes
-   J) Jobs: running and finished tasks (follow, cancel, log)
-   0) Exit
-
-EOF
+  local col key kind label prev=""
+  echo
+  while IFS='|' read -r col key kind label; do
+    if [ "$key" = "-" ]; then
+      printf '\n %s\n' "$C_CYN$label$C_RST"
+    elif [ -n "$key" ]; then
+      printf '  %s) %s %s\n' "$(printf '%3s' "$key")" "$(menu_icon "$kind")" "$(if [ "$kind" = "del" ]; then printf '%s' "$C_RED$label$C_RST"; else printf '%s' "$label"; fi)"
+    fi
+  done < <(menu_items)
+  printf '\n    0) Exit\n\n  %s\n\n' "$(menu_legend)"
 }
 
 menu_up() {
@@ -6084,6 +6058,98 @@ menu_reset() {
   run_job "Reset: remove containers and data volumes" -- do_reset
 }
 
+# help_item KEY KIND NAME TEXT [MORE TEXT] -> one aligned entry of the help
+help_item() {
+  printf '  %2s %s %s %s' "$1" "$(menu_icon "$2")" "$(printf '%-26s' "$3")" "$4"
+  if [ -n "${5:-}" ]; then
+    printf '\n%34s%s' '' "$5"
+  fi
+}
+
+help_text() {
+  local b="$C_BLD" r="$C_RST" c="$C_CYN" d="$C_DIM"
+  cat <<EOF
+${b}RAYNET ONE TECHNOLOGY CATALOG $UI_SEP Installation Portal $UI_SEP Help$r
+${d}q leaves this help, the arrow keys and Space scroll$r
+
+${c}ABOUT RAYNET$r
+  Raynet GmbH (Paderborn, Germany, www.raynet.de) makes software for Software Asset Management,
+  IT Asset Management and application management. Raynet One is its platform to discover,
+  inventory and manage the software and hardware of an organisation.
+
+  The ${b}Raynet One Technology Catalog$r is the knowledge base behind it: manufacturers, software
+  products and versions, hardware products and models, the recognition rules (fingerprints) and
+  normalization rules that turn raw inventory data into clean product names, the UNSPSC
+  classification, and vulnerability data from NIST (CPE, CVE, CWE) linked to the products.
+  Raynet maintains the catalog centrally at $CATALOG_CLOUD_URL. A local Catalog gets it
+  as snapshots (option 17 and 19) or synchronizes itself every day (option 20).
+
+  This installer runs the local Catalog with Docker Compose: catalog-web, four workers, MongoDB,
+  OpenSearch with Dashboards, RabbitMQ, MinIO and, optionally, Nginx Proxy Manager.
+
+${c}THE ICONS$r
+  $(menu_icon edit)  edit      changes settings or files - nothing is started yet
+  $(menu_icon run)  run       does something: generates files, starts or stops containers, downloads, imports
+  $(menu_icon view)  view      only shows information
+  $(menu_icon del)  delete    removes data - you are asked to type DELETE first
+
+${c}SETUP$r
+$(help_item 7 run "Full setup" "Generates .env and docker-compose.yml, validates them and starts the stack." "Start here on a new server.")
+$(help_item 1 edit "Settings" "Opens the settings at the top of $SCRIPT_NAME in $(editor_name):" "versions, ports, time zone (TZ), sync time (AUTOSYNC_CRON) and more.")
+$(help_item 2 run "Generate" "Writes .env and docker-compose.yml from the settings. Passwords are kept;" "asks to align TZ with the server's time zone.")
+$(help_item 3 edit ".env file" "Shows or edits the generated .env (passwords included).")
+$(help_item 4 edit "docker-compose.yml" "Shows or edits the generated compose file.")
+$(help_item 5 view "Validate" "Lets Docker Compose check the files (docker compose config).")
+$(help_item 6 run "Start / apply changes" "docker compose up -d: starts the stack or applies changed files.")
+
+${c}ACCESS$r
+$(help_item 14 view "Credentials" "User names and passwords of MongoDB, MinIO and RabbitMQ from .env.")
+$(help_item 15 view "URLs and proxy setup" "Where Catalog Web and the other services answer, and the steps for" "Nginx Proxy Manager (TLS certificate, proxy host).")
+
+${c}RUN & MONITOR$r
+$(help_item 9 view "Status" "docker compose ps: which containers run and their health.")
+$(help_item 10 view "Logs" "Follow the logs of all or one service.")
+$(help_item 11 run "Pull images" "Downloads the images of the configured versions.")
+$(help_item 12 run "Restart the stack" "Restarts all containers.")
+$(help_item 13 run "Stop the stack" "docker compose down; the data volumes are kept.")
+$(help_item J view "Jobs" "Long tasks run as jobs: they continue when you leave the menu or the" "SSH session ends. Follow, cancel or read their log here.")
+
+${c}CATALOG DATA$r
+$(help_item 17 run "Download snapshot" "Downloads catalog data from $CATALOG_CLOUD_URL (needs an API key).")
+$(help_item 19 run "Import snapshot" "Uploads a downloaded snapshot into the local Catalog.")
+$(help_item 20 run "Daily self-sync" "Lets the local Catalog synchronize itself every day (servers with" "internet access).")
+$(help_item 18 edit "API keys" "Shows, changes, tests and deletes the keys for the online and the" "local Catalog. Keys are tested before they are saved.")
+
+${c}UPDATES & MAINTENANCE$r
+$(help_item 8 run "Updates & offline bundle" "Newest versions of all components, version picker, and" "\"Download only\": an offline bundle for servers without internet.")
+$(help_item 21 run "Guided upgrade" "Backup, new Catalog version, health check, patch updates; goes back" "by itself if you cancel it after the switch.")
+$(help_item 22 run "Update this installer" "Newest $SCRIPT_NAME from GitHub; your settings are kept.")
+$(help_item 23 run "Take over an installation" "Takes the settings of an existing installation (another folder," "or an older installer in this folder).")
+$(help_item 16 view "Check prerequisites" "Docker, Compose, kernel, ports, vm.max_map_count, time zone.")
+$(help_item 99 del "Reset" "Removes all containers AND all data volumes.")
+
+${c}KEYS IN THE MENU$r
+  Number + Enter   run an option          H or ?   this help          J   jobs
+  Tab              select a running job   hold X   cancel it (2 s)    Q   quit
+  The box "Current processes" shows running jobs with progress, speed and remaining time.
+
+${c}FILES NEXT TO THE INSTALLER$r
+  .env, docker-compose.yml    generated files (.env holds the passwords, mode 600)
+  snapshots/, backups/        downloaded snapshots, MongoDB backups taken before an upgrade
+  .jobs/                      state and logs of background jobs
+  RN1-Technology-Catalog-*    offline bundles
+
+${c}MORE$r
+  Command line: ./$SCRIPT_NAME help
+  Documentation: https://github.com/AKARABEL/rn1-technology-catalog-installer
+  Raynet: https://www.raynet.de
+EOF
+}
+
+show_help() {
+  page help_text
+}
+
 # Runs one menu choice. Returns 1 when the choice is unknown.
 menu_dispatch() {
   reload_settings
@@ -6113,61 +6179,98 @@ menu_dispatch() {
     23) adopt_installation || true ;;
     99) run_action menu_reset ;;
     j|J) run_action jobs_menu ;;
+    h|H|help|\?) show_help ;;
     *) warn "Unknown option: $1"; return 1 ;;
   esac
 }
 
+# COLUMN|KEY|KIND|LABEL - KIND: edit (changes settings or files), run (does something),
+# view (only shows information), del (deletes data); KEY "-" is a heading, an empty KEY a gap.
 menu_items() {
   cat <<EOF
-L|SETUP
-1|Edit configuration
-2|Generate .env + docker-compose.yml
-3|Review .env
-4|Review docker-compose.yml
-5|Validate configuration
-6|Start / apply changes
-7|Full setup
-8|Updates and offline bundle
-L|
-L|CATALOG DATA
-17|Download catalog snapshot
-18|API keys
-19|Import snapshot
-20|Daily self-sync
-R|OPERATIONS
-9|Status
-10|Logs
-11|Pull images
-12|Restart the stack
-13|Stop the stack (data kept)
-14|Credentials
-15|URLs and Nginx Proxy Manager
-16|Check prerequisites
-R|
-R|MAINTENANCE
-21|Guided upgrade
-22|Update this installer
-23|Take over an installation
-99|Reset (deletes all data)
+1|-||SETUP
+1|7|run|Full setup
+1|1|edit|Settings
+1|2|run|Generate .env + compose
+1|3|edit|.env file
+1|4|edit|docker-compose.yml
+1|5|view|Validate configuration
+1|6|run|Start / apply changes
+1|||
+1|-||ACCESS
+1|14|view|Credentials
+1|15|view|URLs and proxy setup
+2|-||RUN & MONITOR
+2|9|view|Status
+2|10|view|Logs
+2|11|run|Pull images
+2|12|run|Restart the stack
+2|13|run|Stop the stack (data kept)
+2|J|view|Jobs
+2|||
+2|||
+2|-||CATALOG DATA
+2|17|run|Download snapshot
+2|19|run|Import snapshot
+2|20|run|Daily self-sync
+2|18|edit|API keys
+3|-||UPDATES & MAINTENANCE
+3|8|run|Updates & offline bundle
+3|21|run|Guided upgrade
+3|22|run|Update this installer
+3|23|run|Take over an installation
+3|16|view|Check prerequisites
+3|99|del|Reset (deletes all data)
+3|||
+3|||
+3|-||HELP
+3|H|view|Help & about Raynet
 EOF
 }
 
+# Icon of a menu entry kind.
+menu_icon() {
+  case "$1" in
+    edit) printf '%s' "$C_YLW$UI_EDIT$C_RST" ;;
+    run) printf '%s' "$C_GRN$UI_RUN$C_RST" ;;
+    view) printf '%s' "$C_BLU$UI_VIEW$C_RST" ;;
+    del) printf '%s' "$C_RED$UI_DEL$C_RST" ;;
+    *) printf ' ' ;;
+  esac
+}
+
+menu_legend() {
+  printf '%s' "$(menu_icon edit) ${C_DIM}edit settings or files$C_RST   $(menu_icon run) ${C_DIM}runs an action$C_RST   $(menu_icon view) ${C_DIM}shows information$C_RST   $(menu_icon del) ${C_DIM}deletes data$C_RST"
+}
+
 tui_item() {
-  local num="$1" label="$2" width="$3"
-  if [ -z "$num" ]; then
+  local key="$1" kind="$2" label="$3" width="$4"
+  if [ -z "$key" ]; then
     printf '%s' "$(ui_repeat ' ' "$width")"
-  elif [ "$num" = "L" ] || [ "$num" = "R" ]; then
+  elif [ "$key" = "-" ]; then
     ui_pad "$C_CYN$label$C_RST" "$width"
-  elif [ "$num" = "99" ]; then
-    ui_pad "$(printf '%3s' "$num")  $C_RED$label$C_RST" "$width"
+  elif [ "$kind" = "del" ]; then
+    ui_pad "$C_BLD$(printf '%3s' "$key")$C_RST $(menu_icon "$kind") $C_RED$label$C_RST" "$width"
   else
-    ui_pad "$C_BLD$(printf '%3s' "$num")$C_RST  $label" "$width"
+    ui_pad "$C_BLD$(printf '%3s' "$key")$C_RST $(menu_icon "$kind") $label" "$width"
   fi
+}
+
+# tui_cell "KEY|KIND|LABEL" WIDTH -> one cell of the menu grid (empty: blank)
+tui_cell() {
+  local key kind label
+  if [ -z "$1" ]; then
+    printf '%s' "$(ui_repeat ' ' "$2")"
+    return 0
+  fi
+  IFS='|' read -r key kind label <<< "$1"
+  tui_item "$key" "$kind" "$label" "$2"
 }
 
 tui_draw() {
   reload_settings
-  local tz_note sib cols="$1" left=() right=() line side num label i n col_w found head2 head3 version
+  local tz_note sib cols="$1" line col key kind label i n col_w found head2 head3 version
+  local -a c1=() c2=() c3=()
   version="$(version_label)"
   head2="Catalog $CATALOG_VERSION"
   if [[ "$version" == *"update available"* ]]; then
@@ -6205,29 +6308,27 @@ tui_draw() {
   clear_screen
   ui_box "$cols" "RAYNET ONE TECHNOLOGY CATALOG $UI_SEP Installation Portal" "$head2" "$head3" ${notes[@]+"${notes[@]}"}
   echo
-  col_w=$(( (cols - 4) / 2 ))
-  while IFS='|' read -r side label; do
-    case "$side" in
-      L) left+=("L|$label") ;;
-      R) right+=("R|$label") ;;
-      *)
-        if [ ${#right[@]} -gt 0 ]; then
-          right+=("$side|$label")
-        else
-          left+=("$side|$label")
-        fi
-        ;;
+  col_w=$(( (cols - 4) / 3 ))
+  while IFS='|' read -r col key kind label; do
+    case "$col" in
+      1) c1+=("$key|$kind|$label") ;;
+      2) c2+=("$key|$kind|$label") ;;
+      3) c3+=("$key|$kind|$label") ;;
     esac
   done < <(menu_items)
-  n=${#left[@]}
-  if [ ${#right[@]} -gt "$n" ]; then
-    n=${#right[@]}
+  n=${#c1[@]}
+  if [ ${#c2[@]} -gt "$n" ]; then
+    n=${#c2[@]}
+  fi
+  if [ ${#c3[@]} -gt "$n" ]; then
+    n=${#c3[@]}
   fi
   for ((i = 0; i < n; i++)); do
-    printf '  %s%s\n' "$(tui_item "${left[i]%%|*}" "${left[i]#*|}" "$col_w")" "$(tui_item "${right[i]%%|*}" "${right[i]#*|}" "$col_w")"
+    printf '  %s%s%s\n' "$(tui_cell "${c1[i]:-}" "$col_w")" "$(tui_cell "${c2[i]:-}" "$col_w")" "$(tui_cell "${c3[i]:-}" "$col_w")"
   done
   echo
-  printf '  %s\n' "${C_DIM}Number + Enter $UI_SEP J jobs $UI_SEP Tab next process $UI_SEP hold X cancel process $UI_SEP Q quit$C_RST"
+  printf '  %s\n' "$(menu_legend)"
+  printf '  %s\n' "${C_DIM}Number + Enter $UI_SEP H help $UI_SEP J jobs $UI_SEP Tab next process $UI_SEP hold X cancel process $UI_SEP Q quit$C_RST"
 }
 
 tui_draw_box() {
@@ -6347,6 +6448,7 @@ tui_menu() {
         ;;
       $'\033') read -rsn5 -t 0.01 rest || true ;;
       j|J) tui_run J; redraw=1 ;;
+      h|H|\?) tui_run H; redraw=1 ;;
       q|Q)
         tput cup $((rows - 1)) 0
         echo
@@ -6377,8 +6479,10 @@ tui_run() {
   ui_echo
   menu_dispatch "$1" || true
   ui_echo
-  echo
-  pause
+  if [ "$1" != "H" ] || ! command -v less >/dev/null 2>&1; then
+    echo
+    pause
+  fi
   ui_noecho
 }
 
