@@ -97,13 +97,18 @@ fi
 exit 0
 EOF
 chmod +x "$T/bin/curl"
+cat > "$T/bin/timedatectl" <<'TZEOF'
+#!/usr/bin/env bash
+printf '%s\n' "${SHIM_TZ:-Europe/Berlin}"
+TZEOF
+chmod +x "$T/bin/timedatectl"
 export PATH="$T/bin:$PATH"
-D="$T/inst"; mkdir -p "$D"; cp "$NEW" "$D/catalog.sh"; sed -i 's/^CHECK_FOR_UPDATES=.*/CHECK_FOR_UPDATES="false"/' "$D/catalog.sh"
+D="$T/inst"; mkdir -p "$D"; cp "$NEW" "$D/rn1-technology-catalog-installer.sh"; sed -i 's/^CHECK_FOR_UPDATES=.*/CHECK_FOR_UPDATES="false"/' "$D/rn1-technology-catalog-installer.sh"
 K="$D/.catalog_api_key"
 probe="$T/p"; : > "$probe"; chmod 600 "$probe"; if [ "$(stat -c %a "$probe")" = 600 ]; then CHMOD_WORKS=yes; else CHMOD_WORKS=no; fi
 
 # 1. Option 17 without a stored key: wrong key, then valid key, save, download daily (default)
-out="$(printf "17\nWRONGKEY\n$VALID\ny\n\n\n0\n" | bash "$D/catalog.sh" menu 2>&1)"
+out="$(printf "17\nWRONGKEY\n$VALID\ny\n\n\n0\n" | bash "$D/rn1-technology-catalog-installer.sh" menu 2>&1)"
 check "wrong key rejected with server detail" 'grep -q "not valid: Api key is not registered in the database." <<< "$out"'
 check "valid key accepted after retry" 'grep -q "The API key is valid." <<< "$out"'
 check "key saved with mode 600" '[ -f "$K" ] && [ "$(tr -d "\r\n" < "$K")" = "$VALID" ] && { [ "$(stat -c %a "$K")" = 600 ] || [ "$CHMOD_WORKS" = no ]; }'
@@ -114,61 +119,61 @@ check "key passed via curl config on stdin" 'grep -q "cfg-key-present=yes" "$LOG
 check "https only, no redirects followed" 'grep "^curl " "$LOG" | grep -q -- "--proto =https" && ! grep "^curl " "$LOG" | grep -q -e " -L" -e "--location"'
 
 # 2. Stored key: full snapshot via the menu
-out="$(printf '17\n2\n\n0\n' | bash "$D/catalog.sh" menu 2>&1)"
+out="$(printf '17\n2\n\n0\n' | bash "$D/rn1-technology-catalog-installer.sh" menu 2>&1)"
 check "stored key tested and used" 'grep -q "Testing the stored API key ABCDEF0...2345" <<< "$out"'
 check "full snapshot downloaded" '[ -f "$D/snapshots/2026-09-28-full.tar.gz" ]'
 
 # 3. Same file again -> already downloaded
-out="$(printf '17\n1\n\n0\n' | bash "$D/catalog.sh" menu 2>&1)"
+out="$(printf '17\n1\n\n0\n' | bash "$D/rn1-technology-catalog-installer.sh" menu 2>&1)"
 check "already downloaded detected" 'grep -q "Already downloaded" <<< "$out"'
 
 # 4. Corrupt download -> removed, error
 rm -f "$D/snapshots/2026-10-02-daily.tar.gz"
-out="$(printf '17\n1\n\n0\n' | SHIM_CORRUPT=1 bash "$D/catalog.sh" menu 2>&1)"
+out="$(printf '17\n1\n\n0\n' | SHIM_CORRUPT=1 bash "$D/rn1-technology-catalog-installer.sh" menu 2>&1)"
 check "checksum mismatch rejected and cleaned" 'grep -q "Checksum mismatch" <<< "$out" && [ ! -e "$D/snapshots/2026-10-02-daily.tar.gz" ] && [ ! -e "$D/snapshots/2026-10-02-daily.tar.gz.part" ]'
 
 # 5. CLI snapshot (stored key, non-interactive)
-out="$(bash "$D/catalog.sh" snapshot daily </dev/null 2>&1)"; rc=$?
+out="$(bash "$D/rn1-technology-catalog-installer.sh" snapshot daily </dev/null 2>&1)"; rc=$?
 check "CLI snapshot daily" '[ "$rc" -eq 0 ] && [ -f "$D/snapshots/2026-10-02-daily.tar.gz" ]'
 
 # 6. API key menu: masked display, show full, test, delete
-out="$(printf '18\n1\ny\n3\n0\n\n0\n' | bash "$D/catalog.sh" menu 2>&1)"
+out="$(printf '18\n1\ny\n3\n0\n\n0\n' | bash "$D/rn1-technology-catalog-installer.sh" menu 2>&1)"
 check "menu shows masked key" 'grep -q "Online catalog (https://rayventorycatalog.raynet.de): ABCDEF0...2345" <<< "$out"'
 check "show full key after confirmation" 'grep -q "   $VALID" <<< "$out"'
 check "test stored key" 'grep -q "The API key is valid." <<< "$out"'
-out="$(printf '18\n4\ny\n0\n\n0\n' | bash "$D/catalog.sh" menu 2>&1)"
+out="$(printf '18\n4\ny\n0\n\n0\n' | bash "$D/rn1-technology-catalog-installer.sh" menu 2>&1)"
 check "delete key" '[ ! -e "$K" ] && grep -q "Key deleted." <<< "$out"'
 
 # 7. Add key via menu: forbidden key not saved; valid key saved after immediate test
-out="$(printf "18\n2\n$NOSYNC\n\n0\n\n0\n" | bash "$D/catalog.sh" menu 2>&1)"
+out="$(printf "18\n2\n$NOSYNC\n\n0\n\n0\n" | bash "$D/rn1-technology-catalog-installer.sh" menu 2>&1)"
 check "key without sync role rejected, not saved" 'grep -q "no synchronization permission" <<< "$out" && [ ! -e "$K" ]'
-out="$(printf "18\n2\n$(printf '%s' "$VALID" | tr 'A-F' 'a-f')\ny\n0\n\n0\n" | bash "$D/catalog.sh" menu 2>&1)"
+out="$(printf "18\n2\n$(printf '%s' "$VALID" | tr 'A-F' 'a-f')\ny\n0\n\n0\n" | bash "$D/rn1-technology-catalog-installer.sh" menu 2>&1)"
 check "lower-case key normalized, tested and saved" '[ "$(tr -d "\r\n" < "$K")" = "$VALID" ] && grep -q "API key saved." <<< "$out"'
 
 # 8. Do not save when declined
 rm -f "$K"
-out="$(printf "17\n$VALID\nn\n0\n\n0\n" | bash "$D/catalog.sh" menu 2>&1)"
+out="$(printf "17\n$VALID\nn\n0\n\n0\n" | bash "$D/rn1-technology-catalog-installer.sh" menu 2>&1)"
 check "declined save leaves no key file" '[ ! -e "$K" ]'
 
 # 9. CLI without key; offline; no manifest yet
-out="$(bash "$D/catalog.sh" snapshot </dev/null 2>&1)"; rc=$?
+out="$(bash "$D/rn1-technology-catalog-installer.sh" snapshot </dev/null 2>&1)"; rc=$?
 check "CLI without stored key fails" '[ "$rc" -ne 0 ] && grep -q "No API key stored" <<< "$out"'
 api_key_save_file() { printf '%s\n' "$VALID" > "$K"; chmod 600 "$K"; }
 api_key_save_file
-out="$(SHIM_OFFLINE=1 bash "$D/catalog.sh" snapshot </dev/null 2>&1)"; rc=$?
+out="$(SHIM_OFFLINE=1 bash "$D/rn1-technology-catalog-installer.sh" snapshot </dev/null 2>&1)"; rc=$?
 check "offline: clear message, no 'invalid'" '[ "$rc" -ne 0 ] && grep -q "could not be checked" <<< "$out" && ! grep -q "not valid" <<< "$out"'
-out="$(SHIM_NO_MANIFEST=1 bash "$D/catalog.sh" snapshot </dev/null 2>&1)"; rc=$?
+out="$(SHIM_NO_MANIFEST=1 bash "$D/rn1-technology-catalog-installer.sh" snapshot </dev/null 2>&1)"; rc=$?
 check "no manifest yet: valid key, nothing to download" '[ "$rc" -eq 0 ] && grep -q "has no snapshot yet" <<< "$out"'
 
-out="$(SHIM_OLD_SERVER=1 bash "$D/catalog.sh" snapshot </dev/null 2>&1)"; rc=$?
+out="$(SHIM_OLD_SERVER=1 bash "$D/rn1-technology-catalog-installer.sh" snapshot </dev/null 2>&1)"; rc=$?
 check "server without v3 API: not reported as valid" '[ "$rc" -ne 0 ] && grep -q "offers no snapshot API" <<< "$out" && ! grep -q "The API key is valid" <<< "$out"'
 
 # 10. Key file is not part of an offline bundle copy and not in help as plain text
-check "help lists snapshot command" 'bash "$D/catalog.sh" help | grep -q "snapshot \[daily|full\]"'
+check "help lists snapshot command" 'bash "$D/rn1-technology-catalog-installer.sh" help | grep -q "snapshot \[daily|full\]"'
 
 # 11. Import a downloaded snapshot: local key asked, tested, saved; upload; progress followed
 LK="$D/.catalog_local_api_key"; rm -f "$LK" "$SRV/polls"; : > "$LOG"
-out="$(printf "19\n1\ny\n1\n$LOCALSYNC\ny\n\n0\n" | bash "$D/catalog.sh" menu 2>&1)"
+out="$(printf "19\n1\ny\n1\n$LOCALSYNC\ny\n\n0\n" | bash "$D/rn1-technology-catalog-installer.sh" menu 2>&1)"
 check "local key tested (non-admin) and saved" 'grep -q "Access to the local catalog works (no administrator rights)." <<< "$out" && [ "$(tr -d "\r\n" < "$LK")" = "$LOCALSYNC" ]'
 check "snapshot uploaded as gzip file part" 'grep -q "^file=@.*2026-10-02-daily.tar.gz;type=application/gzip$" "$SRV/upload-form.txt"'
 check "operation followed until finished" 'grep -q "Import finished." <<< "$out" && [ "$(cat "$SRV/polls")" -ge 2 ]'
@@ -176,26 +181,26 @@ check "local key never on a command line" '! grep "^curl " "$LOG" | grep -q "$LO
 
 # 12. CLI import with the stored local key; failed operation reported
 rm -f "$SRV/polls"
-out="$(SHIM_OP_RESULT=failed bash "$D/catalog.sh" import "$D/snapshots/2026-09-28-full.tar.gz" </dev/null 2>&1)"; rc=$?
+out="$(SHIM_OP_RESULT=failed bash "$D/rn1-technology-catalog-installer.sh" import "$D/snapshots/2026-09-28-full.tar.gz" </dev/null 2>&1)"; rc=$?
 check "CLI import: failed operation -> rc!=0" '[ "$rc" -ne 0 ] && grep -q "Import failed: done" <<< "$out"'
-out="$(bash "$D/catalog.sh" import /nonexistent.tar.gz </dev/null 2>&1)"; rc=$?
+out="$(bash "$D/rn1-technology-catalog-installer.sh" import /nonexistent.tar.gz </dev/null 2>&1)"; rc=$?
 check "CLI import: missing file" '[ "$rc" -ne 0 ] && grep -q "File not found" <<< "$out"'
-out="$(SHIM_LOCAL_DOWN=1 bash "$D/catalog.sh" import "$D/snapshots/2026-09-28-full.tar.gz" </dev/null 2>&1)"; rc=$?
+out="$(SHIM_LOCAL_DOWN=1 bash "$D/rn1-technology-catalog-installer.sh" import "$D/snapshots/2026-09-28-full.tar.gz" </dev/null 2>&1)"; rc=$?
 check "CLI import: stack down -> clear message" '[ "$rc" -ne 0 ] && grep -q "not reachable at http://localhost:8080" <<< "$out"'
 
 # 13. Self-sync: needs admin; admin login with special characters; settings merged, sync started
 rm -f "$LK" "$SRV/polls" "$SRV/sync-settings.json"; : > "$LOG"
-out="$(printf '20\n2\nadmin\np@ss"w0rd\ny\n\n0\n' | bash "$D/catalog.sh" menu 2>&1)"
+out="$(printf '20\n2\nadmin\np@ss"w0rd\ny\n\n0\n' | bash "$D/rn1-technology-catalog-installer.sh" menu 2>&1)"
 check "admin login with quote in password" 'grep -q "Logged in to the local catalog." <<< "$out" && grep -qF "\"password\":\"p@ss\\\"w0rd\"" "$SRV/login-body.json"'
 check "password never on a command line" '! grep "^curl " "$LOG" | grep -q "p@ss"'
 check "sync settings: online URL + key set, proxy kept" 'grep -q "\"parentInstanceUrl\": *\"https://rayventorycatalog.raynet.de\"" "$SRV/sync-settings.json" && grep -q "\"parentInstanceKey\": *\"$VALID\"" "$SRV/sync-settings.json" && grep -q "proxy:3128" "$SRV/sync-settings.json"'
 check "synchronization started and followed" 'grep -q "now synchronizes from https://rayventorycatalog.raynet.de" <<< "$out" && grep -q "Import finished." <<< "$out"'
-out="$(printf "20\n1\n$LOCALSYNC\nn\n\n0\n" | bash "$D/catalog.sh" menu 2>&1)"
+out="$(printf "20\n1\n$LOCALSYNC\nn\n\n0\n" | bash "$D/rn1-technology-catalog-installer.sh" menu 2>&1)"
 check "self-sync refused without admin rights" 'grep -q "needs a local administrator" <<< "$out"'
 
 # 14. Key menu: local key add / test / delete
 rm -f "$LK"
-out="$(printf "18\n6\n1\n$LOCALADMIN\ny\n7\n8\ny\n0\n\n0\n" | bash "$D/catalog.sh" menu 2>&1)"
+out="$(printf "18\n6\n1\n$LOCALADMIN\ny\n7\n8\ny\n0\n\n0\n" | bash "$D/rn1-technology-catalog-installer.sh" menu 2>&1)"
 check "local key added (admin), tested and deleted" 'grep -q "Local API key saved." <<< "$out" && grep -q "works (administrator)" <<< "$out" && grep -q "Key deleted." <<< "$out" && [ ! -e "$LK" ]'
 
 echo "== $PASS passed, $FAIL failed"

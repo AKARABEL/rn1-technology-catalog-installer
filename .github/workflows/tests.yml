@@ -15,18 +15,22 @@ jobs:
         with:
           persist-credentials: false
       - name: Syntax
-        run: bash -n catalog.sh && dash -c 'exit 0'
+        run: bash -n rn1-technology-catalog-installer.sh && dash -c 'exit 0'
+      - name: catalog.sh is an identical copy (update address of older installations)
+        run: cmp catalog.sh rn1-technology-catalog-installer.sh && test -x catalog.sh && test -x rn1-technology-catalog-installer.sh
       - name: Generator, menu and Catalog versions
-        run: bash tests/run_tests.sh "$PWD/catalog.sh"
+        run: bash tests/run_tests.sh "$PWD/rn1-technology-catalog-installer.sh"
       - name: Updates and offline bundle
-        run: bash tests/run_bundle_tests.sh "$PWD/catalog.sh"
+        run: bash tests/run_bundle_tests.sh "$PWD/rn1-technology-catalog-installer.sh"
       - name: Snapshots, API keys and import
-        run: bash tests/run_snapshot_tests.sh "$PWD/catalog.sh"
+        run: bash tests/run_snapshot_tests.sh "$PWD/rn1-technology-catalog-installer.sh"
       - name: Guided upgrade
-        run: bash tests/run_upgrade_tests.sh "$PWD/catalog.sh"
+        run: bash tests/run_upgrade_tests.sh "$PWD/rn1-technology-catalog-installer.sh"
       - name: Installer self-update
-        run: bash tests/run_selfupdate_tests.sh "$PWD/catalog.sh"
+        run: bash tests/run_selfupdate_tests.sh "$PWD/rn1-technology-catalog-installer.sh"
       - name: Take over an existing installation
-        run: bash tests/run_adopt_tests.sh "$PWD/catalog.sh"
+        run: bash tests/run_adopt_tests.sh "$PWD/rn1-technology-catalog-installer.sh"
       - name: Background jobs, cancel and the full screen menu
-        run: bash tests/run_jobs_tests.sh "$PWD/catalog.sh"
+        run: bash tests/run_jobs_tests.sh "$PWD/rn1-technology-catalog-installer.sh"
+      - name: Time zone and job times
+        run: bash tests/run_timezone_tests.sh "$PWD/rn1-technology-catalog-installer.sh"

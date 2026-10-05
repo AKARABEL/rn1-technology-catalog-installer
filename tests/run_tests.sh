@@ -43,6 +43,11 @@ case "$url" in
 esac
 EOF
 chmod +x "$T/bin/curl"
+cat > "$T/bin/timedatectl" <<'TZEOF'
+#!/usr/bin/env bash
+printf '%s\n' "${SHIM_TZ:-Europe/Berlin}"
+TZEOF
+chmod +x "$T/bin/timedatectl"
 export PATH="$T/bin:$PATH" SHIM_LOG="$T/docker.log" HUB_DIR="$SP/hub"
 : > "$SHIM_LOG"
 mask() { sed -E 's/^((MONGO_INITDB_ROOT|MINIO_ROOT)_PASSWORD|RABBITMQ_DEFAULT_PASS)=.*/\1=X/' "$1"; }

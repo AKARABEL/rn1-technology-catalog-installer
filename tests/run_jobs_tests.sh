@@ -63,15 +63,20 @@ fi
 exit 0
 EOF
 chmod +x "$T/bin/curl"
+cat > "$T/bin/timedatectl" <<'TZEOF'
+#!/usr/bin/env bash
+printf '%s\n' "${SHIM_TZ:-Europe/Berlin}"
+TZEOF
+chmod +x "$T/bin/timedatectl"
 export PATH="$T/bin:$PATH"
-D="$T/inst"; mkdir -p "$D"; cp "$NEW" "$D/catalog.sh"; sed -i 's/^CHECK_FOR_UPDATES=.*/CHECK_FOR_UPDATES="false"/' "$D/catalog.sh"
+D="$T/inst"; mkdir -p "$D"; cp "$NEW" "$D/rn1-technology-catalog-installer.sh"; sed -i 's/^CHECK_FOR_UPDATES=.*/CHECK_FOR_UPDATES="false"/' "$D/rn1-technology-catalog-installer.sh"
 printf '%s\n' "$VALID" > "$D/.catalog_api_key"; chmod 600 "$D/.catalog_api_key"
 PART="$D/snapshots/2026-10-02-daily.tar.gz.part"
 FILE="$D/snapshots/2026-10-02-daily.tar.gz"
 state() { cat "$D/.jobs/$1/state" 2>/dev/null; }
 
 # 1. The SSH session ends while the download runs: the job carries on and finishes
-setsid bash -c 'printf "17\n1\n\n\n0\n" | bash "$0/catalog.sh" menu > "$0/menu1.out" 2>&1' "$D" &
+setsid bash -c 'printf "17\n1\n\n\n0\n" | bash "$0/rn1-technology-catalog-installer.sh" menu > "$0/menu1.out" 2>&1' "$D" &
 sp=$!
 disown "$sp" 2>/dev/null || true
 wait_for '[ -s "$PART" ]'
@@ -89,10 +94,10 @@ check "key never on a command line" '! grep "^curl " "$LOG" | grep -q "$VALID"'
 
 # 2. Cancel from another session: curl stops and the partial file is removed
 rm -f "$FILE"
-( printf '17\n1\n\n0\n' | bash "$D/catalog.sh" menu > "$T/menu2.out" 2>&1 ) &
+( printf '17\n1\n\n0\n' | bash "$D/rn1-technology-catalog-installer.sh" menu > "$T/menu2.out" 2>&1 ) &
 mp=$!
 wait_for '[ -s "$PART" ]'
-out="$(bash "$D/catalog.sh" jobs cancel 2 2>&1)"
+out="$(bash "$D/rn1-technology-catalog-installer.sh" jobs cancel 2 2>&1)"
 wait "$mp"
 sleep 1
 check "cancel reported" 'grep -q "Job #2 cancelled" <<< "$out"'
@@ -101,31 +106,31 @@ check "partial download removed and not written again" '[ ! -e "$PART" ] && [ ! 
 check "following view reports the cancel" 'grep -q "Job #2 was cancelled" "$T/menu2.out"'
 
 # 3. jobs CLI
-out="$(bash "$D/catalog.sh" jobs list 2>&1)"
+out="$(bash "$D/rn1-technology-catalog-installer.sh" jobs list 2>&1)"
 check "jobs list shows done and cancelled" 'grep -Eq "^ +1 +done " <<< "$out" && grep -Eq "^ +2 +cancelled " <<< "$out"'
-out="$(bash "$D/catalog.sh" jobs log 1 2>&1)"
+out="$(bash "$D/rn1-technology-catalog-installer.sh" jobs log 1 2>&1)"
 check "jobs log prints the log" 'grep -q "Snapshot saved" <<< "$out"'
-out="$(bash "$D/catalog.sh" jobs cancel 1 2>&1)"; rc=$?
+out="$(bash "$D/rn1-technology-catalog-installer.sh" jobs cancel 1 2>&1)"; rc=$?
 check "finished job cannot be cancelled" '[ "$rc" -ne 0 ] && grep -q "is not running" <<< "$out"'
 
 # 4. Only one snapshot download at a time (slower server from here on)
 export SHIM_DELAY=0.7
-( printf '17\n1\n\n0\n' | bash "$D/catalog.sh" menu > "$T/menu3.out" 2>&1 ) &
+( printf '17\n1\n\n0\n' | bash "$D/rn1-technology-catalog-installer.sh" menu > "$T/menu3.out" 2>&1 ) &
 mp=$!
 wait_for '[ -s "$PART" ]'
-out="$(printf '17\n1\n\n0\n' | bash "$D/catalog.sh" menu 2>&1)"
+out="$(printf '17\n1\n\n0\n' | bash "$D/rn1-technology-catalog-installer.sh" menu 2>&1)"
 check "second download refused while one runs" 'grep -q "Job #3 (Snapshot download" <<< "$out" && grep -q "is still running" <<< "$out" && [ ! -d "$D/.jobs/4" ]'
 
 # 5. Full screen menu: Current processes box, hold X cancels the selected process
 if command -v script >/dev/null 2>&1; then
   out="$( { sleep 3; for i in $(seq 1 35); do printf x; sleep 0.08; done; sleep 3; printf q; } \
-    | TERM=xterm LANG=C.UTF-8 script -qfec "stty cols 120 rows 40; bash $D/catalog.sh menu" /dev/null 2>&1 | sed 's/\x1b[[(][0-9;?]*[A-Za-z]//g; s/\x1b[78]//g')"
+    | TERM=xterm LANG=C.UTF-8 script -qfec "stty cols 120 rows 40; bash $D/rn1-technology-catalog-installer.sh menu" /dev/null 2>&1 | sed 's/\x1b[[(][0-9;?]*[A-Za-z]//g; s/\x1b[78]//g')"
   wait "$mp"
   check "menu shows the Current processes box with the job" 'grep -q "Current processes" <<< "$out" && grep -q "#3 Snapshot download" <<< "$out"'
   check "holding X cancelled the job" '[ "$(state 3)" = cancelled ] && [ ! -e "$PART" ]'
   check "cancel animation shown" 'grep -q "keep holding X" <<< "$out"'
 else
-  bash "$D/catalog.sh" jobs cancel 3 >/dev/null 2>&1; wait "$mp"
+  bash "$D/rn1-technology-catalog-installer.sh" jobs cancel 3 >/dev/null 2>&1; wait "$mp"
   echo "SKIP: script (util-linux) missing - no full screen test"
 fi
 

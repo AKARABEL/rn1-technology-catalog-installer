@@ -9,3 +9,4 @@ RN1-Technology-Catalog-*
 backups/
 .jobs/
 .upgrade-failed
+.timezone-kept

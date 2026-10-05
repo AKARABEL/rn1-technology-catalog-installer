@@ -1,6 +1,6 @@
 # RN1 Technology Catalog Installer
 
-`catalog.sh` installs and runs the **Raynet One Technology Catalog** with Docker Compose. A menu guides you through setup, updates, offline installations and catalog snapshots.
+`rn1-technology-catalog-installer.sh` installs and runs the **Raynet One Technology Catalog** with Docker Compose. A menu guides you through setup, updates, offline installations and catalog snapshots.
 
 ## Requirements
 
@@ -10,24 +10,24 @@
 
 ## Install with one command
 
-On the server, in the folder where the Catalog should live:
+On the server, in the folder where the Catalog should live (the installer keeps `.env`, `docker-compose.yml`, `snapshots/` and `backups/` next to itself):
 
 ```bash
-mkdir -p ~/rn1-technology-catalog && cd ~/rn1-technology-catalog && wget -qO catalog.sh https://raw.githubusercontent.com/AKARABEL/rn1-technology-catalog-installer/main/catalog.sh && bash catalog.sh
+wget -qO rn1-technology-catalog-installer.sh https://raw.githubusercontent.com/AKARABEL/rn1-technology-catalog-installer/main/rn1-technology-catalog-installer.sh && chmod +x rn1-technology-catalog-installer.sh && ./rn1-technology-catalog-installer.sh
 ```
 
-Then choose **7** (generate + validate + start). The settings are at the top of `catalog.sh`; option **1** opens them in `vi`.
+Then choose **7** (generate + validate + start). The settings are at the top of `rn1-technology-catalog-installer.sh`; option **1** opens them in `vi`.
 
 - Run the script as a file, as shown above. Piping it into bash (`wget -O- ... | bash`) does not work, because the menu needs the keyboard and the script stores its settings in its own file.
-- **Later updates:** use option **22** (or `./catalog.sh self-update`) instead of the `wget` line. It downloads the newest version and keeps all your settings. The previous version is kept as `catalog.sh.bak-<timestamp>`. Running the `wget` line again would overwrite your settings.
+- **Later updates:** use option **22** (or `./rn1-technology-catalog-installer.sh self-update`) instead of the `wget` line. It downloads the newest version and keeps all your settings. The previous version is kept as `rn1-technology-catalog-installer.sh.bak-<timestamp>`. Running the `wget` line again would overwrite your settings.
 
 ## A Catalog already runs on the server
 
 If the Catalog was installed earlier in another folder, for example with an older script in `/root`, the menu shows where that installation is. Option **23** then takes it over:
 
-- It finds the installation from the Docker Compose labels of its containers: project, folder, compose file and env file. If the containers carry no labels, it searches `/root`, `/home`, `/opt` and `/srv`, or uses the folder you name with `./catalog.sh adopt FOLDER`.
+- It finds the installation from the Docker Compose labels of its containers: project, folder, compose file and env file. If the containers carry no labels, it searches `/root`, `/home`, `/opt` and `/srv`, or uses the folder you name with `./rn1-technology-catalog-installer.sh adopt FOLDER`.
 - It shows the version, the ports and which passwords were found; the passwords themselves are not displayed.
-- It copies `.env` (with the passwords) and `docker-compose.yml` into this folder, and writes the values into the settings of `catalog.sh`.
+- It copies `.env` (with the passwords) and `docker-compose.yml` into this folder, and writes the values into the settings of `rn1-technology-catalog-installer.sh`.
 - It sets `COMPOSE_PROJECT_NAME` to the existing project (for example `root`), so that the same containers and data volumes stay in use. A new folder name would otherwise start a second, empty stack.
 - The running containers and the old folder are not changed. If the old compose file differs from what this installer generates (for example another MinIO image), the differences are listed. They take effect only with option 2 (generate) and 6 (start).
 
@@ -45,7 +45,7 @@ Long tasks run as background jobs: start, pull, restart, stop, snapshot download
   - an upgrade cancelled before `docker compose down` changes nothing, and after it goes back to the previous version.
 - Holding X again while a job is still cleaning up stops it at once.
 - Jobs of the same kind (for example two jobs that change the stack) do not run at the same time.
-- From the command line: `./catalog.sh jobs [list | follow N | cancel N | log N]`.
+- From the command line: `./rn1-technology-catalog-installer.sh jobs [list | follow N | cancel N | log N]`.
 
 ## Menu
 
@@ -71,19 +71,20 @@ Long tasks run as background jobs: start, pull, restart, stop, snapshot download
 ## Command line
 
 ```text
-./catalog.sh help                    all commands
-./catalog.sh setup                   generate + validate + up
-./catalog.sh generate [--new-passwords]
-./catalog.sh up | down | status | logs [service] | pull | restart
-./catalog.sh updates                 available updates of all components
-./catalog.sh upgrade                 guided upgrade (asks first, then runs as a job)
-./catalog.sh jobs [list | follow N | cancel N | log N]
-./catalog.sh self-update             newest installer from GitHub, settings kept
-./catalog.sh adopt [FOLDER]          take over an existing installation
-./catalog.sh download                offline bundle with all images (+ .tar.gz)
-./catalog.sh versions | set-version VERSION|stable
-./catalog.sh snapshot [daily|full]   needs a stored online API key
-./catalog.sh import FILE             needs a stored local API key
+./rn1-technology-catalog-installer.sh help                    all commands
+./rn1-technology-catalog-installer.sh setup                   generate + validate + up
+./rn1-technology-catalog-installer.sh generate [--new-passwords]
+./rn1-technology-catalog-installer.sh up | down | status | logs [service] | pull | restart
+./rn1-technology-catalog-installer.sh updates                 available updates of all components
+./rn1-technology-catalog-installer.sh timezone                use the server's time zone for TZ (job times converted)
+./rn1-technology-catalog-installer.sh upgrade                 guided upgrade (asks first, then runs as a job)
+./rn1-technology-catalog-installer.sh jobs [list | follow N | cancel N | log N]
+./rn1-technology-catalog-installer.sh self-update             newest installer from GitHub, settings kept
+./rn1-technology-catalog-installer.sh adopt [FOLDER]          take over an existing installation
+./rn1-technology-catalog-installer.sh download                offline bundle with all images (+ .tar.gz)
+./rn1-technology-catalog-installer.sh versions | set-version VERSION|stable
+./rn1-technology-catalog-installer.sh snapshot [daily|full]   needs a stored online API key
+./rn1-technology-catalog-installer.sh import FILE             needs a stored local API key
 ```
 
 ## Offline installation
@@ -93,10 +94,10 @@ Long tasks run as background jobs: start, pull, restart, stop, snapshot download
    - `images.txt`
    - `SHA256SUMS`
    - `import-images.sh`
-   - a copy of `catalog.sh`
+   - a copy of `rn1-technology-catalog-installer.sh`
 
    It can also create a `.tar.gz` and copy it with scp. Before any password is sent, it shows the SSH host key fingerprint for confirmation.
-2. On the target: unpack the archive, run `./import-images.sh` (it detects docker or podman and verifies the checksums), then run `./catalog.sh` and choose **7**.
+2. On the target: unpack the archive, run `./import-images.sh` (it detects docker or podman and verifies the checksums), then run the installer it names (`./rn1-technology-catalog-installer.sh`, or `./catalog.sh` in bundles from older versions) and choose **7**.
 
 The bundle contains no `.env`. The target generates its own passwords.
 
@@ -143,6 +144,25 @@ These files are created at runtime and are listed in `.gitignore`. Do not commit
 | `RN1-Technology-Catalog-*` | offline bundles |
 | `.jobs/` | state and logs of background jobs (mode 700; the newest 25 finished jobs are kept) |
 | `.upgrade-failed` | marker of an upgrade that did not become healthy |
+| `.timezone-kept` | `TZ` was kept although the server uses another zone (not asked again) |
+
+## Time zone
+
+The Catalog runs its daily synchronization (`AUTOSYNC_CRON`, default `30 7 * * *`) and the vulnerability caching (`VULNERABILITIES_CACHING_CRON`) in the local time of its containers, which is `TZ` (default `Europe/Berlin`), including summer and winter time.
+
+- Options **2** and **7** compare `TZ` with the time zone of the server. If they differ, they show both times and offer to use the server's zone. With **yes**, `TZ` and the job times change together, so the jobs keep running at the same moment. Example on a server in `Asia/Singapore`: `30 7 * * *` (07:30 Europe/Berlin) becomes `30 13 * * *` during German summer time and `30 14 * * *` during winter time.
+- When the two zones change their clocks on different dates, the converted time matches the old one only for part of the year; the question says so.
+- For an existing installation the question defaults to **no**, so only an explicit yes changes it. With **no**, `TZ` stays and the question is not repeated for this server zone. `./rn1-technology-catalog-installer.sh timezone` asks again.
+- A job time that one cron line cannot express in the other zone (for example a day of the month that moves to the next day) is left as it is and named in the question.
+- Option **16** shows both zones.
+
+## Installations from before the rename
+
+Until 2026-10-05 the installer was called `catalog.sh`. Such installations keep working under their old name:
+
+- Option **22** updates them. The repository still contains `catalog.sh` as an identical copy, because their update address points to it; after this first update they fetch `rn1-technology-catalog-installer.sh` themselves.
+- To use the new name, rename the file while no job runs (check with **J**): `mv catalog.sh rn1-technology-catalog-installer.sh`. The installer finds its settings and files by its own location, so nothing else changes. If you keep the old name, use `./catalog.sh` wherever this README writes `./rn1-technology-catalog-installer.sh`.
+- If you run the one-line install in the folder of an installation that `catalog.sh` (or the original generator script) set up, the new installer starts with its default settings. Whenever another installer in the folder has other settings and generating would change the existing `.env` or `docker-compose.yml`, the menu says so, option 2 asks first, and `generate`, `setup`, the guided upgrade and the patch updates refuse. Option **23** (or `./rn1-technology-catalog-installer.sh adopt ./catalog.sh`) shows the differences, copies the settings of the old file and renames it (not while jobs run). If the other file is no longer used, rename or remove it instead. Differences in `CHECK_FOR_UPDATES` and `INSTALLER_URL` do not count.
 
 ## Known issues
 
@@ -151,13 +171,14 @@ These files are created at runtime and are listed in `.gitignore`. Do not commit
 ## Tests
 
 ```bash
-bash tests/run_tests.sh "$PWD/catalog.sh"
-bash tests/run_bundle_tests.sh "$PWD/catalog.sh"
-bash tests/run_snapshot_tests.sh "$PWD/catalog.sh"
-bash tests/run_upgrade_tests.sh "$PWD/catalog.sh"
-bash tests/run_selfupdate_tests.sh "$PWD/catalog.sh"
-bash tests/run_adopt_tests.sh "$PWD/catalog.sh"
-bash tests/run_jobs_tests.sh "$PWD/catalog.sh"
+bash tests/run_tests.sh "$PWD/rn1-technology-catalog-installer.sh"
+bash tests/run_bundle_tests.sh "$PWD/rn1-technology-catalog-installer.sh"
+bash tests/run_snapshot_tests.sh "$PWD/rn1-technology-catalog-installer.sh"
+bash tests/run_upgrade_tests.sh "$PWD/rn1-technology-catalog-installer.sh"
+bash tests/run_selfupdate_tests.sh "$PWD/rn1-technology-catalog-installer.sh"
+bash tests/run_adopt_tests.sh "$PWD/rn1-technology-catalog-installer.sh"
+bash tests/run_jobs_tests.sh "$PWD/rn1-technology-catalog-installer.sh"
+bash tests/run_timezone_tests.sh "$PWD/rn1-technology-catalog-installer.sh"
 ```
 
-Docker, ssh, scp and the Raynet APIs are replaced by fakes. The Updates tests query Docker Hub and GHCR, so they need internet access. The jobs tests close the menu's session the way a lost SSH connection does, cancel jobs, and hold X in the full screen menu; they need Linux (`setsid` and `script` from util-linux). GitHub Actions runs all seven suites on every push.
+Docker, ssh, scp and the Raynet APIs are replaced by fakes. The Updates tests query Docker Hub and GHCR, so they need internet access. The jobs tests close the menu's session the way a lost SSH connection does, cancel jobs, and hold X in the full screen menu; they need Linux (`setsid` and `script` from util-linux). The time zone tests need tzdata. GitHub Actions runs all eight suites on every push.
