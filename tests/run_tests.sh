@@ -155,17 +155,114 @@ f="${@: -1}"; sed -i 's/^CATALOG_VERSION=.*/CATALOG_VERSION="27.0.0.1"/' "$f"; e
 EOF
 chmod +x "$T/bin/"ed-*
 cs1="$(cksum < "$D/gen.sh")"
-out="$(printf '1\nn\n\n0\n' | EDITOR=ed-break bash "$D/gen.sh" menu 2>&1)"; rc=$?
+out="$(printf '1\ne\nn\n0\n0\n' | EDITOR=ed-break bash "$D/gen.sh" menu 2>&1)"; rc=$?
 check "broken edit detected" 'grep -q "cannot start with these settings" <<< "$out"'
 check "broken edit restored + menu continues" '[ "$rc" -eq 0 ] && [ "$(cksum < "$D/gen.sh")" = "$cs1" ] && grep -q "previous version" <<< "$out"'
-out="$(printf '1\n\n0\n' | EDITOR=ed-none bash "$D/gen.sh" menu 2>&1)"
+out="$(printf '1\ne\n0\n0\n' | EDITOR=ed-none bash "$D/gen.sh" menu 2>&1)"
 check "no-change edit says No changes" 'grep -q "No changes" <<< "$out"'
-out="$(printf '1\n0\n' | EDITOR=ed-good bash "$D/gen.sh" menu 2>&1)"
+out="$(printf '1\ne\n0\n' | EDITOR=ed-good bash "$D/gen.sh" menu 2>&1)"
 check "good edit reloads with new version" 'grep -q "Configuration reloaded" <<< "$out" && grep -q "Catalog 26.2.0.5" <<< "$out"'
-out="$(printf '1\n0\n' | EDITOR=ed-exit1 bash "$D/gen.sh" menu 2>&1)"
+out="$(printf '1\ne\n0\n' | EDITOR=ed-exit1 bash "$D/gen.sh" menu 2>&1)"
 check "editor rc!=0 with changes still reloads" 'grep -q "Catalog 27.0.0.1" <<< "$out"'
-out="$(printf '1\n\n0\n' | EDITOR=no-such-editor bash -x "$D/gen.sh" menu 2>&1)"
-check "missing editor error visible before pause" 'grep -A12 "^ERROR Editor .no-such-editor. not found" <<< "$out" | grep -q "^+ pause"'
+out="$(printf '1\ne\n0\n0\n' | EDITOR=no-such-editor bash -x "$D/gen.sh" menu 2>&1)"
+check "missing editor error visible before the screen is redrawn" 'grep -A12 "^ERROR Editor .no-such-editor. not found" <<< "$out" | grep -q "^+ ui_pause_tty"'
+
+# 9b. Settings screen: grouped by name, edits checked, saved together into the script
+D="$(newdir sets)"; sed -i 's/^CHECK_FOR_UPDATES=.*/CHECK_FOR_UPDATES="false"/' "$D/gen.sh"
+grp() { bash "$D/gen.sh" __settings_groups | awk -F'|' -v n="$1" '$2 == n { print $1 }'; }
+val() { bash "$D/gen.sh" __settings_groups | awk -F'|' -v n="$1" '$2 == n { print substr($0, length($1 "|" $2) + 2) }'; }
+nset="$(sed -n '/^# CONFIGURE ONLY THIS SECTION/,/^# DO NOT CHANGE ANYTHING BELOW/p' "$D/gen.sh" | grep -c '^[A-Z_][A-Z0-9_]*=')"
+check "every setting listed once" '[ "$(bash "$D/gen.sh" __settings_groups | wc -l)" -eq "$nset" ] && [ "$(bash "$D/gen.sh" __settings_groups | cut -d"|" -f2 | sort -u | wc -l)" -eq "$nset" ]'
+check "groups: *_TAG, shared first word, shared last word, rest general" '[ "$(grp MONGO_TAG)" = _TAG ] && [ "$(grp MINIO_TAG)" = _TAG ] && [ "$(grp CATALOG_VERSION)" = CATALOG_ ] && [ "$(grp MINIO_ROOT_USER)" = MINIO_ ] && [ "$(grp AUTOSYNC_CRON)" = _CRON ] && [ "$(grp TZ)" = - ] && [ "$(grp INSTALL_NGINX_PROXY_MANAGER)" = - ]'
+cp "$D/gen.sh" "$T/sets-dyn.sh"
+sed -i 's/^LOG_LEVEL_DEFAULT=.*/&\nREDIS_HOST="redis"\nREDIS_PORT="6379"\nGRAFANA_TAG="11"\nLONELY="x"/' "$D/gen.sh"
+check "new settings appear in their groups by themselves" '[ "$(grp REDIS_HOST)" = REDIS_ ] && [ "$(grp REDIS_PORT)" = REDIS_ ] && [ "$(grp GRAFANA_TAG)" = _TAG ] && [ "$(grp LONELY)" = - ]'
+out="$(printf '1\n0\n0\n' | LC_ALL=C COLUMNS=120 bash "$D/gen.sh" menu 2>&1)"
+check "screen: group headings with their name pattern" 'grep -q "Image tags  \*_TAG" <<< "$out" && grep -q "Catalog  CATALOG_\*" <<< "$out" && grep -q "MinIO  MINIO_\*" <<< "$out" && grep -q "Schedules  \*_CRON" <<< "$out" && grep -q "Redis  REDIS_\*" <<< "$out" && grep -q "General" <<< "$out"'
+check "screen: no pause after leaving it" '! grep -q "Press Enter to return" <<< "$out"'
+mv "$T/sets-dyn.sh" "$D/gen.sh"
+for w in 60 70 99 100 120 160 200; do
+  out="$(printf '1\n0\n0\n' | LC_ALL=C COLUMNS=$w bash "$D/gen.sh" menu 2>&1 | sed -n '/Settings ---/,/0 back *$/p')"
+  max="$(printf '%s\n' "$out" | awk '{ if (length($0) > m) m = length($0) } END { print m + 0 }')"
+  lim="$w"; [ "$lim" -gt 160 ] && lim=160; [ "$lim" -lt 60 ] && lim=60
+  check "screen fits $w columns" '[ "$max" -gt 0 ] && [ "$max" -le "$lim" ]'
+done
+out="$(printf '1\n0\n0\n' | LC_ALL=C COLUMNS=100 bash "$D/gen.sh" menu 2>&1)"
+check "100 columns: short values are not cut" 'grep -q "VERSION \.* 25.4.4191.133" <<< "$out" && grep -q "TZ \.* Europe/Berlin" <<< "$out" && grep -q "INSTALL_NGINX_P[A-Z_]*~* \. true" <<< "$out"'
+out="$(printf '1\n/port\n0\n0\n' | COLUMNS=120 bash "$D/gen.sh" menu 2>&1)"
+out="$(sed -n '/Filter "port": /,$p' <<< "$out")"
+check "filter shows only matching settings" 'grep -q "WEB_PORT" <<< "$out" && ! grep -q "ENV_FILE" <<< "$out"'
+out="$(printf '1\n/MINIO_*\n/mongodb\n0\n0\n' | COLUMNS=120 bash "$D/gen.sh" menu 2>&1)"
+check "filter takes the patterns and group names shown" 'grep -q "Filter \"MINIO_\*\": 5 of" <<< "$out" && grep -q "Filter \"mongodb\": 4 of" <<< "$out"'
+out="$(printf '1\n999\n\033[A\n0\n0\n' | bash "$D/gen.sh" menu 2>&1)"
+check "unknown number and arrow keys reported" 'grep -q "There is no setting 999" <<< "$out" && grep -q "Type a number, a name or /text" <<< "$out" && ! grep -q "Filter \"" <<< "$out"'
+cs1="$(cksum < "$D/gen.sh")"
+out="$(printf '1\ncatalog_web_port\n70000\n080\n9090\nHEALTH_TIMEOUT\n0900\n\nAUTOSYNC_CRON\n75 25 * * *\n30 7 * * * *\n\nTZ\nEurope/Berln x;y\n\nCATALOG_VERSION\n26.3.4789.148\n0\nn\n0\n' | bash "$D/gen.sh" menu 2>&1)"
+check "port: out of range and leading zero refused" '[ "$(grep -c "A port is a number from 1 to 65535" <<< "$out")" -eq 2 ]'
+check "leading zero in a number refused" 'grep -q "Give the number of seconds" <<< "$out"'
+check "cron: field ranges and five fields checked" 'grep -q "The minute field \"75\" is not valid" <<< "$out" && grep -q "Give five fields" <<< "$out"'
+check "time zone name format checked" 'grep -q "is not a time zone name" <<< "$out"'
+check "leaving without saving keeps the file" 'grep -q "Settings not saved" <<< "$out" &&[ "$(cksum < "$D/gen.sh")" = "$cs1" ]'
+out="$(printf '1\ncatalog_web_port\n9090\ninstall_nginx_proxy_manager\nn\nQUEUE_PREFIX\na"b\nrvc|x|\nOPENSEARCH_HEAP\n-Xms1g -Xmx1g\nX_FRAME_OPTIONS\n""\n\nCOMPOSE_PROJECT_NAME\nmyproj\ns\n0\n' | bash "$D/gen.sh" menu 2>&1)"
+check "values the .env cannot hold refused" 'grep -q "Not allowed: \"" <<< "$out"'
+check "required setting cannot be emptied" 'grep -q "X_FRAME_OPTIONS must not be empty" <<< "$out" && [ "$(val X_FRAME_OPTIONS)" = sameorigin ]'
+check "saved: values written into the settings" '[ "$(val CATALOG_WEB_PORT)" = 9090 ] && [ "$(val INSTALL_NGINX_PROXY_MANAGER)" = false ] && [ "$(val OPENSEARCH_HEAP)" = "-Xms1g -Xmx1g" ] && [ "$(val COMPOSE_PROJECT_NAME)" = myproj ]'
+check "saved: a value with | read back exactly" '[ "$(val QUEUE_PREFIX)" = "rvc|x|" ] && bash -n "$D/gen.sh" && bash "$D/gen.sh" check-settings >/dev/null 2>&1'
+check "saved: backup kept, menu restarted with a notice" 'ls "$D"/gen.sh.bak-* >/dev/null 2>&1 && grep -q "5 setting(s) saved (INSTALL_NGINX_PROXY_MANAGER, QUEUE_PREFIX, COMPOSE_PROJECT_NAME, +2 more" <<< "$out"'
+printf '1\nQUEUE_PREFIX\nrvc\n0\ny\n0\n' | bash "$D/gen.sh" menu >/dev/null 2>&1
+check "a value ending in | can be changed back" '[ "$(val QUEUE_PREFIX)" = rvc ]'
+printf '1\nCOMPOSE_PROJECT_NAME\n""\ns\n0\n' | bash "$D/gen.sh" menu >/dev/null 2>&1
+check "\"\" empties a setting that may be empty" '[ "$(val COMPOSE_PROJECT_NAME)" = "" ]'
+out="$(printf '1\nCATALOG_WEB_PORT\n9091\n0\nn\n0\n' | LC_ALL=C COLUMNS=120 bash "$D/gen.sh" menu 2>&1)"
+check "changed rows marked without colors" 'grep -q "\*[0-9][0-9]* WEB_PORT \.* 9091" <<< "$out"'
+cs1="$(cksum < "$D/gen.sh")"
+out="$(printf '1\nMONGO_PORT_HOST\n9090\ns\nu\n0\n0\n' | bash "$D/gen.sh" menu 2>&1)"
+check "settings that clash are not saved" 'grep -q "Not saved - the settings do not work together" <<< "$out" && grep -q "used by more than one setting" <<< "$out" && [ "$(cksum < "$D/gen.sh")" = "$cs1" ]'
+out="$(printf '1\nCATALOG_WEB_PORT\n8080\n0\n' | bash "$D/gen.sh" menu 2>&1)"; rc=$?
+check "end of input: leaves without saving, no loop" '[ "$rc" -eq 0 ] && [ "$(cksum < "$D/gen.sh")" = "$cs1" ]'
+out="$(printf '1\nCHECK_FOR_UPDATES\ntrue\ns\n0\n' | bash "$D/gen.sh" menu 2>&1)"
+check "update check runs again after CHECK_FOR_UPDATES is switched on" 'grep -q "Checking Docker Hub for new Catalog versions" <<< "$out"'
+sed -i 's/^CHECK_FOR_UPDATES=.*/CHECK_FOR_UPDATES="false"/' "$D/gen.sh"
+mkdir -p "$T/ro"; cp "$D/gen.sh" "$T/ro/gen.sh"; chmod 555 "$T/ro"
+if ! touch "$T/ro/probe" 2>/dev/null; then
+  cs1="$(cksum < "$T/ro/gen.sh")"
+  out="$(printf '1\nCATALOG_WEB_PORT\n9191\ns\n0\nn\n0\n' | bash "$T/ro/gen.sh" menu 2>&1)"
+  check "no backup possible: nothing saved, no false notice" 'grep -q "Cannot write a backup" <<< "$out" && ! grep -q "setting(s) saved" <<< "$out" && [ "$(cksum < "$T/ro/gen.sh")" = "$cs1" ]'
+fi
+chmod 755 "$T/ro"
+cp "$D/gen.sh" "$T/cs.sh"
+sed -i 's/^HEALTH_TIMEOUT=.*/HEALTH_TIMEOUT="0900"/' "$T/cs.sh"
+check "check-settings: number with leading zero refused" '! bash "$T/cs.sh" check-settings >/dev/null 2>&1'
+cp "$D/gen.sh" "$T/cs.sh"; sed -i 's/^CATALOG_WEB_PORT=.*/CATALOG_WEB_PORT="080"/' "$T/cs.sh"
+check "check-settings: port with leading zero refused" '! bash "$T/cs.sh" check-settings >/dev/null 2>&1'
+cp "$D/gen.sh" "$T/cs.sh"; sed -i 's/^ENV_FILE=.*/ENV_FILE="docker-compose.yml"/' "$T/cs.sh"
+check "check-settings: ENV_FILE and COMPOSE_FILE must differ" '! bash "$T/cs.sh" check-settings >/dev/null 2>&1'
+cp "$D/gen.sh" "$T/cs.sh"; sed -i 's/^ENV_FILE=.*/ENV_FILE="cs.sh"/' "$T/cs.sh"
+check "check-settings: ENV_FILE must not be the installer itself" '! bash "$T/cs.sh" check-settings >/dev/null 2>&1'
+cs1="$(cksum < "$D/gen.sh")"
+out="$(printf "1\nQUEUE_PREFIX\n'rvc\n\nAUTOSYNC_CRON\n30 7 * NOPE NEVER\n30 7 * * MON-FRI\nASPNETCORE_HTTP_PORTS\nabc\n80;8080\nMINIO_ROOT_USER\nab\n\n0\nn\n0\n" | bash "$D/gen.sh" menu 2>&1)"
+check "single quote refused" 'grep -q "Not allowed: \"" <<< "$out"'
+check "cron names checked as numbers" 'grep -q "The month field \"NOPE\" is not valid" <<< "$out" && grep -q "AUTOSYNC_CRON .* 30 7 [*] [*] MON-FRI" <<< "$out"'
+check "port lists and MinIO user length checked" 'grep -q "Give one or more ports separated by ;" <<< "$out" && grep -q "MinIO needs a user name of at least 3 characters" <<< "$out" && [ "$(cksum < "$D/gen.sh")" = "$cs1" ]'
+out="$(printf '1\n0\n0\n' | EDITOR="code --wait --new-window" COLUMNS=70 bash "$D/gen.sh" menu 2>&1)"
+check "keys line keeps 0 back with a long EDITOR" 'grep -q "E code   0 back" <<< "$out"'
+cat > "$T/bin/ed-hub" <<'EOF'
+#!/usr/bin/env bash
+f="${@: -1}"; sed -i 's/^CHECK_FOR_UPDATES=.*/CHECK_FOR_UPDATES="true"/' "$f"
+EOF
+chmod +x "$T/bin/ed-hub"
+out="$(printf '1\ne\n0\n' | EDITOR=ed-hub bash "$D/gen.sh" menu 2>&1)"
+check "E: update check runs again after CHECK_FOR_UPDATES is switched on" 'grep -q "Configuration reloaded" <<< "$out" && grep -q "Checking Docker Hub for new Catalog versions" <<< "$out"'
+sed -i 's/^CHECK_FOR_UPDATES=.*/CHECK_FOR_UPDATES="false"/' "$D/gen.sh"
+if [ -f /usr/share/zoneinfo/Asia/Singapore ]; then
+  out="$(printf '1\nTZ\nAsia/Singapore\ny\ns\n0\n' | bash "$D/gen.sh" menu 2>&1)"
+  check "TZ change moves the job times to the same moment" '[ "$(val TZ)" = Asia/Singapore ] && [ "$(val AUTOSYNC_CRON)" = "$(bash "$D/gen.sh" __cron_convert "30 7 * * *" Europe/Berlin Asia/Singapore)" ] && [ "$(val AUTOSYNC_CRON)" != "30 7 * * *" ]'
+  out="$(printf '1\nTZ\nEurope/Berln\nUTC\nn\n0\nn\n0\n' | bash "$D/gen.sh" menu 2>&1)"
+  check "unknown time zone refused" 'grep -q "not a time zone this server knows" <<< "$out"'
+  sed -i 's/^AUTOSYNC_CRON=.*/AUTOSYNC_CRON="30 2 1 * *"/' "$D/gen.sh"
+  out="$(printf '1\nTZ\nAmerica/New_York\n0\nn\n0\n' | bash "$D/gen.sh" menu 2>&1)"
+  check "a job time that cannot be moved is named under the grid" 'grep -q "AUTOSYNC_CRON could not be moved to America/New_York" <<< "$out"'
+fi
 
 # 10. symlink-free path: run from another dir writes next to script
 D="$(newdir otherdir)"; mkdir -p "$T/elsewhere"

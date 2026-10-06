@@ -101,5 +101,27 @@ check "quoted, unquoted and commented settings kept as bash reads them" '[ "$rc"
 # 9. The default address of this version is the renamed file
 check "default address is rn1-technology-catalog-installer.sh" 'grep -q "^INSTALLER_URL=\"$NEWURL\"$" "$NEW"'
 
+# 10. A write that stops half way (disk full) is undone from the backup
+if [ "$(uname -s)" = "Linux" ] && [ -d "/proc/$$/fd" ]; then
+  W="$T/wfail"; mkdir -p "$W/bin"; cp "$NEW" "$W/rn1-technology-catalog-installer.sh"
+  sed -i 's/^CHECK_FOR_UPDATES=.*/CHECK_FOR_UPDATES="false"/' "$W/rn1-technology-catalog-installer.sh"
+  before="$(cksum < "$W/rn1-technology-catalog-installer.sh")"
+  REAL_CAT="$(command -v cat)"
+  cat > "$W/bin/cat" <<'EOF'
+#!/usr/bin/env bash
+# the first write into the installer stops after 1000 bytes
+if [ ! -e "$CAT_FAILED" ] && [ "$(readlink -f "/proc/$$/fd/1")" = "$CAT_TARGET" ]; then
+  touch "$CAT_FAILED"
+  head -c 1000 -- "${@: -1}"
+  echo "cat: write error: No space left on device" >&2
+  exit 1
+fi
+exec "$REAL_CAT" "$@"
+EOF
+  chmod +x "$W/bin/cat"
+  out="$(PATH="$W/bin:$PATH" REAL_CAT="$REAL_CAT" CAT_FAILED="$W/failed" CAT_TARGET="$(readlink -f "$W/rn1-technology-catalog-installer.sh")" bash "$W/rn1-technology-catalog-installer.sh" self-update </dev/null 2>&1)"; rc=$?
+  check "failed write: installer restored, not reported as updated" '[ "$rc" -ne 0 ] && [ -e "$W/failed" ] && grep -q "it was restored from" <<< "$out" && ! grep -q "Installer updated" <<< "$out" && [ "$(cksum < "$W/rn1-technology-catalog-installer.sh")" = "$before" ]'
+fi
+
 echo "== $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]

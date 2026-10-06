@@ -215,7 +215,10 @@ script_backup() {
     target="$SCRIPT_PATH.bak-$(date +%Y%m%d-%H%M%S)-$n"
     n=$((n + 1))
   done
-  cp -p -- "$SCRIPT_PATH" "$target"
+  if ! cp -p -- "$SCRIPT_PATH" "$target"; then
+    rm -f -- "$target"
+    return 1
+  fi
   printf '%s' "$target"
 }
 
@@ -3670,9 +3673,18 @@ update_installer() {
     info "Cancelled."
     return 0
   fi
-  backup="$(script_backup)"
+  if ! backup="$(script_backup)"; then
+    rm -f -- "$tmp"
+    err "Cannot write a backup next to $SCRIPT_PATH - nothing was changed."
+    return 1
+  fi
   # Write the content back instead of moving the file, so owner and mode stay.
-  cat -- "$tmp" > "$SCRIPT_PATH"
+  if ! cat -- "$tmp" > "$SCRIPT_PATH"; then
+    cat -- "$backup" > "$SCRIPT_PATH" 2>/dev/null || true
+    rm -f -- "$tmp"
+    err "Cannot write $SCRIPT_PATH - it was restored from $backup."
+    return 1
+  fi
   rm -f -- "$tmp"
   ok "Installer updated (previous version: $backup)."
   if [ "$mode" = "interactive" ]; then
@@ -3872,7 +3884,10 @@ takeover_settings() {
     info "Cancelled."
     return 0
   fi
-  backup="$(script_backup)"
+  if ! backup="$(script_backup)"; then
+    err "Cannot write a backup next to $SCRIPT_PATH - nothing was changed."
+    return 1
+  fi
   for spec in "${diffs[@]}"; do
     IFS='|' read -r name ours theirs <<< "$spec"
     if ! set_setting "$name" "$theirs"; then
@@ -4024,7 +4039,10 @@ adopt_installation() {
     return 0
   fi
 
-  backup="$(script_backup)"
+  if ! backup="$(script_backup)"; then
+    err "Cannot write a backup next to $SCRIPT_PATH - nothing was changed."
+    return 1
+  fi
   backup_file "$ENV_FILE"
   backup_file "$COMPOSE_FILE"
   (umask 077 && cp -- "$envf" "$ENV_FILE")
@@ -5372,7 +5390,7 @@ check_settings() {
   esac
   for name in $(port_settings); do
     value="${!name}"
-    if ! [[ "$value" =~ ^[0-9]+$ ]] || [ "$value" -lt 1 ] || [ "$value" -gt 65535 ]; then
+    if ! [[ "$value" =~ ^[1-9][0-9]{0,4}$ ]] || [ "$value" -gt 65535 ]; then
       err "$name must be a port number between 1 and 65535 (is \"$value\")."
       problems=$((problems + 1))
     elif [[ "$seen" == *" $value "* ]]; then
@@ -5389,8 +5407,23 @@ check_settings() {
     err "CATALOG_VERSION must not be empty."
     problems=$((problems + 1))
   fi
-  if ! [[ "${SYNC_MAX_UPLOAD:-}" =~ ^[0-9]+(GB|MB|KB)?$ ]]; then
+  if ! [[ "${SYNC_MAX_UPLOAD:-}" =~ ^[1-9][0-9]{0,6}(GB|MB|KB)$ ]] && ! [[ "${SYNC_MAX_UPLOAD:-}" =~ ^[1-9][0-9]{0,14}$ ]]; then
     err "SYNC_MAX_UPLOAD must be a size like 32GB, 8000MB or a number of bytes (is \"${SYNC_MAX_UPLOAD:-}\")."
+    problems=$((problems + 1))
+  fi
+  if ! [[ "${HEALTH_TIMEOUT:-}" =~ ^[1-9][0-9]{0,5}$ ]]; then
+    err "HEALTH_TIMEOUT must be a number of seconds, e.g. 600 (is \"${HEALTH_TIMEOUT:-}\")."
+    problems=$((problems + 1))
+  fi
+  for name in ENV_FILE COMPOSE_FILE; do
+    value="${!name}"
+    if [ -z "$value" ] || [[ "$value" =~ [[:space:]/] ]] || [ "$value" = "." ] || [ "$value" = ".." ] || [ "$value" = "$SCRIPT_NAME" ]; then
+      err "$name must be a plain file name in this folder, not $SCRIPT_NAME (is \"$value\")."
+      problems=$((problems + 1))
+    fi
+  done
+  if [ "$ENV_FILE" = "$COMPOSE_FILE" ]; then
+    err "ENV_FILE and COMPOSE_FILE must be two different files (both are \"$ENV_FILE\")."
     problems=$((problems + 1))
   fi
   [ "$problems" -eq 0 ]
@@ -6226,11 +6259,966 @@ do_check() {
   fi
 }
 
+###############################################################################
+# Settings screen (menu option 1)
+###############################################################################
+
+# The settings of this script while the screen is open (same index everywhere): group key, group
+# title, name, saved value, value on the screen, "1" when that value is not saved yet.
+SET_GROUP=()
+SET_TITLE=()
+SET_NAME=()
+SET_SAVED=()
+SET_NEW=()
+SET_MOD=()
+SET_FILTER=""
+SET_NOTE=""
+SET_CELL=""
+SET_NCHANGED=0
+SET_CHANGED=""
+if [ "$UI_UTF" = "true" ]; then
+  SET_LEADER="·"
+  SET_MARK="✎"
+else
+  SET_LEADER="."
+  SET_MARK="*"
+fi
+
+# GROUP|NAME|VALUE for every setting of FILE, grouped by what the names have in common: names
+# ending in _TAG are the image tags ("_TAG"); a first word that two or more settings share makes a
+# group ("CATALOG_", "MINIO_" ...); then a last word that two or more share ("_CRON"); the rest is
+# "-" (general). Groups keep the order of the settings section, so new settings appear by themselves.
+settings_grouped() {
+  local pairs
+  pairs="$(settings_pairs "$1")" || return 1
+  if [ -z "$pairs" ]; then
+    return 1
+  fi
+  awk -F'|' '
+    $0 !~ /^[A-Z_][A-Z0-9_]*\|/ { next }
+    {
+      n++
+      name[n] = $1
+      val[n] = substr($0, length($1) + 2)
+      if ($1 ~ /_TAG$/) { grp[n] = "_TAG"; next }
+      if (index($1, "_")) { p = $1; sub(/_.*/, "", p); pre[n] = p; cp[p]++ }
+    }
+    END {
+      for (i = 1; i <= n; i++) {
+        if (grp[i] == "" && pre[i] != "" && cp[pre[i]] >= 2) grp[i] = pre[i] "_"
+      }
+      for (i = 1; i <= n; i++) {
+        if (grp[i] == "" && index(name[i], "_")) { s = name[i]; sub(/.*_/, "", s); suf[i] = s; cs[s]++ }
+      }
+      for (i = 1; i <= n; i++) {
+        if (grp[i] == "") grp[i] = (suf[i] != "" && cs[suf[i]] >= 2) ? "_" suf[i] : "-"
+        if (!(grp[i] in seen)) { seen[grp[i]] = 1; order[++g] = grp[i] }
+      }
+      for (j = 1; j <= g; j++) {
+        for (i = 1; i <= n; i++) {
+          if (grp[i] == order[j]) print grp[i] "|" name[i] "|" val[i]
+        }
+      }
+    }' <<< "$pairs"
+}
+
+# Display name of a group key of settings_grouped
+settings_group_title() {
+  local w
+  case "$1" in
+    -) printf 'General' ;;
+    _TAG) printf 'Image tags' ;;
+    _CRON) printf 'Schedules' ;;
+    CATALOG_) printf 'Catalog' ;;
+    MONGO_) printf 'MongoDB' ;;
+    MINIO_) printf 'MinIO' ;;
+    RABBITMQ_) printf 'RabbitMQ' ;;
+    OPENSEARCH_) printf 'OpenSearch' ;;
+    NPM_) printf 'Nginx Proxy Manager' ;;
+    ASPNETCORE_) printf 'ASP.NET Core' ;;
+    COMPOSE_) printf 'Docker Compose' ;;
+    FILESTORAGE_) printf 'File storage' ;;
+    *)
+      w="${1//_/}"
+      printf '%s%s' "${w:0:1}" "$(printf '%s' "${w:1}" | tr '[:upper:]' '[:lower:]')"
+      ;;
+  esac
+}
+
+# "MINIO_*" or "*_TAG" for a group key (empty for the general group)
+settings_group_pattern() {
+  case "$1" in
+    -) ;;
+    _*) printf '*%s' "$1" ;;
+    *) printf '%s*' "$1" ;;
+  esac
+}
+
+# One line about a setting for its edit screen (empty when nothing is known about it)
+settings_hint() {
+  local name="$1" value="$2"
+  case "$name" in
+    ENV_FILE) printf 'File name of the generated environment file (it holds the passwords)' ;;
+    COMPOSE_FILE) printf 'File name of the generated Docker Compose file' ;;
+    COMPOSE_PROJECT_NAME) printf 'Compose project name; empty uses the folder name (a-z, 0-9, - and _)' ;;
+    TZ) printf 'Time zone of all containers, e.g. Europe/Berlin; the job times (*_CRON) run in it' ;;
+    BASEURL) printf 'BASEURL of catalog-web' ;;
+    INSTALL_NGINX_PROXY_MANAGER) printf 'true starts Nginx Proxy Manager (reverse proxy with TLS) with the stack' ;;
+    CATALOG_VERSION) printf 'Version of catalog-web and all workers; option 8 picks one from Docker Hub' ;;
+    CATALOG_IMAGE_REPO) printf 'Docker Hub repository of catalog-web' ;;
+    CATALOG_WORKER_IMAGE_REPO) printf 'Docker Hub repository of the four workers' ;;
+    CHECK_FOR_UPDATES) printf 'true: the menu looks for new Catalog versions on Docker Hub' ;;
+    CATALOG_LICENSE_PATH) printf 'Folder of the license volume inside catalog-web' ;;
+    CATALOG_CLOUD_URL) printf 'Online catalog for snapshots (option 17) and the daily self-sync (option 20)' ;;
+    SYNC_MAX_UPLOAD) printf 'Largest snapshot upload of Catalog 26.x, e.g. 32GB (25.x: fixed 10 GB)' ;;
+    HEALTH_TIMEOUT) printf 'Seconds the guided upgrade waits for a healthy stack' ;;
+    INSTALLER_URL) printf 'Where option 22 downloads new versions of this installer' ;;
+    OPENSEARCH_HEAP) printf 'Java heap of OpenSearch, e.g. -Xms1g -Xmx1g' ;;
+    OPENSEARCH_URL) printf 'Address of OpenSearch inside the stack' ;;
+    X_FRAME_OPTIONS) printf 'X-Frame-Options header of Nginx Proxy Manager' ;;
+    DISABLE_IPV6) printf 'true: Nginx Proxy Manager does not use IPv6' ;;
+    QUEUE_PREFIX) printf 'Prefix of the RabbitMQ queues of the Catalog' ;;
+    FILESTORAGE_BUCKET) printf 'MinIO bucket of the Catalog files' ;;
+    AUTOSYNC_CRON) printf 'Daily synchronization: minute hour day month weekday, in TZ; - turns it off' ;;
+    VULNERABILITIES_CACHING_CRON) printf 'Vulnerability caching: minute hour day month weekday, in TZ; - turns it off' ;;
+    LOG_LEVEL_DEFAULT) printf 'Trace, Debug, Information, Warning, Error, Critical or None' ;;
+    MONGO_INITDB_ROOT_USERNAME|MINIO_ROOT_USER|RABBITMQ_DEFAULT_USER) printf 'User name; the password is generated into %s' "$ENV_FILE" ;;
+    *_TAG) printf 'Image tag; option 8 shows newer ones' ;;
+    *_CRON) printf 'Cron expression: minute hour day month weekday, in TZ' ;;
+    *_PORT_CONTAINER) printf 'Port inside the container (1-65535)' ;;
+    *_PORT|*_PORT_HOST) printf 'Port on this server (1-65535)' ;;
+    *)
+      if [ "$value" = "true" ] || [ "$value" = "false" ]; then
+        printf 'true or false'
+      fi
+      ;;
+  esac
+}
+
+# settings_empty_ok NAME SAVED -> true when NAME may be empty (it is empty now, or empty has a meaning)
+settings_empty_ok() {
+  [ -z "$2" ] || [ "$1" = "COMPOSE_PROJECT_NAME" ]
+}
+
+# settings_check NAME VALUE SAVED -> fails and prints the reason when VALUE does not fit NAME
+settings_check() {
+  local name="$1" value="$2" saved="$3" f spec idx lo hi what k ports_re='^[1-9][0-9]{0,4}(;[1-9][0-9]{0,4})*$'
+  local -a fields=() names=()
+  if [[ "$value" == *[[:cntrl:]]* ]]; then
+    echo "Control characters are not allowed."
+    return 1
+  fi
+  # the generated .env holds the values without quotes: docker compose would read these differently
+  if [[ "$value" == *[\"\'\\\$\`]* ]] || [[ "$value" == *" #"* ]]; then
+    echo "Not allowed: \" ' \\ \$ \` and \" #\" (the generated $ENV_FILE cannot hold them)."
+    return 1
+  fi
+  if [ -z "$value" ]; then
+    if settings_empty_ok "$name" "$saved"; then
+      return 0
+    fi
+    echo "$name must not be empty."
+    return 1
+  fi
+  if { [ "$saved" = "true" ] || [ "$saved" = "false" ]; } && [ "$value" != "true" ] && [ "$value" != "false" ]; then
+    echo "$name is true or false."
+    return 1
+  fi
+  if [[ "$name" =~ _PORT(_[A-Z]+)?$ ]]; then
+    if ! [[ "$value" =~ ^[1-9][0-9]{0,4}$ ]] || [ "$value" -gt 65535 ]; then
+      echo "A port is a number from 1 to 65535."
+      return 1
+    fi
+  fi
+  case "$name" in
+    *_PORTS)
+      if ! [[ "$value" =~ $ports_re ]]; then
+        echo "Give one or more ports separated by ;, e.g. 80 or 80;8080."
+        return 1
+      fi
+      ;;
+    MINIO_ROOT_USER)
+      if [ "${#value}" -lt 3 ]; then
+        echo "MinIO needs a user name of at least 3 characters."
+        return 1
+      fi
+      ;;
+  esac
+  case "$name" in
+    *_CRON)
+      if [ "$value" = "-" ]; then
+        return 0
+      fi
+      read -r -a fields <<< "$value"
+      if [ "${#fields[@]}" -ne 5 ]; then
+        echo "Give five fields (minute hour day month weekday), e.g. 30 7 * * *, or - to turn the job off."
+        return 1
+      fi
+      for spec in "0 0 59 minute" "1 0 23 hour" "2 1 31 day" "3 1 12 month" "4 0 7 weekday"; do
+        read -r idx lo hi what <<< "$spec"
+        f="${fields[idx]}"
+        # month and weekday may use names (JAN, MON-FRI): checked as their numbers
+        if [ "$idx" -eq 3 ]; then
+          names=(JAN FEB MAR APR MAY JUN JUL AUG SEP OCT NOV DEC)
+        else
+          names=(SUN MON TUE WED THU FRI SAT)
+        fi
+        if [ "$idx" -ge 3 ]; then
+          f="${f^^}"
+          for ((k = 0; k < ${#names[@]}; k++)); do
+            f="${f//${names[k]}/$((k + lo))}"
+          done
+        fi
+        if cron_values "$f" "$lo" "$hi" >/dev/null 2>&1; then
+          continue
+        fi
+        echo "The $what field \"${fields[idx]}\" is not valid (allowed: $lo-$hi, *, lists, ranges and steps)."
+        return 1
+      done
+      ;;
+    TZ)
+      if ! [[ "$value" =~ ^[A-Za-z][A-Za-z0-9_+-]*(/[A-Za-z0-9_+-]+)*$ ]]; then
+        echo "\"$value\" is not a time zone name (e.g. Europe/Berlin, Asia/Singapore, UTC)."
+        return 1
+      fi
+      if [ -f /usr/share/zoneinfo/Europe/Berlin ] && ! tz_known "$value"; then
+        echo "\"$value\" is not a time zone this server knows (e.g. Europe/Berlin, Asia/Singapore, UTC)."
+        return 1
+      fi
+      ;;
+    SYNC_MAX_UPLOAD)
+      if ! [[ "$value" =~ ^[1-9][0-9]{0,6}(GB|MB|KB)$ ]] && ! [[ "$value" =~ ^[1-9][0-9]{0,14}$ ]]; then
+        echo "Give a size like 32GB, 8000MB or a number of bytes."
+        return 1
+      fi
+      ;;
+    HEALTH_TIMEOUT)
+      if ! [[ "$value" =~ ^[1-9][0-9]{0,5}$ ]]; then
+        echo "Give the number of seconds, e.g. 600."
+        return 1
+      fi
+      ;;
+    LOG_LEVEL_DEFAULT)
+      case "$value" in
+        Trace|Debug|Information|Warning|Error|Critical|None) ;;
+        *)
+          echo "Use Trace, Debug, Information, Warning, Error, Critical or None."
+          return 1
+          ;;
+      esac
+      ;;
+    COMPOSE_PROJECT_NAME)
+      if ! [[ "$value" =~ ^[a-z0-9][a-z0-9_-]*$ ]]; then
+        echo "Only lower-case letters, digits, - and _ (or \"\" for the folder name)."
+        return 1
+      fi
+      ;;
+    ENV_FILE|COMPOSE_FILE)
+      if [[ "$value" =~ [[:space:]/] ]] || [ "$value" = "$SCRIPT_NAME" ]; then
+        echo "Give a plain file name in this folder (no spaces, no /, not $SCRIPT_NAME)."
+        return 1
+      fi
+      ;;
+    CATALOG_CLOUD_URL|INSTALLER_URL)
+      if ! [[ "$value" =~ ^https://[^[:space:]]+$ ]]; then
+        echo "Give an https:// address."
+        return 1
+      fi
+      ;;
+    *URL)
+      if ! [[ "$value" =~ ^https?://[^[:space:]]+$ ]]; then
+        echo "Give an http:// or https:// address."
+        return 1
+      fi
+      ;;
+    *_PATH)
+      if [[ "$value" != /* ]] || [[ "$value" =~ [[:space:]] ]]; then
+        echo "Give an absolute path without spaces, e.g. /app/license."
+        return 1
+      fi
+      ;;
+    CATALOG_VERSION|*_TAG|*_REPO)
+      if [[ "$value" =~ [[:space:]] ]]; then
+        echo "$name must not contain spaces."
+        return 1
+      fi
+      ;;
+  esac
+}
+
+# Fills SET_* with the settings of this script; fails when the settings section cannot be read.
+settings_load() {
+  local line rest group
+  SET_GROUP=()
+  SET_TITLE=()
+  SET_NAME=()
+  SET_SAVED=()
+  SET_NEW=()
+  SET_MOD=()
+  while IFS= read -r line; do
+    group="${line%%|*}"
+    rest="${line#*|}"
+    if [ "${#SET_GROUP[@]}" -eq 0 ] || [ "$group" != "${SET_GROUP[${#SET_GROUP[@]} - 1]}" ]; then
+      SET_CELL="$(settings_group_title "$group")"
+    fi
+    SET_GROUP+=("$group")
+    SET_TITLE+=("$SET_CELL")
+    SET_NAME+=("${rest%%|*}")
+    SET_SAVED+=("${rest#*|}")
+    SET_NEW+=("${rest#*|}")
+    SET_MOD+=("")
+  done < <(settings_grouped "$SCRIPT_PATH")
+  [ "${#SET_NAME[@]}" -gt 0 ]
+}
+
+# SET_NCHANGED: how many settings are changed on the screen and not saved yet; SET_CHANGED: their names
+settings_changed() {
+  local i
+  SET_NCHANGED=0
+  SET_CHANGED=""
+  for ((i = 0; i < ${#SET_NAME[@]}; i++)); do
+    if [ "${SET_MOD[i]}" = "1" ]; then
+      SET_NCHANGED=$((SET_NCHANGED + 1))
+      SET_CHANGED="${SET_CHANGED:+$SET_CHANGED, }${SET_NAME[i]}"
+    fi
+  done
+}
+
+# Index of the setting called NAME (any case); fails when there is none.
+settings_find() {
+  local i want
+  want="$(printf '%s' "$1" | tr '[:lower:]' '[:upper:]')"
+  for ((i = 0; i < ${#SET_NAME[@]}; i++)); do
+    if [ "${SET_NAME[i]}" = "$want" ]; then
+      printf '%s' "$i"
+      return 0
+    fi
+  done
+  return 1
+}
+
+# Label of setting INDEX in its group (into SET_CELL): the name without the part the group shares
+settings_label() {
+  case "${SET_GROUP[$1]}" in
+    -) SET_CELL="${SET_NAME[$1]}" ;;
+    _*) SET_CELL="${SET_NAME[$1]%"${SET_GROUP[$1]}"}" ;;
+    *) SET_CELL="${SET_NAME[$1]#"${SET_GROUP[$1]}"}" ;;
+  esac
+  if [ -z "$SET_CELL" ]; then
+    SET_CELL="${SET_NAME[$1]}"
+  fi
+}
+
+# settings_cell SPEC WIDTH NUMW -> SET_CELL: a group heading ("H|INDEX"), a setting
+# ("I|INDEX|NAMEW": the values of a group line up after NAMEW characters) or a blank ("")
+# of exactly WIDTH visible characters. A value that would be cut first gives up the alignment,
+# then takes room from a long name; only then is it cut.
+settings_cell() {
+  local spec="$1" width="$2" numw="$3" i namew title pattern len label value lab val dotsn room cut num mark valc dots pad empty=""
+  if [ -z "$spec" ]; then
+    printf -v SET_CELL '%*s' "$width" ''
+    return 0
+  fi
+  i="${spec#*|}"
+  namew="${i#*|}"
+  i="${i%%|*}"
+  if [ "${spec%%|*}" = "H" ]; then
+    title="${SET_TITLE[i]}"
+    pattern="$(settings_group_pattern "${SET_GROUP[i]}")"
+    len=$((${#title} + ${pattern:+2 + }${#pattern}))
+    if [ "$len" -gt "$width" ]; then
+      pattern=""
+      title="${title:0:$width}"
+      len="${#title}"
+    fi
+    printf -v pad '%*s' $((width - len)) ''
+    SET_CELL="$C_CYN$title$C_RST${pattern:+  $C_DIM$pattern$C_RST}$pad"
+    return 0
+  fi
+  settings_label "$i"
+  label="$SET_CELL"
+  value="${SET_NEW[i]}"
+  if [ -z "$value" ]; then
+    value="(empty)"
+    empty="$C_DIM"
+  fi
+  lab="${#label}"
+  val="${#value}"
+  dotsn=$((namew - lab + 1))
+  if [ "$dotsn" -lt 1 ]; then
+    dotsn=1
+  fi
+  room=$((width - numw - lab - dotsn - 4))
+  if [ "$val" -gt "$room" ]; then
+    dotsn=1
+    room=$((width - numw - lab - 5))
+  fi
+  # a short value (version, time zone, port, true/false) is worth a shorter name; a long one is cut anyway
+  cut=0
+  if [ "$val" -gt "$room" ] && [ "$val" -le 16 ]; then
+    cut=$((val - room))
+  elif [ "$val" -gt "$room" ] && [ "$room" -lt 6 ]; then
+    cut=$((6 - room))
+  fi
+  if [ "$cut" -gt $((lab - 6)) ]; then
+    cut=$((lab - 6))
+  fi
+  if [ "$cut" -gt 0 ]; then
+    label="${label:0:$((lab - cut - 1))}~"
+    lab=$((lab - cut))
+    room=$((room + cut))
+  fi
+  if [ "$room" -lt 1 ]; then
+    room=1
+  fi
+  if [ "$val" -gt "$room" ]; then
+    value="${value:0:$((room - 1))}~"
+    val="$room"
+  fi
+  mark=" "
+  num="$C_BLD"
+  valc="$empty"
+  if [ "${SET_MOD[i]}" = "1" ]; then
+    mark="$C_YLW$SET_MARK$C_RST"
+    num="$C_YLW"
+    valc="$C_YLW"
+  fi
+  printf -v num "%s%${numw}s%s" "$num" "$((i + 1))" "$C_RST"
+  printf -v dots '%*s' "$dotsn" ''
+  dots="${dots// /$SET_LEADER}"
+  printf -v pad '%*s' $((room - val)) ''
+  SET_CELL="$mark$num $label $C_DIM$dots$C_RST $valc$value$C_RST$pad"
+}
+
+# The editor in short ("vim" for "/usr/bin/vim -p"), for key hints
+editor_short() {
+  local e
+  e="$(editor_name)"
+  e="${e%% *}"
+  printf '%s' "${e##*/}"
+}
+
+# CHECK_FOR_UPDATES and the image repositories of FILE: when they change, the menu checks Docker Hub again
+settings_hub_keys() {
+  settings_pairs "$1" | awk -F'|' '$1 == "CHECK_FOR_UPDATES" || $1 == "CATALOG_IMAGE_REPO" || $1 == "CATALOG_WORKER_IMAGE_REPO"'
+}
+
+# settings_say TEXT -> TEXT wrapped to the screen width, indented by four spaces
+settings_say() {
+  printf '%s\n' "$1" | fold -s -w $(($(settings_width) - 6)) | sed 's/^/    /'
+}
+
+# Width of the settings screens: the terminal, 60 to 160 columns
+settings_width() {
+  local c
+  c="$(ui_cols)"
+  if [ "$c" -gt 160 ]; then
+    c=160
+  fi
+  if [ "$c" -lt 60 ]; then
+    c=60
+  fi
+  printf '%s' "$c"
+}
+
+# The settings screen: the groups side by side, every setting with its number and value; values
+# that are not saved yet are marked.
+settings_draw() {
+  local width ncol colw cellw numw total="${#SET_NAME[@]}" i b c h r target used shown=0 groups=0 prev=""
+  local block="" bhgt=0 nb=0 maxh=0 line namew limit spec header specs filter=""
+  local -a bitems=() bh=() bcol=() c1=() c2=() c3=() filterl=()
+  width="$(settings_width)"
+  if [ "$width" -ge 100 ]; then
+    ncol=3
+  elif [ "$width" -ge 70 ]; then
+    ncol=2
+  else
+    ncol=1
+  fi
+  colw=$(((width - 2) / ncol))
+  cellw=$((colw - 2))
+  numw="${#total}"
+  # names up to this length line up their values; longer ones push theirs to the right
+  limit=$((cellw * 45 / 100))
+  # the patterns on the screen (MINIO_*, *_TAG) work as filters too
+  filter="${SET_FILTER//\*/}"
+  filter="${filter,,}"
+
+  # one block per group with visible settings: the indexes of its settings
+  for ((i = 0; i < total; i++)); do
+    if [ "$i" -eq 0 ] || [ "${SET_GROUP[i]}" != "${SET_GROUP[i - 1]}" ]; then
+      groups=$((groups + 1))
+    fi
+    if [ -n "$filter" ] && [[ "${SET_NAME[i],,}" != *"$filter"* ]] && [[ "${SET_NEW[i],,}" != *"$filter"* ]] && [[ "${SET_TITLE[i],,}" != *"$filter"* ]]; then
+      continue
+    fi
+    shown=$((shown + 1))
+    if [ -n "$block" ] && [ "${SET_GROUP[i]}" != "$prev" ]; then
+      bitems+=("$block")
+      bh+=("$bhgt")
+      block=""
+    fi
+    if [ -z "$block" ]; then
+      bhgt=1
+      prev="${SET_GROUP[i]}"
+    fi
+    block="${block:+$block }$i"
+    bhgt=$((bhgt + 1))
+  done
+  if [ -n "$block" ]; then
+    bitems+=("$block")
+    bh+=("$bhgt")
+  fi
+  nb="${#bh[@]}"
+
+  # the smallest column height that holds all blocks in order, none of them split
+  h=0
+  for ((b = 0; b < nb; b++)); do
+    h=$((h + bh[b] + (b > 0 ? 1 : 0)))
+  done
+  target=$(((h + ncol - 1) / ncol))
+  while true; do
+    c=1
+    used=0
+    for ((b = 0; b < nb; b++)); do
+      if [ "$used" -gt 0 ] && [ $((used + 1 + bh[b])) -gt "$target" ]; then
+        c=$((c + 1))
+        used=0
+      fi
+      bcol[b]="$c"
+      used=$((used + (used > 0 ? 1 : 0) + bh[b]))
+    done
+    if [ "$c" -le "$ncol" ]; then
+      break
+    fi
+    target=$((target + 1))
+  done
+
+  for ((b = 0; b < nb; b++)); do
+    namew=0
+    for i in ${bitems[b]}; do
+      settings_label "$i"
+      if [ "${#SET_CELL}" -le "$limit" ] && [ "${#SET_CELL}" -gt "$namew" ]; then
+        namew="${#SET_CELL}"
+      fi
+    done
+    specs=""
+    if [ "$b" -gt 0 ] && [ "${bcol[b]}" = "${bcol[b - 1]}" ]; then
+      specs="-"
+    fi
+    i="${bitems[b]%% *}"
+    specs="${specs:+$specs }H|$i"
+    for i in ${bitems[b]}; do
+      specs="$specs I|$i|$namew"
+    done
+    for spec in $specs; do
+      if [ "$spec" = "-" ]; then
+        spec=""
+      fi
+      case "${bcol[b]}" in
+        1) c1+=("$spec") ;;
+        2) c2+=("$spec") ;;
+        *) c3+=("$spec") ;;
+      esac
+    done
+  done
+  maxh="${#c1[@]}"
+  if [ "${#c2[@]}" -gt "$maxh" ]; then
+    maxh="${#c2[@]}"
+  fi
+  if [ "${#c3[@]}" -gt "$maxh" ]; then
+    maxh="${#c3[@]}"
+  fi
+
+  settings_changed
+  if [ "$SET_NCHANGED" -gt 0 ]; then
+    header="$C_YLW$SET_MARK $SET_NCHANGED not saved$C_RST ${C_DIM}(S saves, U undoes):$C_RST $SET_CHANGED"
+  else
+    header="${C_DIM}Changes are checked before they are written; the previous file is kept as a backup.$C_RST"
+  fi
+  if [ -n "$SET_FILTER" ]; then
+    filterl=("Filter \"$SET_FILTER\": $shown of $total settings   ${C_DIM}/ shows all again$C_RST")
+  fi
+  clear_screen
+  ui_box "$width" "RAYNET ONE TECHNOLOGY CATALOG $UI_SEP Settings" \
+    "$total settings in $groups groups $UI_SEP from the settings section of $SCRIPT_NAME" \
+    "$header" ${filterl[@]+"${filterl[@]}"}
+  echo
+  if [ "$shown" -eq 0 ]; then
+    echo "  ${C_DIM}No setting matches \"$SET_FILTER\".$C_RST"
+  fi
+  for ((r = 0; r < maxh; r++)); do
+    line=""
+    for ((c = 1; c <= ncol; c++)); do
+      case "$c" in
+        1) spec="${c1[r]:-}" ;;
+        2) spec="${c2[r]:-}" ;;
+        *) spec="${c3[r]:-}" ;;
+      esac
+      settings_cell "$spec" "$cellw" "$numw"
+      line="$line $SET_CELL "
+    done
+    printf '%s\n' "${line%"${line##*[! ]}"}"
+  done
+  echo
+  # taller than the terminal: the box has scrolled away, so its state is repeated here
+  if [ $((maxh + ${#filterl[@]} + 10)) -gt "$(ui_rows)" ]; then
+    if [ "$SET_NCHANGED" -gt 0 ]; then
+      settings_note "$header"
+    fi
+    if [ -n "$SET_FILTER" ]; then
+      settings_note "${filterl[0]}"
+    fi
+  fi
+  if [ -n "$SET_NOTE" ]; then
+    while IFS= read -r line; do
+      printf '  %s\n' "$(ui_pad "$line" $((width - 2)))"
+    done <<< "$SET_NOTE"
+    SET_NOTE=""
+  fi
+  line="$(ui_keys "number|edit" "/text|filter" "S|save" "U|undo" "E|$(editor_short)" "0|back")"
+  if [ "$(ui_len "$line")" -gt "$width" ]; then
+    line="$(ui_keys "nr|edit" "/|filter" "S|save" "U|undo" "E|$(editor_short)" "0|back")"
+  fi
+  printf '%s\n' "$(ui_pad "$line" "$width")"
+}
+
+# Adds a line to the note under the settings grid.
+settings_note() {
+  SET_NOTE="${SET_NOTE:+$SET_NOTE$'\n'}$1"
+}
+
+# The job times run in TZ: offers to move them with a new TZ, so they keep their moment.
+settings_tz_jobs() {
+  local from="$1" to="$2" i value newval k=0 question="" failed="" said="false"
+  local -a idx=() vals=()
+  for ((i = 0; i < ${#SET_NAME[@]}; i++)); do
+    value="${SET_NEW[i]}"
+    if [[ "${SET_NAME[i]}" != *_CRON ]] || [ "$value" = "-" ]; then
+      continue
+    fi
+    if newval="$(cron_convert "$value" "$from" "$to")"; then
+      settings_say "The $(cron_label "${SET_NAME[i]}") (${SET_NAME[i]} \"$value\") runs at $(cron_time_text "$value") $from, that is $(cron_time_text "$newval") $to."
+      settings_say "$(tz_season_note "$from" "$to" "$newval" | sed 's/^ *//')" | sed '/^ *$/d'
+      said="true"
+      if [ "$newval" != "$value" ]; then
+        idx+=("$i")
+        vals+=("$newval")
+        k=$((k + 1))
+        question="${question:+$question and }${SET_NAME[i]} to \"$newval\""
+      fi
+    else
+      failed="${failed:+$failed, }${SET_NAME[i]}"
+    fi
+  done
+  if [ -n "$failed" ]; then
+    settings_note "$C_YLW$UI_NO$C_RST $failed could not be moved to $to automatically - check the time."
+  fi
+  if [ "$k" -eq 0 ]; then
+    if [ "$said" = "true" ]; then
+      ui_pause_tty
+    fi
+    return 0
+  fi
+  if confirm "  Keep the job times: change $question?" y; then
+    for ((i = 0; i < k; i++)); do
+      SET_NEW[idx[i]]="${vals[i]}"
+      if [ "${vals[i]}" = "${SET_SAVED[idx[i]]}" ]; then
+        SET_MOD[idx[i]]=""
+      else
+        SET_MOD[idx[i]]="1"
+      fi
+    done
+  else
+    settings_note "${C_DIM}The job times stay as they are and now run in $to time.$C_RST"
+  fi
+}
+
+# settings_edit INDEX -> asks for a new value of one setting; it stays on the screen until saved
+settings_edit() {
+  local i="$1" name group saved cur value problem title pattern hint env bool="false" k jobs="" pre prompt
+  local -a lines=()
+  name="${SET_NAME[i]}"
+  group="${SET_GROUP[i]}"
+  saved="${SET_SAVED[i]}"
+  cur="${SET_NEW[i]}"
+  title="${SET_TITLE[i]}"
+  pattern="$(settings_group_pattern "$group")"
+  if [ "$saved" = "true" ] || [ "$saved" = "false" ]; then
+    bool="true"
+  fi
+  lines+=("Group      $title${pattern:+  $C_DIM$pattern$C_RST}")
+  lines+=("Saved      ${saved:-$C_DIM(empty)$C_RST}")
+  if [ "${SET_MOD[i]}" = "1" ]; then
+    lines+=("On screen  $C_YLW${cur:-(empty)}$C_RST  ${C_DIM}not saved yet$C_RST")
+  fi
+  if [ -f "$ENV_FILE" ] && grep -q "^$name=" "$ENV_FILE"; then
+    env="$(env_value "$name")"
+    if [ "$env" = "$saved" ]; then
+      lines+=("In $ENV_FILE    ${env:-$C_DIM(empty)$C_RST}")
+    else
+      lines+=("In $ENV_FILE    $C_YLW${env:-(empty)}$C_RST  ${C_DIM}option 2 regenerates it from the settings$C_RST")
+    fi
+  fi
+  hint="$(settings_hint "$name" "$saved")"
+  if [ -n "$hint" ]; then
+    lines+=("$C_DIM$hint$C_RST")
+  fi
+  clear_screen
+  ui_box "$(settings_width)" "Setting $UI_SEP $name" "${lines[@]}"
+  echo
+  if [ -t 0 ]; then
+    echo "  ${C_DIM}Change the value and press Enter$(if settings_empty_ok "$name" "$saved"; then printf ' ("" empties it)'; fi). Enter alone keeps it.$C_RST"
+  elif [ "$bool" = "true" ]; then
+    echo "  ${C_DIM}true or false; Enter keeps ${cur:-it}.$C_RST"
+  else
+    echo "  ${C_DIM}Enter keeps the value$(if settings_empty_ok "$name" "$saved"; then printf ', "" empties it'; fi).$C_RST"
+  fi
+  # readline must not count the color codes of the prompt: they go between \001 and \002
+  prompt="  "$'\001'"$C_CYN"$'\002'"$UI_ARROW"$'\001'"$C_RST"$'\002'" $name: "
+  pre="$cur"
+  while true; do
+    # On a terminal the value is ready to be changed (after a refused one: the text just typed).
+    # The read runs in a subshell with the default Ctrl-C, so Ctrl-C cancels instead of keeping the line.
+    if [ -t 0 ]; then
+      if ! value="$(trap - INT; read -e -r -i "$pre" -p "$prompt" v && printf '%s' "$v")"; then
+        echo
+        return 0
+      fi
+    elif ! ui_ask value "$name:"; then
+      return 0
+    fi
+    if [ -z "$value" ] || [ "$value" = "$cur" ]; then
+      return 0
+    fi
+    if [ "$value" = '""' ]; then
+      value=""
+    fi
+    if [ "$bool" = "true" ]; then
+      case "${value,,}" in
+        true|t|yes|y|on|1) value="true" ;;
+        false|f|no|n|off|0) value="false" ;;
+      esac
+    fi
+    if problem="$(settings_check "$name" "$value" "$saved")"; then
+      break
+    fi
+    err "$problem"
+    pre="$value"
+  done
+  if [ "$value" = "$cur" ]; then
+    return 0
+  fi
+  SET_NEW[i]="$value"
+  if [ "$value" = "$saved" ]; then
+    SET_MOD[i]=""
+    settings_note "$C_GRN$UI_OK$C_RST $name is back at its saved value."
+  else
+    SET_MOD[i]="1"
+    settings_note "$C_YLW$SET_MARK$C_RST $name ${C_DIM}$UI_RARR$C_RST ${value:-(empty)}   ${C_DIM}not saved yet - S saves$C_RST"
+  fi
+  if [ "$name" = "TZ" ]; then
+    if tz_known "${cur:-UTC}" && tz_known "${value:-UTC}"; then
+      if ! tz_same "${cur:-UTC}" "${value:-UTC}"; then
+        echo
+        settings_tz_jobs "${cur:-UTC}" "${value:-UTC}"
+      fi
+    else
+      for ((k = 0; k < ${#SET_NAME[@]}; k++)); do
+        if [[ "${SET_NAME[k]}" == *_CRON ]] && [ "${SET_NEW[k]}" != "-" ]; then
+          jobs="${jobs:+$jobs, }${SET_NAME[k]}"
+        fi
+      done
+      if [ -n "$jobs" ]; then
+        settings_note "$C_YLW$UI_NO$C_RST $jobs not moved: this server has no time zone data to convert them - check the times."
+      fi
+    fi
+  fi
+}
+
+# Checks the changed settings together, writes them into this script (after a backup) and
+# restarts the menu with them. Fails, with the reason, when they cannot be used.
+settings_save() {
+  local i n dir copy orig out="" backup="" ids id tries=0 names hub="keep"
+  settings_changed
+  n="$SET_NCHANGED"
+  if [ "$n" -eq 0 ]; then
+    settings_note "${C_DIM}Nothing to save.$C_RST"
+    return 0
+  fi
+  ids="$(job_running_ids)"
+  if [ -n "$ids" ]; then
+    echo
+    while IFS= read -r id; do
+      warn "Job #$id ($(cat -- "$JOBS_DIR/$id/title" 2>/dev/null)) is running."
+    done <<< "$ids"
+    if ! confirm "  Save the settings while it runs? It may still use the old values." n; then
+      settings_note "${C_DIM}Not saved yet.$C_RST"
+      return 0
+    fi
+  fi
+  if ! dir="$(mktemp -d)" || [ ! -d "$dir" ]; then
+    err "Cannot create a temporary folder for the check (TMPDIR) - nothing was changed."
+    return 1
+  fi
+  copy="$dir/$SCRIPT_NAME"
+  orig="$dir/orig"
+  while true; do
+    # the changes go into a copy of the current file, so a setting a job wrote meanwhile stays
+    if ! cp -p -- "$SCRIPT_PATH" "$orig" || ! cp -p -- "$orig" "$copy"; then
+      rm -rf -- "$dir"
+      err "Cannot copy $SCRIPT_NAME for the check - nothing was changed."
+      return 1
+    fi
+    for ((i = 0; i < ${#SET_NAME[@]}; i++)); do
+      if [ "${SET_MOD[i]}" = "1" ] && ! set_setting "${SET_NAME[i]}" "${SET_NEW[i]}" "$copy"; then
+        rm -rf -- "$dir"
+        return 1
+      fi
+    done
+    if ! bash -n "$copy" 2>/dev/null || ! out="$(bash "$copy" check-settings 2>&1)"; then
+      rm -rf -- "$dir"
+      echo
+      err "Not saved - the settings do not work together:"
+      if [ -n "$out" ]; then
+        printf '%s\n' "$out" | sed 's/^/    /'
+      fi
+      return 1
+    fi
+    if ! backup="$(script_backup)"; then
+      rm -rf -- "$dir"
+      err "Cannot write a backup next to $SCRIPT_PATH - nothing was changed."
+      return 1
+    fi
+    if [ "$(cksum < "$orig")" = "$(cksum < "$SCRIPT_PATH")" ]; then
+      break
+    fi
+    rm -f -- "$backup"
+    tries=$((tries + 1))
+    if [ "$tries" -ge 3 ]; then
+      rm -rf -- "$dir"
+      err "$SCRIPT_NAME keeps changing (a running job?) - nothing was changed, try again later."
+      return 1
+    fi
+  done
+  # Write the content back instead of moving the file, so owner and mode stay.
+  if ! cat -- "$copy" > "$SCRIPT_PATH"; then
+    cat -- "$backup" > "$SCRIPT_PATH" 2>/dev/null || true
+    rm -rf -- "$dir"
+    err "Cannot write $SCRIPT_PATH - it was restored from $backup."
+    return 1
+  fi
+  rm -rf -- "$dir"
+  names="$SET_CHANGED"
+  if [ "$n" -gt 3 ]; then
+    names="$(printf '%s' "$SET_CHANGED" | cut -d, -f1-3), +$((n - 3)) more"
+  fi
+  for ((i = 0; i < ${#SET_NAME[@]}; i++)); do
+    if [ "${SET_MOD[i]}" = "1" ]; then
+      case "${SET_NAME[i]}" in
+        CHECK_FOR_UPDATES|CATALOG_IMAGE_REPO|CATALOG_WORKER_IMAGE_REPO) hub="fresh" ;;
+      esac
+    fi
+  done
+  export RVC_NOTICE="$n setting(s) saved ($names; backup $(basename -- "$backup")). Option 2 regenerates the files, then 6 applies them."
+  if [ "$hub" = "keep" ]; then
+    export RVC_HUB_STATUS="$HUB_STATUS" RVC_LATEST_VERSION="$LATEST_VERSION" RVC_HUB_STABLE="$HUB_STABLE"
+  else
+    unset RVC_HUB_STATUS RVC_LATEST_VERSION RVC_HUB_STABLE
+  fi
+  exec bash "$SCRIPT_PATH" menu
+}
+
+# Menu option 1: all settings of this script on one screen, grouped by the part of their names
+# they share. Edits stay on the screen until S saves them; E opens the file in the text editor.
+settings_editor() {
+  local choice n i
+  if [ -z "$SCRIPT_PATH" ] || [ ! -w "$SCRIPT_PATH" ]; then
+    err "Cannot change the settings (${SCRIPT_PATH:-the script} is not a writable file)."
+    ui_pause_tty
+    return 0
+  fi
+  if ! settings_load; then
+    err "The settings section of $SCRIPT_NAME cannot be read - opening the file in the editor."
+    edit_config
+    ui_pause_tty
+    return 0
+  fi
+  SET_FILTER=""
+  SET_NOTE=""
+  while true; do
+    settings_draw
+    if ! ui_ask choice "Select (number or name):"; then
+      choice="0"
+      echo
+    fi
+    if [[ "$choice" == *[[:cntrl:]]* ]]; then
+      settings_note "$C_YLW$UI_NO$C_RST Type a number, a name or /text."
+      continue
+    fi
+    case "$choice" in
+      0|q|Q)
+        settings_changed
+        n="$SET_NCHANGED"
+        if [ "$n" -eq 0 ]; then
+          return 0
+        fi
+        if confirm "  Save the $n changed setting(s) ($SET_CHANGED)?" y; then
+          settings_save || ui_pause_tty
+        else
+          # shown by the menu after it is drawn again
+          TUI_NOTICE="Settings not saved - $SCRIPT_NAME is unchanged."
+          return 0
+        fi
+        ;;
+      s|S) settings_save || ui_pause_tty ;;
+      u|U)
+        settings_changed
+        n="$SET_NCHANGED"
+        for ((i = 0; i < ${#SET_NAME[@]}; i++)); do
+          SET_NEW[i]="${SET_SAVED[i]}"
+          SET_MOD[i]=""
+        done
+        settings_note "${C_DIM}$n change(s) undone.$C_RST"
+        ;;
+      e|E)
+        settings_changed
+        n="$SET_NCHANGED"
+        if [ "$n" -gt 0 ] && ! confirm "  Open the file in $(editor_name)? The $n change(s) on this screen are lost." n; then
+          continue
+        fi
+        edit_config
+        ui_pause_tty
+        if ! settings_load; then
+          err "The settings section of $SCRIPT_NAME cannot be read."
+          ui_pause_tty
+          return 0
+        fi
+        ;;
+      /*) SET_FILTER="${choice#/}" ;;
+      "") ;;
+      *)
+        if [[ "$choice" =~ ^[0-9]{1,4}$ ]]; then
+          if [ "$((10#$choice))" -ge 1 ] && [ "$((10#$choice))" -le "${#SET_NAME[@]}" ]; then
+            settings_edit $((10#$choice - 1))
+          else
+            settings_note "$C_YLW$UI_NO$C_RST There is no setting $choice."
+          fi
+        elif i="$(settings_find "$choice")"; then
+          settings_edit "$i"
+        else
+          SET_FILTER="$choice"
+        fi
+        ;;
+    esac
+  done
+}
+
 # Opens the configuration section of this script in the editor, then restarts
 # the script so the new values are used. Runs in the main shell (not in a
 # subshell) because it replaces the running process.
 edit_config() {
-  local line="" before saved editor
+  local line="" before saved editor hub
   if [ -z "$SCRIPT_PATH" ] || [ ! -w "$SCRIPT_PATH" ]; then
     err "Cannot edit the script file (${SCRIPT_PATH:-unknown path} is not writable)."
     return 0
@@ -6243,6 +7231,7 @@ edit_config() {
   fi
   line="$(grep -n -m 1 '^# CONFIGURE ONLY THIS SECTION' "$SCRIPT_PATH" | cut -d: -f1)" || line=""
   before="$(cksum < "$SCRIPT_PATH")"
+  hub="$(settings_hub_keys "$SCRIPT_PATH")"
   saved="$(mktemp)"
   cp -p -- "$SCRIPT_PATH" "$saved"
   while true; do
@@ -6268,7 +7257,11 @@ edit_config() {
   done
   rm -f -- "$saved"
   export RVC_NOTICE="Configuration reloaded. Use option 2 to regenerate the files, then 6 to apply."
-  export RVC_HUB_STATUS="$HUB_STATUS" RVC_LATEST_VERSION="$LATEST_VERSION" RVC_HUB_STABLE="$HUB_STABLE"
+  if [ "$(settings_hub_keys "$SCRIPT_PATH")" = "$hub" ]; then
+    export RVC_HUB_STATUS="$HUB_STATUS" RVC_LATEST_VERSION="$LATEST_VERSION" RVC_HUB_STABLE="$HUB_STABLE"
+  else
+    unset RVC_HUB_STATUS RVC_LATEST_VERSION RVC_HUB_STABLE
+  fi
   exec bash "$SCRIPT_PATH" menu
 }
 
@@ -6429,7 +7422,7 @@ ${c}THE ICONS$r
 
 ${c}SETUP$r
 $(help_item 7 run "Full setup" "Generates .env and docker-compose.yml, validates them and starts the stack." "Start here on a new server.")
-$(help_item 1 edit "Settings" "Opens the settings at the top of $SCRIPT_NAME in $(editor_name):" "versions, ports, time zone (TZ), sync time (AUTOSYNC_CRON) and more.")
+$(help_item 1 edit "Settings" "All settings on one screen, grouped by name (CATALOG_*, MINIO_*," "*_TAG ...); checked before they are saved. E opens them in $(editor_short).")
 $(help_item 2 run "Generate" "Writes .env and docker-compose.yml from the settings. Passwords are kept;" "asks to align TZ with the server's time zone.")
 $(help_item 3 edit ".env file" "Shows or edits the generated .env (passwords included).")
 $(help_item 4 edit "docker-compose.yml" "Shows or edits the generated compose file.")
@@ -6488,7 +7481,7 @@ show_help() {
 menu_dispatch() {
   reload_settings
   case "$1" in
-    1)  edit_config ;;
+    1)  settings_editor ;;
     2)  run_action do_generate ask ;;
     3)  run_action edit_generated "$ENV_FILE" ;;
     4)  run_action edit_generated "$COMPOSE_FILE" ;;
@@ -6813,10 +7806,19 @@ tui_run() {
   ui_echo
   menu_dispatch "$1" || true
   ui_echo
-  if [ "$1" != "H" ] || ! command -v less >/dev/null 2>&1; then
-    echo
-    pause
-  fi
+  case "$1" in
+    1) ;;
+    H)
+      if ! command -v less >/dev/null 2>&1; then
+        echo
+        pause
+      fi
+      ;;
+    *)
+      echo
+      pause
+      ;;
+  esac
   ui_noecho
 }
 
@@ -6853,6 +7855,12 @@ menu() {
       ok "$notice"
       echo
       notice=""
+      TUI_NOTICE=""
+    fi
+    if [ -n "$TUI_NOTICE" ]; then
+      ok "$TUI_NOTICE"
+      echo
+      TUI_NOTICE=""
     fi
     if [ -n "$SCRIPT_PATH" ] && [ -n "$(job_running_ids)" ]; then
       echo " Running processes (J shows, follows and cancels them):"
@@ -6871,8 +7879,10 @@ menu() {
       "") continue ;;
     esac
     menu_dispatch "$choice" || true
-    echo
-    pause
+    if [ "$choice" != "1" ]; then
+      echo
+      pause
+    fi
   done
 }
 
@@ -6956,6 +7966,7 @@ main() {
     check) do_check ;;
     timezone|tz) timezone_cli ;;
     __cron_convert) cron_convert "$@"; echo ;;
+    __settings_groups) settings_grouped "$SCRIPT_PATH" ;;
     updates) show_updates_cli ;;
     upgrade) INTERACTIVE="true"; do_upgrade ;;
     self-update) update_installer cli ;;

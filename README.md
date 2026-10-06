@@ -16,7 +16,7 @@ On the server, in the folder where the Catalog should live (the installer keeps 
 wget -nv -O rn1-technology-catalog-installer.sh https://raw.githubusercontent.com/AKARABEL/rn1-technology-catalog-installer/main/rn1-technology-catalog-installer.sh && chmod +x rn1-technology-catalog-installer.sh && ./rn1-technology-catalog-installer.sh
 ```
 
-Then choose **7** (generate + validate + start). The settings are at the top of `rn1-technology-catalog-installer.sh`; option **1** opens them in `vi`.
+Then choose **7** (generate + validate + start). The settings are at the top of `rn1-technology-catalog-installer.sh`; option **1** shows them on one screen to change and check them (**E** there opens them in `vi`).
 
 - Run the script as a file, as shown above. Piping it into bash (`wget -O- ... | bash`) does not work, because the menu needs the keyboard and the script stores its settings in its own file.
 - **Later updates:** use option **22** (or `./rn1-technology-catalog-installer.sh self-update`) instead of the `wget` line. It downloads the newest version and keeps all your settings. The previous version is kept as `rn1-technology-catalog-installer.sh.bak-<timestamp>`. Running the `wget` line again would overwrite your settings. If the line seems to do nothing, the download failed: `wget -nv` prints why (network, DNS, proxy).
@@ -51,7 +51,7 @@ Long tasks run as background jobs: start, pull, restart, stop, snapshot download
 
 | Option | Purpose |
 |---|---|
-| 1 | Edit the settings at the top of the script; errors are caught before reload |
+| 1 | **Settings**: all settings of the script on one screen, grouped by name (see below) |
 | 2 | Generate `.env` and `docker-compose.yml`; existing passwords are kept |
 | 3, 4 | Review or edit the generated files |
 | 5, 6 | Validate (`docker compose config`), start or apply changes (`up -d`) |
@@ -67,6 +67,23 @@ Long tasks run as background jobs: start, pull, restart, stop, snapshot download
 | 23 | Take over an existing installation on this host (its `.env`, `docker-compose.yml`, passwords and data) |
 | 99 | Remove containers **and all data volumes** (you must type `DELETE`) |
 | J | Jobs: follow, cancel and read the log of running and finished tasks |
+
+## Settings screen
+
+Option **1** reads the settings section at the top of the script and groups the settings by their names:
+
+- names ending in `_TAG`: the image tags;
+- names that share their first word with another setting, for example `CATALOG_*`, `MINIO_*` and `RABBITMQ_*`;
+- names that share their last word, for example `*_CRON`;
+- all other settings under **General**.
+
+A setting added to the script later appears in its group by itself.
+
+- To change a value, type its number or its name. Values are checked as you type them: ports, `true`/`false`, time zones, cron times, sizes and URLs.
+- `/text` shows only the settings whose name or value contains the text.
+- **S** checks all changes together and writes them into the script, then the menu restarts with them. The previous script is kept as `<script>.bak-<time>`. **U** undoes the changes, and **0** asks before it drops them.
+- When `TZ` changes, the screen offers to move the job times (`*_CRON`), so they keep running at the same moment.
+- **E** opens the settings in the text editor (`$EDITOR`, default `vi`), as before.
 
 ## Command line
 
