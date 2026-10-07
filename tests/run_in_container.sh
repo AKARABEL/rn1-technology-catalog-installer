@@ -2,17 +2,17 @@
 set -euo pipefail
 if command -v dnf >/dev/null 2>&1; then
   dnf -y -q --setopt=strict=0 install findutils procps-ng util-linux tar gzip diffutils tzdata python3 jq \
-    hostname iproute which ncurses sed gawk grep shadow-utils >/dev/null
+    hostname iproute which ncurses sed gawk grep shadow-utils openssh-clients >/dev/null
 elif command -v yum >/dev/null 2>&1; then
   # CentOS 7 is end of life: its packages are only in the vault
   sed -i -e 's/^mirrorlist=/#mirrorlist=/' -e 's|^#\{0,1\}baseurl=http://mirror.centos.org|baseurl=http://vault.centos.org|' /etc/yum.repos.d/CentOS-*.repo
-  yum -y -q install findutils procps-ng util-linux tar gzip diffutils tzdata python3 hostname iproute which ncurses >/dev/null
+  yum -y -q install findutils procps-ng util-linux tar gzip diffutils tzdata python3 hostname iproute which ncurses openssh-clients >/dev/null
 elif command -v apt-get >/dev/null 2>&1; then
   apt-get update -qq
-  DEBIAN_FRONTEND=noninteractive apt-get install -y -qq procps tzdata python3 jq iproute2 ncurses-bin bsdutils util-linux >/dev/null
+  DEBIAN_FRONTEND=noninteractive apt-get install -y -qq procps tzdata python3 jq iproute2 ncurses-bin bsdutils util-linux openssh-client >/dev/null
 elif command -v zypper >/dev/null 2>&1; then
   zypper -q -n install procps util-linux timezone python3 jq iproute2 tar gzip diffutils which hostname ncurses-utils \
-    findutils shadow gawk >/dev/null
+    findutils shadow gawk openssh-clients >/dev/null
 fi
 id t >/dev/null 2>&1 || useradd -m t
 rm -rf /home/t/r

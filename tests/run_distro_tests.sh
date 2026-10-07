@@ -92,6 +92,18 @@ check "missing Compose plugin: install command of this machine ($PM)" 'grep -q "
 out="$(run check)"
 check "a working Docker passes the Docker checks" 'grep -q "Docker CLI: Docker version 28.0.1" <<< "$out" && grep -q "Compose: Docker Compose version v2.33.1" <<< "$out" && ! grep -q "Podman" <<< "$out"'
 
+# a UTF-8 locale that is not installed (C.UTF-8 on CentOS 7): plain characters, else the boxes break
+# (only with glibc: Git Bash accepts every locale name)
+if [ -r /etc/os-release ] && command -v locale >/dev/null 2>&1; then
+  out="$(cd "$T/d" && printf '0\n' | LC_ALL= LC_CTYPE= LANG=xx_YY.UTF-8 PATH="$T/bin:$PATH" bash "$I" menu 2>&1)"
+  check "UTF-8 locale that is not installed: plain characters" 'grep -q "I install - U update - R remove" <<< "$out"'
+  UTF="$(locale -a 2>/dev/null | grep -iE '^(C|en_US)\.utf-?8$' | head -n 1)"
+  if [ -n "$UTF" ]; then
+    out="$(cd "$T/d" && printf '0\n' | LC_ALL= LC_CTYPE= LANG="$UTF" PATH="$T/bin:$PATH" bash "$I" menu 2>&1)"
+    check "installed UTF-8 locale ($UTF): line characters" 'grep -q "I install · U update · R remove" <<< "$out"'
+  fi
+fi
+
 if ! command -v docker >/dev/null 2>&1; then
   out="$(cd "$T/d" && bash "$I" check </dev/null 2>&1)"
   check "no Docker at all: install steps for this distribution" 'grep -q "Docker is not installed" <<< "$out" && grep -qF -- "$WANT" <<< "$out"'

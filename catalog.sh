@@ -371,6 +371,15 @@ docker_install_hint() {
   esac
 }
 
+# The package with ssh, scp and ssh-keygen
+ssh_package() {
+  if command -v apt-get >/dev/null 2>&1 || command -v apk >/dev/null 2>&1; then
+    echo "openssh-client"
+  else
+    echo "openssh-clients"
+  fi
+}
+
 # True when the docker command is Podman's emulation (podman-docker), which is not supported
 docker_is_podman() {
   local v
@@ -1713,7 +1722,13 @@ scp_build_opts() {
 # Asks for the scp target, confirms a new host key and opens the connection (the password is
 # asked here, so the copy can run later in the background). Returns 0 ready, 1 error, 2 cancelled.
 scp_prepare() {
-  local host scp_host port user target rt auth key pw kh kf known="$HOME/.ssh/known_hosts"
+  local host scp_host port user target rt auth key pw kh kf known="$HOME/.ssh/known_hosts" tool
+  for tool in ssh scp ssh-keygen ssh-keyscan; do
+    if ! command -v "$tool" >/dev/null 2>&1; then
+      err "Copying needs the SSH client, $tool is missing: $(pkg_hint "$(ssh_package)")"
+      return 1
+    fi
+  done
   echo
   read -r -p "  Host (IP or DNS)  : " host || host=""
   if [ -z "$host" ]; then
@@ -4229,7 +4244,13 @@ adopt_installation() {
 
 UI_UTF="false"
 case "${LC_ALL:-${LC_CTYPE:-${LANG:-}}}" in
-  *[Uu][Tt][Ff]-8*|*[Uu][Tt][Ff]8*) UI_UTF="true" ;;
+  *[Uu][Tt][Ff]-8*|*[Uu][Tt][Ff]8*)
+    # only when the locale is installed: bash then counts the three bytes of a line character as one
+    UI_PROBE="$(printf '\342\224\200')"
+    if [ "${#UI_PROBE}" -eq 1 ]; then
+      UI_UTF="true"
+    fi
+    ;;
 esac
 UI_LINES=0
 UI_JOB_SEL=""
@@ -4351,14 +4372,22 @@ ui_fancy() {
 }
 
 ui_cols() {
-  local c
-  c="$(tput cols 2>/dev/null)" || c=""
+  local c s
+  s="$(stty size 2>/dev/null)" || s=""
+  c="${s##* }"
+  if ! [[ "$c" =~ ^[1-9][0-9]*$ ]]; then
+    c="$(tput cols 2>/dev/null)" || c=""
+  fi
   printf '%s' "${c:-${COLUMNS:-80}}"
 }
 
 ui_rows() {
-  local r
-  r="$(tput lines 2>/dev/null)" || r=""
+  local r s
+  s="$(stty size 2>/dev/null)" || s=""
+  r="${s%% *}"
+  if ! [[ "$r" =~ ^[1-9][0-9]*$ ]]; then
+    r="$(tput lines 2>/dev/null)" || r=""
+  fi
   printf '%s' "${r:-${LINES:-24}}"
 }
 
