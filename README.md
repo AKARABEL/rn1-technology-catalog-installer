@@ -4,7 +4,7 @@
 
 ## Requirements
 
-- Linux (Ubuntu, Debian or RHEL family) with Docker Engine and the Docker Compose plugin. The older `docker-compose` 1.27 or newer also works.
+- Linux with Docker Engine and the Docker Compose plugin: Ubuntu, Debian, RHEL 8 to 10, CentOS Stream, Rocky Linux, AlmaLinux, Oracle Linux or openSUSE. The older `docker-compose` 1.27 or newer also works. Podman (`podman-docker`) is not supported. Option 16 shows how to install Docker Engine on the server's distribution, see [RHEL, CentOS, Rocky and AlmaLinux](#rhel-centos-rocky-and-almalinux).
 - bash 4.2 or newer and curl. Snapshot features also need `jq` or `python3`.
 - For OpenSearch: `vm.max_map_count` of at least 262144. Menu option 16 checks this.
 
@@ -16,7 +16,13 @@ On the server, in the folder where the Catalog should live (the installer keeps 
 wget -nv -O rn1-technology-catalog-installer.sh https://raw.githubusercontent.com/AKARABEL/rn1-technology-catalog-installer/main/rn1-technology-catalog-installer.sh && chmod +x rn1-technology-catalog-installer.sh && ./rn1-technology-catalog-installer.sh
 ```
 
-Then choose **7** (generate + validate + start). The settings are at the top of `rn1-technology-catalog-installer.sh`; option **1** shows them on one screen to change and check them (**E** there opens them in `vi`).
+RHEL, Rocky and AlmaLinux minimal installations have no `wget`; use curl there:
+
+```bash
+curl -fsSL -o rn1-technology-catalog-installer.sh https://raw.githubusercontent.com/AKARABEL/rn1-technology-catalog-installer/main/rn1-technology-catalog-installer.sh && chmod +x rn1-technology-catalog-installer.sh && ./rn1-technology-catalog-installer.sh
+```
+
+Then press **I** for the guided installation, or choose **7** to generate, validate and start in one go. The settings are at the top of `rn1-technology-catalog-installer.sh`; option **1** shows them on one screen to change and check them (**E** there opens them in `vi`).
 
 - Run the script as a file, as shown above. Piping it into bash (`wget -O- ... | bash`) does not work, because the menu needs the keyboard and the script stores its settings in its own file.
 - **Later updates:** use option **22** (or `./rn1-technology-catalog-installer.sh self-update`) instead of the `wget` line. It downloads the newest version and keeps all your settings. The previous version is kept as `rn1-technology-catalog-installer.sh.bak-<timestamp>`. Running the `wget` line again would overwrite your settings. If the line seems to do nothing, the download failed: `wget -nv` prints why (network, DNS, proxy).
@@ -212,6 +218,24 @@ Until 2026-10-05 the installer was called `catalog.sh`. Such installations keep 
 - To use the new name, rename the file while no job runs (check with **J**): `mv catalog.sh rn1-technology-catalog-installer.sh`. The installer finds its settings and files by its own location, so nothing else changes. If you keep the old name, use `./catalog.sh` wherever this README writes `./rn1-technology-catalog-installer.sh`.
 - If you run the one-line install in the folder of an installation that `catalog.sh` (or the original generator script) set up, the new installer starts with its default settings. Whenever another installer in the folder has other settings and generating would change the existing `.env` or `docker-compose.yml`, the menu says so, option 2 asks first, and `generate`, `setup`, the guided upgrade and the patch updates refuse. Option **23** (or `./rn1-technology-catalog-installer.sh adopt ./catalog.sh`) shows the differences, copies the settings of the old file and renames it (not while jobs run). If the other file is no longer used, rename or remove it instead. Differences in `CHECK_FOR_UPDATES` and `INSTALLER_URL` do not count.
 
+## RHEL, CentOS, Rocky and AlmaLinux
+
+- **Docker Engine:** install Docker CE from Docker's repository; the `podman-docker` package of the distribution is not supported. Option 16 prints the commands for the server, on Rocky Linux 9 for example:
+
+  ```bash
+  sudo dnf -y install dnf-plugins-core
+  sudo dnf config-manager --add-repo https://download.docker.com/linux/centos/docker-ce.repo
+  sudo dnf -y install docker-ce docker-ce-cli containerd.io docker-compose-plugin
+  sudo systemctl enable --now docker
+  ```
+
+  RHEL itself uses `https://download.docker.com/linux/rhel/docker-ce.repo`. If dnf reports a conflict with `podman` or `runc`, remove them first. Details: [docs.docker.com/engine/install](https://docs.docker.com/engine/install/).
+- **Packages:** the hints of the script name the package manager of the server (`sudo dnf install jq`, `sudo yum install curl`, `sudo zypper install ...`).
+- **SELinux** can stay enforcing: the stack keeps its data in named Docker volumes and mounts no host folders.
+- **firewalld** does not filter the ports that Docker publishes. Restrict access in the network firewall or the `DOCKER-USER` chain.
+- **vm.max_map_count** is 65530 by default; OpenSearch wants 262144 (option 16 shows the two commands).
+- **CentOS 7 and RHEL 7** are end of life. The tests run there to keep bash 4.2 working, but use version 8 or newer for new servers.
+
 ## Known issues
 
 - MongoDB 8 does not start on Linux kernels 6.19 to 7.0.13, which includes Ubuntu 26.04 with kernel 7.0.0 ([SERVER-121912](https://jira.mongodb.org/browse/SERVER-121912)). Set `MONGO_TAG="7.0"`. The script warns about this in options 6 and 16.
@@ -228,6 +252,7 @@ bash tests/run_adopt_tests.sh "$PWD/rn1-technology-catalog-installer.sh"
 bash tests/run_jobs_tests.sh "$PWD/rn1-technology-catalog-installer.sh"
 bash tests/run_timezone_tests.sh "$PWD/rn1-technology-catalog-installer.sh"
 bash tests/run_wizard_tests.sh "$PWD/rn1-technology-catalog-installer.sh"
+bash tests/run_distro_tests.sh "$PWD/rn1-technology-catalog-installer.sh"
 ```
 
-Docker, ssh, scp and the Raynet APIs are replaced by fakes. The Updates tests query Docker Hub and GHCR, so they need internet access. The jobs tests close the menu's session the way a lost SSH connection does, cancel jobs, and hold X in the full screen menu; they need Linux (`setsid` and `script` from util-linux). The time zone tests need tzdata. GitHub Actions runs all nine suites on every push.
+Docker, ssh, scp and the Raynet APIs are replaced by fakes. The Updates tests query Docker Hub and GHCR, so they need internet access. The jobs tests close the menu's session the way a lost SSH connection does, cancel jobs, and hold X in the full screen menu; they need Linux (`setsid` and `script` from util-linux). The time zone tests need tzdata. The distribution tests check the package and Docker hints for the machine they run on. GitHub Actions runs all ten suites on every push: on Ubuntu, and with `tests/run_in_container.sh` as a normal user in RHEL 8, 9 and 10 (UBI), CentOS 7 (bash 4.2), CentOS Stream 9, Rocky Linux 9, AlmaLinux 9, Debian 12 and openSUSE Leap 15.6.

@@ -36,3 +36,29 @@ jobs:
         run: bash tests/run_timezone_tests.sh "$PWD/rn1-technology-catalog-installer.sh"
       - name: Guided tasks install, update and remove
         run: bash tests/run_wizard_tests.sh "$PWD/rn1-technology-catalog-installer.sh"
+      - name: Package and Docker hints of the distribution
+        run: bash tests/run_distro_tests.sh "$PWD/rn1-technology-catalog-installer.sh"
+
+  distributions:
+    name: ${{ matrix.name }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: "RHEL 10 (UBI)", image: "registry.access.redhat.com/ubi10/ubi" }
+          - { name: "RHEL 9 (UBI)", image: "registry.access.redhat.com/ubi9/ubi" }
+          - { name: "RHEL 8 (UBI), bash 4.4", image: "registry.access.redhat.com/ubi8/ubi" }
+          - { name: "CentOS 7, bash 4.2", image: "centos:7" }
+          - { name: "CentOS Stream 9", image: "quay.io/centos/centos:stream9" }
+          - { name: "Rocky Linux 9", image: "rockylinux/rockylinux:9" }
+          - { name: "AlmaLinux 9", image: "almalinux:9" }
+          - { name: "Debian 12", image: "debian:12" }
+          - { name: "openSUSE Leap 15.6", image: "opensuse/leap:15.6" }
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - name: All suites as a normal user
+        run: docker run --rm -v "$PWD:/src:ro" "${{ matrix.image }}" bash /src/tests/run_in_container.sh

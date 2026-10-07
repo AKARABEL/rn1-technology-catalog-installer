@@ -288,6 +288,99 @@ port_settings() {
 # Docker / Compose
 ###############################################################################
 
+# pkg_hint PACKAGE... -> the command that installs them on this machine ("sudo dnf install jq")
+pkg_hint() {
+  local pm
+  for pm in apt-get dnf yum zypper apk; do
+    if command -v "$pm" >/dev/null 2>&1; then
+      case "$pm" in
+        apk) echo "sudo apk add $*" ;;
+        *) echo "sudo $pm install $*" ;;
+      esac
+      return 0
+    fi
+  done
+  echo "install $*"
+}
+
+# os_release FIELD -> a field of /etc/os-release (ID, ID_LIKE ...), without quotes
+os_release() {
+  local v=""
+  if [ -r /etc/os-release ]; then
+    v="$(sed -n "s/^$1=//p" /etc/os-release)"
+  fi
+  v="${v%%$'\n'*}"
+  v="${v//\"/}"
+  printf '%s' "${v//\'/}"
+}
+
+# The package with the Docker Compose plugin
+compose_package() {
+  if command -v apt-get >/dev/null 2>&1; then
+    if [ "$(os_release ID)" = "ubuntu" ] && command -v dpkg >/dev/null 2>&1 && dpkg -s docker.io >/dev/null 2>&1; then
+      echo "docker-compose-v2"
+    else
+      echo "docker-compose-plugin"
+    fi
+  elif ! command -v dnf >/dev/null 2>&1 && ! command -v yum >/dev/null 2>&1 && command -v zypper >/dev/null 2>&1; then
+    echo "docker-compose"
+  else
+    echo "docker-compose-plugin"
+  fi
+}
+
+# How to install Docker Engine with the Compose plugin on this Linux, as indented lines
+docker_install_hint() {
+  local id like repo="" pm="dnf"
+  id="$(os_release ID)"
+  like=" $(os_release ID_LIKE) "
+  case "$id" in
+    rhel) repo="rhel" ;;
+    fedora) repo="" ;;
+    centos|rocky|almalinux|ol) repo="centos" ;;
+    *)
+      case "$like" in
+        *" rhel "*|*" centos "*) repo="centos" ;;
+      esac
+      ;;
+  esac
+  if [ -n "$repo" ]; then
+    if ! command -v dnf >/dev/null 2>&1 && command -v yum >/dev/null 2>&1; then
+      pm="yum"
+      echo "      sudo yum -y install yum-utils"
+      echo "      sudo yum-config-manager --add-repo https://download.docker.com/linux/$repo/docker-ce.repo"
+    else
+      echo "      sudo dnf -y install dnf-plugins-core"
+      echo "      sudo dnf config-manager --add-repo https://download.docker.com/linux/$repo/docker-ce.repo"
+    fi
+    echo "      sudo $pm -y install docker-ce docker-ce-cli containerd.io docker-compose-plugin"
+    echo "      sudo systemctl enable --now docker"
+    echo "      If $pm reports a conflict with podman or runc, remove them first: sudo $pm remove podman-docker podman runc"
+    echo "      Details: https://docs.docker.com/engine/install/$repo/"
+    return 0
+  fi
+  case "$id $like" in
+    ubuntu*|*" ubuntu "*) echo "      See https://docs.docker.com/engine/install/ubuntu/ (docker-ce and docker-compose-plugin from Docker's repository)" ;;
+    debian*|*" debian "*) echo "      See https://docs.docker.com/engine/install/debian/ (docker-ce and docker-compose-plugin from Docker's repository)" ;;
+    fedora*) echo "      See https://docs.docker.com/engine/install/fedora/ (docker-ce and docker-compose-plugin from Docker's repository)" ;;
+    *suse*|sles*|sled*)
+      echo "      sudo zypper install docker docker-compose"
+      echo "      sudo systemctl enable --now docker"
+      ;;
+    *) echo "      See https://docs.docker.com/engine/install/" ;;
+  esac
+}
+
+# True when the docker command is Podman's emulation (podman-docker), which is not supported
+docker_is_podman() {
+  local v
+  v="$(docker --version 2>/dev/null)" || v=""
+  case "$v" in
+    *[Pp]odman*) return 0 ;;
+  esac
+  return 1
+}
+
 detect_compose() {
   local v
   if [ "${#COMPOSE[@]}" -gt 0 ]; then
@@ -302,19 +395,23 @@ detect_compose() {
     case "$v" in
       1.2[7-9]*|[2-9]*) COMPOSE=(docker-compose) ;;
       *)
-        COMPOSE_PROBLEM="docker-compose ${v:-(unknown version)} is too old (1.27 or newer needed) - install the docker-compose-plugin package."
+        COMPOSE_PROBLEM="docker-compose ${v:-(unknown version)} is too old (1.27 or newer needed) - install the Compose plugin: $(pkg_hint "$(compose_package)")"
         return 1
         ;;
     esac
   else
-    COMPOSE_PROBLEM="Docker Compose is not available (neither 'docker compose' nor 'docker-compose') - install the docker-compose-plugin package."
+    COMPOSE_PROBLEM="Docker Compose is not available (neither 'docker compose' nor 'docker-compose') - install the Compose plugin: $(pkg_hint "$(compose_package)")"
     return 1
   fi
 }
 
 require_docker() {
   if ! command -v docker >/dev/null 2>&1; then
-    err "Docker is not installed (or not in PATH)."
+    err "Docker is not installed (or not in PATH) - option 16 shows how to install it."
+    return 1
+  fi
+  if docker_is_podman; then
+    err "'docker' on this server is Podman (podman-docker), which this installer does not support - option 16 shows how to install Docker Engine."
     return 1
   fi
   if ! docker info >/dev/null 2>&1; then
@@ -1341,7 +1438,7 @@ reload_settings() {
 do_updates() {
   local choice
   if ! command -v curl >/dev/null 2>&1; then
-    err "curl is needed to check for updates (apt-get install curl)."
+    err "curl is needed to check for updates ($(pkg_hint curl))."
     return 1
   fi
   collect_updates
@@ -1365,7 +1462,7 @@ do_updates() {
 
 show_updates_cli() {
   if ! command -v curl >/dev/null 2>&1; then
-    err "curl is needed to check for updates (apt-get install curl)."
+    err "curl is needed to check for updates ($(pkg_hint curl))."
     return 1
   fi
   collect_updates
@@ -1807,7 +1904,7 @@ download_bundle() {
   while IFS= read -r ref; do
     images+=("$ref")
   done < <(stack_images)
-  for ref in "${images[@]}"; do
+  for ref in ${images[@]+"${images[@]}"}; do
     if ! is_exact_tag "${ref##*:}"; then
       floating=$((floating + 1))
     fi
@@ -1850,7 +1947,7 @@ download_bundle() {
         n|N) for i in "${!images[@]}"; do picked[i]=0; done ;;
         *)
           read -r -a toks <<< "$choice"
-          for tok in "${toks[@]}"; do
+          for tok in ${toks[@]+"${toks[@]}"}; do
             if [[ "$tok" =~ ^[0-9]+$ ]] && [ "$tok" -ge 1 ] && [ "$tok" -le "${#images[@]}" ]; then
               picked[tok - 1]=$((1 - picked[tok - 1]))
             else
@@ -2267,7 +2364,7 @@ for r in rows:
     print("\t".join(r))
 ' | tr -d '\r'
   else
-    err "Reading the snapshot list needs jq or python3 (apt-get install jq)."
+    err "Reading the snapshot list needs jq or python3 ($(pkg_hint jq))."
     return 1
   fi
 }
@@ -2314,7 +2411,7 @@ download_snapshot() {
   local kind="${1:-}" mode="${2:-interactive}" key rows daily full row choice since="" chain plan planfile reached newest fdate
   local type date size checksum path based dir dest free_kb rc total count title chainfile
   if ! command -v curl >/dev/null 2>&1; then
-    err "curl is needed (apt-get install curl)."
+    err "curl is needed ($(pkg_hint curl))."
     return 1
   fi
   key="$(api_key_stored)"
@@ -2551,7 +2648,7 @@ snapshot_plan_fetch() {
   rm -f -- "$planfile"
   count="${#lines[@]}"
   dir="$WORK_DIR/snapshots"
-  for line in "${lines[@]}"; do
+  for line in ${lines[@]+"${lines[@]}"}; do
     n=$((n + 1))
     IFS=$'\t' read -r type date size checksum path based <<< "$line"
     if [ "$count" -gt 1 ]; then
@@ -3049,7 +3146,7 @@ import_snapshot_menu() {
   echo
   ui_box "$(ui_width)" "Import into the local catalog $UI_SEP $(local_url)" "Snapshots in $WORK_DIR/snapshots, newest first. A chain is imported file by file, in order."
   i=0
-  for f in "${chains[@]}"; do
+  for f in ${chains[@]+"${chains[@]}"}; do
     i=$((i + 1))
     n=0
     total=0
@@ -3224,7 +3321,7 @@ stack_health() {
   while true; do
     bad=""
     warned=""
-    for svc in "${services[@]}"; do
+    for svc in ${services[@]+"${services[@]}"}; do
       id="$(compose ps -q "$svc" 2>/dev/null | head -n 1)" || id=""
       if [ -z "$id" ]; then
         bad="$bad $svc(missing)"
@@ -3361,7 +3458,7 @@ offer_patch_updates() {
       0) info "No patch updates applied."; return 0 ;;
       *)
         read -r -a toks <<< "$choice"
-        for tok in "${toks[@]}"; do
+        for tok in ${toks[@]+"${toks[@]}"}; do
           if [[ "$tok" =~ ^[0-9]+$ ]] && [ "$tok" -ge 1 ] && [ "$tok" -le "${#keys[@]}" ]; then
             picked[tok - 1]=$((1 - picked[tok - 1]))
           fi
@@ -3459,7 +3556,7 @@ do_upgrade() {
   sibling_guard || return 1
   upgrade_offer_rollback || return 0
   if ! command -v curl >/dev/null 2>&1; then
-    err "curl is needed (apt-get install curl)."
+    err "curl is needed ($(pkg_hint curl))."
     return 1
   fi
   collect_updates
@@ -3620,6 +3717,15 @@ upgrade_rollback() {
 # Installers from before the rename to rn1-technology-catalog-installer.sh carry this INSTALLER_URL.
 LEGACY_INSTALLER_URL="https://raw.githubusercontent.com/AKARABEL/rn1-technology-catalog-installer/main/catalog.sh"
 CURRENT_INSTALLER_URL="https://raw.githubusercontent.com/AKARABEL/rn1-technology-catalog-installer/main/rn1-technology-catalog-installer.sh"
+
+# The line that downloads and starts the installer: with wget, or with curl where wget is missing
+install_line() {
+  if ! command -v wget >/dev/null 2>&1 && command -v curl >/dev/null 2>&1; then
+    echo "curl -fsSL -o rn1-technology-catalog-installer.sh $CURRENT_INSTALLER_URL && chmod +x rn1-technology-catalog-installer.sh && ./rn1-technology-catalog-installer.sh"
+  else
+    echo "wget -nv -O rn1-technology-catalog-installer.sh $CURRENT_INSTALLER_URL && chmod +x rn1-technology-catalog-installer.sh && ./rn1-technology-catalog-installer.sh"
+  fi
+}
 
 # Downloads the newest installer and carries the current settings over to it.
 update_installer() {
@@ -5163,7 +5269,7 @@ cron_convert() {
   if [ "$h" = "*" ]; then
     newh="*"
   else
-    newh="$(cron_list "${hours[@]}")"
+    newh="$(cron_list ${hours[@]+"${hours[@]}"})"
   fi
   newdow="$dow"
   if ! cron_wild "$dom" || ! cron_wild "$mon" || ! cron_wild "$dow"; then
@@ -5181,7 +5287,7 @@ cron_convert() {
       for v in $list; do
         days+=("$((((v % 7 + shift) % 7 + 7) % 7))")
       done
-      newdow="$(cron_list "${days[@]}")"
+      newdow="$(cron_list ${days[@]+"${days[@]}"})"
     fi
   fi
   printf '%s %s %s %s %s' "$newm" "$newh" "$dom" "$mon" "$newdow"
@@ -6170,7 +6276,11 @@ do_check() {
   local problems=0 name port mmc host_tz
   info "Checking prerequisites..."
 
-  if command -v docker >/dev/null 2>&1; then
+  if command -v docker >/dev/null 2>&1 && docker_is_podman; then
+    err "'docker' on this server is Podman (podman-docker), which this installer does not support. Install Docker Engine:"
+    docker_install_hint
+    problems=$((problems + 1))
+  elif command -v docker >/dev/null 2>&1; then
     ok "Docker CLI: $(docker --version 2>/dev/null)"
     if docker info >/dev/null 2>&1; then
       ok "Docker daemon is reachable."
@@ -6190,7 +6300,8 @@ do_check() {
       problems=$((problems + 1))
     fi
   else
-    err "Docker is not installed (or not in PATH)."
+    err "Docker is not installed (or not in PATH). Install Docker Engine with the Compose plugin:"
+    docker_install_hint
     problems=$((problems + 1))
   fi
 
@@ -8469,7 +8580,7 @@ remove_wizard() {
         ;;
       *)
         read -r -a toks <<< "$choice"
-        for tok in "${toks[@]}"; do
+        for tok in ${toks[@]+"${toks[@]}"}; do
           if [[ "$tok" =~ ^[0-9]{1,2}$ ]]; then
             tok=$((10#$tok))
             if [ "$tok" -ge 1 ] && [ "$tok" -le "${#keys[@]}" ]; then
@@ -8575,7 +8686,7 @@ remove_wizard() {
   if [ "$self_gone" = "yes" ]; then
     echo
     echo "  The installer was removed too. To install again, download it with:"
-    echo "  wget -nv -O rn1-technology-catalog-installer.sh $CURRENT_INSTALLER_URL && chmod +x rn1-technology-catalog-installer.sh && ./rn1-technology-catalog-installer.sh"
+    echo "  $(install_line)"
     exit 0
   fi
   echo "  I installs it again; the settings at the top of $SCRIPT_NAME were kept."

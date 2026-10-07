@@ -299,9 +299,11 @@ check "remove: images found without containers" 'grep -q "Docker images of the s
 check "remove: volumes with no proof they are this folder's - not selected, .env kept" 'grep -q "not selected: they may be another installation" <<< "$out" && [ -f "$ST/vols" ] && [ -f "$D/.env" ]'
 
 # 18. Remove everything including the installer; a toggle with a leading zero works
+# (the download line uses curl where wget is missing, as on RHEL minimal)
+if command -v wget >/dev/null 2>&1; then DL="wget -nv -O rn1-technology-catalog-installer.sh"; else DL="curl -fsSL -o rn1-technology-catalog-installer.sh"; fi
 installed
 out="$(printf 'r\nn\ny\na\n\nDELETE\n' | bash "$I" menu 2>&1)"; rc=$?
-check "remove all: installer gone, exits with the download line" '[ "$rc" -eq 0 ] && [ ! -e "$I" ] && grep -q "The installer was removed too" <<< "$out" && grep -q "wget -nv -O rn1-technology-catalog-installer.sh" <<< "$out"'
+check "remove all: installer gone, exits with the download line" '[ "$rc" -eq 0 ] && [ ! -e "$I" ] && grep -q "The installer was removed too" <<< "$out" && grep -q "$DL" <<< "$out"'
 installed
 out="$(printf 'r\nn\ny\n04\n0\n\n0\n' | bash "$I" menu 2>&1)"; rc=$?
 check "remove: toggle 04 understood (no octal error)" '[ "$rc" -eq 0 ] && grep -q "Cancelled - nothing was removed" <<< "$out" && ! grep -q "value too great" <<< "$out"'
