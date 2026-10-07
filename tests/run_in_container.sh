@@ -9,7 +9,7 @@ elif command -v yum >/dev/null 2>&1; then
   yum -y -q install findutils procps-ng util-linux tar gzip diffutils tzdata python3 hostname iproute which ncurses openssh-clients >/dev/null
 elif command -v apt-get >/dev/null 2>&1; then
   apt-get update -qq
-  DEBIAN_FRONTEND=noninteractive apt-get install -y -qq procps tzdata python3 jq iproute2 ncurses-bin bsdutils util-linux openssh-client >/dev/null
+  DEBIAN_FRONTEND=noninteractive apt-get install -y -qq procps tzdata python3 jq iproute2 ncurses-bin bsdutils util-linux openssh-client curl ca-certificates >/dev/null
 elif command -v zypper >/dev/null 2>&1; then
   zypper -q -n install procps util-linux timezone python3 jq iproute2 tar gzip diffutils which hostname ncurses-utils \
     findutils shadow gawk openssh-clients >/dev/null
