@@ -34,3 +34,5 @@ jobs:
         run: bash tests/run_jobs_tests.sh "$PWD/rn1-technology-catalog-installer.sh"
       - name: Time zone and job times
         run: bash tests/run_timezone_tests.sh "$PWD/rn1-technology-catalog-installer.sh"
+      - name: Guided tasks install, update and remove
+        run: bash tests/run_wizard_tests.sh "$PWD/rn1-technology-catalog-installer.sh"

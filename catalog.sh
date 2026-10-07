@@ -345,12 +345,10 @@ require_files() {
 # Docker volumes that already belong to this Compose project (empty if none
 # or if Docker cannot be reached).
 project_volumes() {
-  local project="${COMPOSE_PROJECT_NAME:-$(basename -- "$WORK_DIR")}"
-  project="$(printf '%s' "$project" | tr '[:upper:]' '[:lower:]' | tr -cd 'a-z0-9_-')"
   if ! command -v docker >/dev/null 2>&1; then
     return 0
   fi
-  docker volume ls -q --filter "label=com.docker.compose.project=${project}" 2>/dev/null || true
+  docker volume ls -q --filter "label=com.docker.compose.project=$(stack_project)" 2>/dev/null || true
 }
 
 # True when the generated files differ from what the current settings would
@@ -2455,14 +2453,14 @@ download_snapshot() {
       0)
         chainfile="$(ls -1t -- "$dir"/chain-*.tsv 2>/dev/null | head -n 1)" || chainfile=""
         if [ "$count" -gt 1 ] && [ -n "$chainfile" ]; then
-          if confirm "Import the $count files into the local catalog now, one after the other?" n; then
+          if confirm "Import the $count files into the local catalog now, one after the other?" "${SNAP_IMPORT_DEFAULT:-n}"; then
             import_chain "$chainfile"
           else
             echo "  Import them later with option 19 (it offers the whole chain)."
           fi
         else
           IFS=$'\t' read -r type date _ <<< "$plan"
-          if confirm "Import $dir/$date-$type.tar.gz into the local catalog now?" n; then
+          if confirm "Import $dir/$date-$type.tar.gz into the local catalog now?" "${SNAP_IMPORT_DEFAULT:-n}"; then
             import_snapshot "$dir/$date-$type.tar.gz"
           else
             echo "  Import it later with option 19."
@@ -3148,7 +3146,10 @@ print(json.dumps(cur))
   code="$(local_call POST /v1/databaseconfiguration/synchronization "$out" -H 'Content-Type: application/json' --data-binary "@$body")"
   rm -f -- "$body"
   case "$code" in
-    200|201|204) ok "The local catalog now synchronizes from $CATALOG_CLOUD_URL (automatically: AUTOSYNC_CRON \"$(setting AUTOSYNC_CRON)\")." ;;
+    200|201|204)
+      ok "The local catalog now synchronizes from $CATALOG_CLOUD_URL (automatically: AUTOSYNC_CRON \"$(setting AUTOSYNC_CRON)\")."
+      wiz_mark sync
+      ;;
     *) rm -f -- "$out"; err "Saving the synchronization settings failed (HTTP $code)."; return 1 ;;
   esac
 
@@ -3689,7 +3690,7 @@ update_installer() {
   ok "Installer updated (previous version: $backup)."
   if [ "$mode" = "interactive" ]; then
     export RVC_NOTICE="Installer updated - your settings were kept."
-    exec bash "$SCRIPT_PATH" menu
+    exec bash "$SCRIPT_PATH" menu ${WIZ_RESUME:+"$WIZ_RESUME"}
   fi
 }
 
@@ -4551,7 +4552,7 @@ job_bytes() {
 # Jobs of one class do not run at the same time (two of them changing the stack would collide).
 job_class() {
   case "$1" in
-    do_up|do_down|do_restart|do_pull|do_reset|upgrade_run|upgrade_rollback|patch_apply) printf 'stack' ;;
+    do_up|do_down|do_restart|do_pull|do_reset|upgrade_run|upgrade_rollback|patch_apply|install_start|remove_stack|remove_backup) printf 'stack' ;;
     snapshot_fetch|snapshot_plan_fetch) printf 'snapshot' ;;
     import_upload|import_chain_run|self_sync_run) printf 'import' ;;
   esac
@@ -4602,12 +4603,19 @@ job_start() {
     shift
   fi
   shift
-  mkdir -p -- "$JOBS_DIR"
+  if ! mkdir -p -- "$JOBS_DIR" 2>/dev/null || [ ! -w "$JOBS_DIR" ]; then
+    err "Cannot create $JOBS_DIR - is $WORK_DIR writable?"
+    return 1
+  fi
   chmod 700 "$JOBS_DIR"
   job_prune
   id=$(( $(cat -- "$JOBS_DIR/seq" 2>/dev/null || echo 0) + 1 ))
   while ! mkdir -- "$JOBS_DIR/$id" 2>/dev/null; do
     id=$((id + 1))
+    if [ ! -d "$JOBS_DIR/$((id - 1))" ]; then
+      err "Cannot create a job folder in $JOBS_DIR."
+      return 1
+    fi
   done
   echo "$id" > "$JOBS_DIR/seq"
   dir="$JOBS_DIR/$id"
@@ -4933,7 +4941,7 @@ run_job() {
     err "Job #$busy ($(cat -- "$JOBS_DIR/$busy/title")) is still running - follow or cancel it first (J)."
     return 1
   fi
-  id="$(job_start "$@")"
+  id="$(job_start "$@")" || return 1
   info "Started as job #$id - it keeps running when you leave this view or the SSH session ends."
   job_follow "$id"
 }
@@ -6053,8 +6061,10 @@ do_up() {
   echo
   ok "Stack is up."
   compose ps
-  echo
-  show_access_info
+  if [ "${WIZ_QUIET_ACCESS:-}" != "yes" ]; then
+    echo
+    show_access_info
+  fi
 }
 
 do_full_setup() {
@@ -6192,7 +6202,11 @@ do_check() {
 
   if mongo_kernel_problem; then
     err "MongoDB $(setting MONGO_TAG) cannot start on Linux kernel $(uname -r) (kernels 6.19 to 7.0.13, SERVER-121912)."
-    echo "      Set MONGO_TAG=\"7.0\" at the top of $SCRIPT_NAME (menu option 1), or use a kernel 7.0.14 or newer."
+    if [ -z "$(project_volumes)" ]; then
+      echo "      Set MONGO_TAG=\"7.0\" at the top of $SCRIPT_NAME (menu option 1), or use a kernel 7.0.14 or newer."
+    else
+      echo "      The data of this installation needs MongoDB $(setting MONGO_TAG): use a kernel 7.0.14 or newer."
+    fi
     problems=$((problems + 1))
   fi
 
@@ -7331,8 +7345,16 @@ show_menu() {
   if tz_note="$(tz_menu_note)" && [ -n "$tz_note" ]; then
     printf '%s\n' "${C_YLW}$tz_note${C_RST}"
   fi
-  local col key kind label prev=""
-  echo
+  local col key kind label prev="" installed="no" state title color l1 l2
+  state="$(stack_state)"
+  if wiz_installed; then
+    installed="yes"
+  fi
+  printf '\n %s\n' "${C_CYN}START HERE$C_RST"
+  for key in I U R; do
+    IFS='|' read -r title color l1 l2 <<< "$(wiz_card "$key" "$installed" "$state" 40)"
+    printf '  %s) %s  %s\n' "$(printf '%3s' "$key")" "$color$(ui_pad "$title" 8)$C_RST" "$l1"
+  done
   while IFS='|' read -r col key kind label; do
     if [ "$key" = "-" ]; then
       printf '\n %s\n' "$C_CYN$label$C_RST"
@@ -7385,6 +7407,1267 @@ menu_reset() {
   run_job "Reset: remove containers and data volumes" -- do_reset
 }
 
+###############################################################################
+# Guided tasks of the main menu: I install, U update, R remove
+###############################################################################
+
+if [ "$UI_UTF" = "true" ]; then
+  WIZ_TODO="○"
+else
+  WIZ_TODO="-"
+fi
+# The argument that brings a restarted menu back to step 2 of the update (see update_installer)
+WIZ_RESUME=""
+
+# wiz_head TASK STEP STEP-NAME... -> clears the screen and shows the task with all its steps:
+# the steps done are ticked, the current one is marked. A narrow terminal shows only the current step.
+wiz_head() {
+  local task="$1" step="$2" i=0 s line="" width
+  shift 2
+  local -a names=("$@")
+  for s in "$@"; do
+    i=$((i + 1))
+    if [ "$i" -lt "$step" ]; then
+      line="$line$C_GRN$UI_OK $s$C_RST   "
+    elif [ "$i" -eq "$step" ]; then
+      line="$line$C_CYN$UI_ARROW $s$C_RST   "
+    else
+      line="$line$C_DIM$WIZ_TODO $s$C_RST   "
+    fi
+  done
+  line="${line%   }"
+  width="$(settings_width)"
+  if [ "$(ui_len "$line")" -gt $((width - 4)) ]; then
+    line="$C_CYN$UI_ARROW ${names[step - 1]}$C_RST"
+  fi
+  clear_screen
+  ui_box "$width" "RAYNET ONE TECHNOLOGY CATALOG $UI_SEP $task $UI_SEP step $step of $#" "$line"
+  echo
+}
+
+# Runs a step in a subshell, so the variables it changes stay there, and returns its exit code
+# (3: a job was left running in the background). The menu runs under "|| true", so errexit does
+# not work in here: the steps check their own results.
+wiz_run() {
+  local rc
+  set +e
+  ( "$@" )
+  rc=$?
+  set -e
+  return "$rc"
+}
+
+# wiz_yes_no QUESTION DEFAULT(y|n) -> 0 yes, 1 no, 2 no answer (end of input)
+wiz_yes_no() {
+  local hint answer
+  if [ "$2" = "y" ]; then
+    hint="[Y/n]"
+  else
+    hint="[y/N]"
+  fi
+  if ! read -r -p "$1 $hint " answer; then
+    echo
+    return 2
+  fi
+  case "${answer:-$2}" in
+    [Yy]|[Yy][Ee][Ss]) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# The guided task stops here; the menu shows how to go on.
+wiz_stop() {
+  info "Stopped. $1 starts it again; the steps done so far are kept."
+}
+
+# Version of the installed Catalog: from .env, else from the running catalog-web, else from the newest .env backup
+wiz_installed_version() {
+  local v
+  v="$(env_value CATALOG_IMAGE)"
+  if [ -z "$v" ] && detect_compose >/dev/null 2>&1; then
+    v="$(running_tag catalog-web 2>/dev/null)" || v=""
+  fi
+  if [ -z "$v" ] && [ -n "$(newest_env_backup)" ]; then
+    v="$(sed -n 's/^CATALOG_IMAGE=//p' "$(newest_env_backup)" | tail -n 1)"
+  fi
+  printf '%s' "${v##*:}"
+}
+
+# The task notes what it set up here (wiz_mark sync); the steps run in subshells
+WIZ_MARK=""
+wiz_mark() {
+  if [ -n "$WIZ_MARK" ]; then
+    printf '%s\n' "$1" >> "$WIZ_MARK"
+  fi
+}
+
+# Number of the newest job (0 when there is none)
+wiz_last_job() {
+  local id last=0
+  for id in "$JOBS_DIR"/[0-9]*; do
+    id="${id##*/}"
+    if [[ "$id" =~ ^[0-9]+$ ]] && [ "$id" -gt "$last" ]; then
+      last="$id"
+    fi
+  done
+  printf '%s' "$last"
+}
+
+# wiz_job_since ID TITLE-START -> state of the newest job after ID whose title starts so (empty: none)
+wiz_job_since() {
+  local since="$1" id state=""
+  for ((id = since + 1; id <= $(wiz_last_job); id++)); do
+    if [[ "$(cat -- "$JOBS_DIR/$id/title" 2>/dev/null)" == "$2"* ]]; then
+      state="$(job_state "$id")"
+    fi
+  done
+  printf '%s' "$state"
+}
+
+# True when this folder has an installation: its generated files, or containers of this installation
+# (volumes alone may belong to another folder with the same name).
+wiz_installed() {
+  if [ -f "$ENV_FILE" ]; then
+    return 0
+  fi
+  command -v docker >/dev/null 2>&1 && [ -n "$(remove_containers)" ]
+}
+
+# Names of the running jobs ("#3 Upgrade to ..."), one per line; empty when none runs.
+wiz_running_jobs() {
+  local id
+  while IFS= read -r id; do
+    if [ -n "$id" ]; then
+      printf '#%s %s\n' "$id" "$(cat -- "$JOBS_DIR/$id/title" 2>/dev/null)"
+    fi
+  done < <(job_running_ids)
+}
+
+# wiz_wait_job TITLE SINCE -> the next step of a task needs the job it started (the newest job
+# after SINCE with that title) to end: shows it again while it runs. 0 when it ended well, 1 when it
+# failed or was not started, 3 when it was left again (it goes on in the background).
+wiz_wait_job() {
+  local title="$1" since="$2" id="" i rc
+  for ((i = since + 1; i <= $(wiz_last_job); i++)); do
+    if [ "$(cat -- "$JOBS_DIR/$i/title" 2>/dev/null)" = "$title" ]; then
+      id="$i"
+    fi
+  done
+  if [ -z "$id" ]; then
+    return 1
+  fi
+  while [ "$(job_state "$id")" = "running" ]; do
+    echo
+    info "The next step needs job #$id to end first."
+    rc=0
+    job_follow "$id" || rc=$?
+    if [ "$rc" -eq 3 ] && [ "$(job_state "$id")" = "running" ]; then
+      return 3
+    fi
+  done
+  [ "$(job_state "$id")" = "done" ]
+}
+
+# wiz_set NAME VALUE -> writes a setting into this script and uses it at once
+wiz_set() {
+  if [ "${!1-}" = "$2" ]; then
+    return 0
+  fi
+  if ! set_setting "$1" "$2"; then
+    return 1
+  fi
+  printf -v "$1" '%s' "$2"
+  ok "$1 = \"$2\""
+}
+
+# wiz_ask NAME QUESTION -> asks for a new value of a setting (Enter keeps it), checked like on the
+# settings screen; a port must not be taken by another setting or, on a new installation, by
+# another program. Fails at the end of input.
+wiz_ask() {
+  local name="$1" question="$2" value problem other ans
+  while true; do
+    ui_ask value "$question [${!name}]:" || return 1
+    value="${value:-${!name}}"
+    if ! problem="$(settings_check "$name" "$value" "${!name}")"; then
+      err "$problem"
+      continue
+    fi
+    if [[ "$name" == *_PORT* ]]; then
+      problem=""
+      for other in $(port_settings); do
+        if [ "$other" != "$name" ] && [ "${!other}" = "$value" ]; then
+          problem="Port $value is already set for $other."
+        fi
+      done
+      if [ -n "$problem" ]; then
+        err "$problem"
+        continue
+      fi
+      if [ -z "$(project_volumes)" ] && wiz_port_used "$value"; then
+        warn "Port $value is already in use on this server."
+        ans=0
+        wiz_yes_no "Use it anyway?" n || ans=$?
+        case "$ans" in
+          0) ;;
+          1) continue ;;
+          *) return 1 ;;
+        esac
+      fi
+    fi
+    wiz_set "$name" "$value"
+    return 0
+  done
+}
+
+# True when something listens on host port $1 (only checked when ss is there).
+wiz_port_used() {
+  command -v ss >/dev/null 2>&1 && ss -ltn 2>/dev/null | awk -v p=":$1\$" '$4 ~ p { found = 1 } END { exit !found }'
+}
+
+# Worker of the install task: start the stack and wait until every service is healthy.
+install_start() {
+  WIZ_QUIET_ACCESS="yes" do_up
+  echo
+  stack_health
+}
+
+# Step of the install task: writes the files, keeping existing passwords, and checks that they were
+# written completely (a full disk does not stop the writes by itself here). Exit code 4: cancelled.
+install_generate() {
+  do_generate keep no-next || exit 1
+  if [ "$GENERATE_CANCELLED" = "true" ]; then
+    exit 4
+  fi
+  if [ ! -s "$ENV_FILE" ] || [ ! -s "$COMPOSE_FILE" ] || settings_stale; then
+    err "$ENV_FILE or $COMPOSE_FILE was not written completely (disk full? permissions?)."
+    exit 1
+  fi
+}
+
+# Step of the install task: snapshots, imported right away by default
+install_snapshots() {
+  SNAP_IMPORT_DEFAULT="y"
+  download_snapshot
+}
+
+# I: a new installation, step by step - check, main settings, files, start, catalog data, done.
+# In a folder that is installed already: repair, continue with the data, update or remove.
+install_wizard() {
+  local -a steps=(Check Settings Files Start Data Done)
+  local jobs found choice rc ans fresh="yes" step=1 installed="" data="no" since
+  jobs="$(wiz_running_jobs)"
+  if [ -n "$jobs" ]; then
+    warn "A background job is running - wait for it or follow it with J first:"
+    printf '    %s\n' "$jobs"
+    return 0
+  fi
+  if [ -z "$SCRIPT_PATH" ] || [ ! -w "$SCRIPT_PATH" ]; then
+    err "The installer must be a writable file for the installation (it keeps the settings)."
+    return 0
+  fi
+  if [ ! -w "$WORK_DIR" ]; then
+    err "$WORK_DIR is not writable - the installation writes its files there (run as its owner, or with sudo)."
+    return 0
+  fi
+
+  wiz_head "Install" 1 "${steps[@]}"
+  if wiz_installed; then
+    fresh="no"
+    installed="$(wiz_installed_version)"
+    warn "This folder already has an installation (Catalog ${installed:-$CATALOG_VERSION}, stack: $(stack_state))."
+    echo
+    printf '   %s  %s\n' "${C_BLD}1$C_RST" "Repair: check it, write the files again and start it (passwords, data and version are kept)"
+    printf '   %s  %s\n' "${C_BLD}2$C_RST" "Continue with the catalog data (step 5)"
+    printf '   %s  %s\n' "${C_BLD}3$C_RST" "Update it instead (U)"
+    printf '   %s  %s\n' "${C_BLD}4$C_RST" "Remove it first (R), then install from scratch"
+    printf '   %s  %s\n' "${C_BLD}0$C_RST" "${C_DIM}cancel$C_RST"
+    echo
+    ui_ask choice "Select [0]:" || choice="0"
+    case "$choice" in
+      1) wiz_head "Install" 1 "${steps[@]}" ;;
+      2) step=5 ;;
+      3) update_wizard; return 0 ;;
+      4) remove_wizard; return 0 ;;
+      *) info "Cancelled."; return 0 ;;
+    esac
+  else
+    found="$(stack_foreign)" || found=""
+    if [ -z "$found" ]; then
+      found="$(first_installation_dir)"
+    fi
+    if [ -n "$found" ]; then
+      warn "A Catalog installation already exists on this server: $found"
+      echo "  The Catalog runs once per server (its containers have fixed names), so a second one cannot start."
+      echo
+      printf '   %s  %s\n' "${C_BLD}1$C_RST" "Take it over into this folder (option 23) - keeps its settings, passwords and data"
+      printf '   %s  %s\n' "${C_BLD}0$C_RST" "${C_DIM}cancel (or remove it with R in its own folder first)$C_RST"
+      echo
+      ui_ask choice "Select [0]:" || choice="0"
+      if [ "$choice" = "1" ]; then
+        adopt_installation || true
+      else
+        info "Cancelled."
+      fi
+      return 0
+    fi
+  fi
+
+  if [ "$step" -le 1 ]; then
+    # 1. Check (MongoDB 8 cannot run on some kernels: a new installation takes 7.0 there)
+    if mongo_kernel_problem; then
+      warn "MongoDB $MONGO_TAG does not start on this Linux kernel ($(uname -r), SERVER-121912)."
+      if [ "$fresh" = "yes" ]; then
+        ans=0
+        wiz_yes_no "Use MongoDB 7.0 instead?" y || ans=$?
+        case "$ans" in
+          0) wiz_set MONGO_TAG "7.0" ;;
+          1) ;;
+          *) wiz_stop "I"; return 0 ;;
+        esac
+      else
+        echo "  The data of this installation needs MongoDB $MONGO_TAG: use a kernel 7.0.14 or newer, or move the"
+        echo "  data with a backup. A switch to 7.0 cannot read it."
+      fi
+      echo
+    fi
+    echo "  Docker, Docker Compose, kernel, ports, vm.max_map_count and the time zone:"
+    echo
+    ans=0
+    if wiz_run do_check; then
+      wiz_yes_no "Continue with the settings?" y || ans=$?
+    else
+      echo
+      wiz_yes_no "Some checks failed (see above). Continue anyway?" n || ans=$?
+    fi
+    if [ "$ans" -ne 0 ]; then
+      wiz_stop "I"
+      return 0
+    fi
+
+    # 2. Settings
+    wiz_head "Install" 2 "${steps[@]}"
+    echo "  The main settings - all others are on the settings screen (option 1)."
+    echo
+    if [ "$fresh" = "yes" ]; then
+      if [ "$CHECK_FOR_UPDATES" = "true" ] && [ "$HUB_STATUS" != "ok" ]; then
+        check_latest_version
+      fi
+      if [ "$HUB_STATUS" = "ok" ] && [ -n "$HUB_STABLE" ] && is_version "$CATALOG_VERSION" && version_gt "$HUB_STABLE" "$CATALOG_VERSION"; then
+        ans=0
+        wiz_yes_no "Install the newest stable Catalog $HUB_STABLE (instead of $CATALOG_VERSION)?" y || ans=$?
+        case "$ans" in
+          0) wiz_set CATALOG_VERSION "$HUB_STABLE" ;;
+          1) ;;
+          *) wiz_stop "I"; return 0 ;;
+        esac
+      else
+        echo "  Catalog version: $CATALOG_VERSION $C_DIM(option 8 picks another one)$C_RST"
+      fi
+    else
+      # a repair keeps the running version: an upgrade needs the backup and rollback of U
+      if is_version "$installed" && [ "$installed" != "$CATALOG_VERSION" ]; then
+        warn "CATALOG_VERSION is $CATALOG_VERSION, the installation has $installed - the repair keeps $installed (U upgrades with backup and rollback)."
+        wiz_set CATALOG_VERSION "$installed"
+      fi
+      echo "  Catalog version: $CATALOG_VERSION $C_DIM(kept - U updates it)$C_RST"
+    fi
+    ans=0
+    wiz_yes_no "Install Nginx Proxy Manager as reverse proxy with TLS (ports $NPM_HTTP_PORT, $NPM_HTTPS_PORT and $NPM_ADMIN_PORT)?" "$(if [ "$INSTALL_NGINX_PROXY_MANAGER" = "true" ]; then echo y; else echo n; fi)" || ans=$?
+    case "$ans" in
+      0) wiz_set INSTALL_NGINX_PROXY_MANAGER true ;;
+      1) wiz_set INSTALL_NGINX_PROXY_MANAGER false ;;
+      *) wiz_stop "I"; return 0 ;;
+    esac
+    if ! wiz_ask CATALOG_WEB_PORT "Port of Catalog Web on this server"; then
+      wiz_stop "I"
+      return 0
+    fi
+    tz_offer_alignment
+    reload_settings
+    echo
+    ans=0
+    wiz_yes_no "Write the files with these settings?" y || ans=$?
+    if [ "$ans" -ne 0 ]; then
+      wiz_stop "I"
+      return 0
+    fi
+
+    # 3. Files
+    wiz_head "Install" 3 "${steps[@]}"
+    rc=0
+    wiz_run install_generate || rc=$?
+    case "$rc" in
+      0) ;;
+      4) wiz_stop "I"; return 0 ;;
+      *) err "The files could not be written (see above)."; wiz_stop "I"; return 0 ;;
+    esac
+    echo
+    ans=0
+    wiz_yes_no "Start the Catalog now? (pulls the images; the first start takes a few minutes)" y || ans=$?
+    if [ "$ans" -ne 0 ]; then
+      wiz_stop "I"
+      return 0
+    fi
+
+    # 4. Start
+    wiz_head "Install" 4 "${steps[@]}"
+    rc=0
+    wiz_run run_job "Install: start the Catalog" -- install_start || rc=$?
+    case "$rc" in
+      0) ;;
+      3)
+        info "The start goes on in the background (J shows it). When it is done, I continues with the"
+        echo "  catalog data (choice 2), or use option 20 or options 17 and 19."
+        return 0
+        ;;
+      *)
+        err "The Catalog did not start cleanly - option 10 shows the logs, option 16 checks the server."
+        wiz_stop "I"
+        return 0
+        ;;
+    esac
+    echo
+    ans=0
+    wiz_yes_no "Continue with the catalog data?" y || ans=$?
+    if [ "$ans" -ne 0 ]; then
+      wiz_stop "I"
+      return 0
+    fi
+  fi
+
+  # 5. Data
+  wiz_head "Install" 5 "${steps[@]}"
+  echo "  The Catalog is empty until it gets its data from $CATALOG_CLOUD_URL."
+  echo
+  printf '   %s %s  %s\n' "${C_BLD}1$C_RST" "$(menu_icon run)" "Daily self-sync: the Catalog fetches the data itself $C_DIM(server with internet, option 20)$C_RST"
+  printf '   %s %s  %s\n' "${C_BLD}2$C_RST" "$(menu_icon run)" "Download the snapshots here and import them $C_DIM(options 17 and 19)$C_RST"
+  printf '   %s    %s\n' "${C_BLD}0$C_RST" "${C_DIM}later$C_RST"
+  echo
+  ui_ask choice "Select [0]:" || choice="0"
+  # what really happened is read afterwards: a mark of the self-sync, and the jobs started meanwhile
+  since="$(wiz_last_job)"
+  WIZ_MARK="$(mktemp)"
+  case "$choice" in
+    1) wiz_run local_self_sync || true ;;
+    2) wiz_run install_snapshots || true ;;
+  esac
+  if grep -qx sync "$WIZ_MARK" 2>/dev/null; then
+    data="sync"
+  fi
+  rm -f -- "$WIZ_MARK"
+  WIZ_MARK=""
+  case "$(wiz_job_since "$since" "Snapshot import")" in
+    done) data="snapshot" ;;
+    running) data="importing" ;;
+    "")
+      case "$(wiz_job_since "$since" "Snapshot download")" in
+        done) data="downloaded" ;;
+        running) data="downloading" ;;
+      esac
+      ;;
+  esac
+  ui_pause_tty
+
+  # 6. Done
+  wiz_head "Install" 6 "${steps[@]}"
+  ok "The Catalog is installed: $(stack_state)."
+  echo
+  show_access_info
+  echo
+  case "$data" in
+    sync) echo "  Catalog data: the Catalog synchronizes itself every day ($AUTOSYNC_CRON in $TZ)." ;;
+    snapshot) echo "  Catalog data: imported from the snapshots (option 19 imports newer ones)." ;;
+    importing) echo "  Catalog data: the import runs in the background (J shows it)." ;;
+    downloaded) warn "Catalog data: downloaded, not imported yet - option 19 imports it." ;;
+    downloading) echo "  Catalog data: the download runs in the background (J); option 19 imports it afterwards." ;;
+    *) warn "The Catalog has no data yet: option 20 (daily self-sync) or options 17 and 19 (snapshots)." ;;
+  esac
+  echo "  Passwords: option 14 $UI_SEP Nginx Proxy Manager steps: option 15 $UI_SEP status: option 9"
+}
+
+# U: brings the installation up to date - the installer itself, then the Catalog with backup,
+# health check and the patch updates of the other components. update_wizard [STEP [NOTICE]]
+update_wizard() {
+  local -a steps=(Installer Catalog Done)
+  local start="${1:-1}" notice="${2:-}" jobs rc ans before after target installed failed_before="no"
+  jobs="$(wiz_running_jobs)"
+  if [ -n "$jobs" ]; then
+    warn "A background job is running - wait for it or follow it with J first:"
+    printf '    %s\n' "$jobs"
+    return 0
+  fi
+  if [ -z "$SCRIPT_PATH" ] || [ ! -w "$SCRIPT_PATH" ]; then
+    err "The installer must be a writable file for an update (it keeps the settings and the version)."
+    return 0
+  fi
+  if ! wiz_installed; then
+    info "Nothing is installed in this folder yet - I installs the Catalog."
+    return 0
+  fi
+
+  # 1. The installer (a new version restarts the menu, which comes back to step 2)
+  if [ "$start" -le 1 ]; then
+    wiz_head "Update" 1 "${steps[@]}"
+    echo "  First the installer itself, so the newest checks and steps are used."
+    echo
+    WIZ_RESUME="resume-update"
+    update_installer interactive || warn "The installer was not updated (see above) - continuing with the Catalog."
+    WIZ_RESUME=""
+    echo
+    ans=0
+    wiz_yes_no "Continue with the Catalog?" y || ans=$?
+    if [ "$ans" -ne 0 ]; then
+      wiz_stop "U"
+      return 0
+    fi
+  fi
+
+  # 2. The Catalog and the patch updates of the other components
+  wiz_head "Update" 2 "${steps[@]}"
+  if [ -n "$notice" ]; then
+    ok "$notice"
+    echo
+  fi
+  detect_compose >/dev/null 2>&1 || true
+  before="$(running_tag catalog-web 2>/dev/null)" || before=""
+  if [ -f "$UPGRADE_FAILED_FILE" ]; then
+    failed_before="yes"
+  fi
+  rc=0
+  wiz_run do_upgrade || rc=$?
+  reload_settings
+  jobs="$(wiz_running_jobs)"
+  if [ "$rc" -eq 3 ] || [ -n "$jobs" ]; then
+    info "The upgrade goes on in the background - J follows it. Run U again when it is done (patch updates)."
+    return 0
+  fi
+  after="$(running_tag catalog-web 2>/dev/null)" || after=""
+  if [ "$rc" -ne 0 ]; then
+    echo
+    warn "The update did not finish (see above). Catalog: ${after:-unknown} - option 21 goes back or tries again."
+    return 0
+  fi
+  ui_pause_tty
+
+  # 3. Done (do_upgrade read Docker Hub in its subshell: this shell asks once more if it has to)
+  wiz_head "Update" 3 "${steps[@]}"
+  if [ -z "$HUB_STABLE$LATEST_VERSION" ]; then
+    fetch_hub_versions >/dev/null 2>&1 || true
+  fi
+  target="${HUB_STABLE:-${LATEST_VERSION:-${HUB_VERSIONS%%$'\n'*}}}"
+  installed="${after:-$(wiz_installed_version)}"
+  if [ -f "$UPGRADE_FAILED_FILE" ]; then
+    warn "The last upgrade did not become healthy - option 21 goes back. Catalog: ${installed:-unknown}."
+  elif [ "$failed_before" = "yes" ] && [ -n "$after" ] && [ "$after" != "$before" ]; then
+    ok "Went back to Catalog $after."
+  elif [ -n "$before" ] && [ -n "$after" ] && [ "$before" != "$after" ]; then
+    ok "Catalog updated: $before $UI_RARR $after $UI_SEP stack: $(stack_state)."
+  elif [ -n "$target" ] && is_version "$installed" && version_gt "$target" "$installed"; then
+    warn "Not upgraded: Catalog $installed is installed, $target is available - U or option 21 upgrades it."
+  else
+    ok "Catalog ${installed:-$CATALOG_VERSION} is up to date $UI_SEP stack: $(stack_state)."
+  fi
+  if [ -z "$after" ]; then
+    warn "The stack is not running - option 6 starts it."
+  fi
+  echo
+  echo "  Major versions of MongoDB, OpenSearch or RabbitMQ: option 8 (Updates)."
+  echo "  Catalog data: the daily self-sync (option 20) keeps it current; offline servers import"
+  echo "  the changes since their last snapshot with options 17 and 19."
+}
+
+# Project name of the stack, as docker compose names it from the folder (or COMPOSE_PROJECT_NAME)
+stack_project() {
+  local project="${COMPOSE_PROJECT_NAME:-$(basename -- "$WORK_DIR")}"
+  project="$(printf '%s' "$project" | tr '[:upper:]' '[:lower:]' | tr -cd 'a-z0-9_-')"
+  # docker compose v2 also drops leading - and _; docker-compose v1 keeps them
+  if detect_compose >/dev/null 2>&1 && [ "${COMPOSE[0]}" = "docker" ]; then
+    project="${project#"${project%%[!_-]*}"}"
+  fi
+  printf '%s' "$project"
+}
+
+# Size of files or folders, e.g. "1.2 GB"
+wiz_size() {
+  local f total=0 kb
+  for f in "$@"; do
+    if [ -e "$f" ]; then
+      kb="$(du -sk -- "$f" 2>/dev/null | awk '{ print $1 }')" || kb=0
+      total=$((total + ${kb:-0}))
+    fi
+  done
+  human_size $((total * 1024))
+}
+
+# True only when folder $1 surely does not exist (any more): its nearest existing parent can be
+# searched. A folder this user cannot look into counts as existing.
+wiz_dir_gone() {
+  local d="$1"
+  if [ -z "$d" ] || [ -e "$d" ]; then
+    return 1
+  fi
+  while [ ! -e "$d" ] && [ "$d" != "/" ] && [ "$d" != "." ]; do
+    d="$(dirname -- "$d")"
+  done
+  [ -d "$d" ] && [ -x "$d" ]
+}
+
+# stack_compose_keys services|volumes -> the names that section has in the compose file this
+# installer writes (all optional parts included)
+stack_compose_keys() {
+  local tmp
+  tmp="$(mktemp)" || return 0
+  (
+    COMPOSE_FILE="$tmp"
+    INSTALL_NGINX_PROXY_MANAGER="true"
+    write_compose_file
+  ) >/dev/null 2>&1 || true
+  awk -v s="$1:" '$0 == s { on = 1; next } /^[^ ]/ { on = 0 } on && /^  [A-Za-z0-9_.-]+:/ { k = $1; sub(/:$/, "", k); print k }' "$tmp"
+  rm -f -- "$tmp"
+}
+
+# Containers with the project name of this folder: ID|OWNER|IMAGE, OWNER "here" for this
+# installation - started here, or started from a folder that surely no longer exists (moved) with
+# a service and an image of this installer - otherwise the folder they were started from.
+stack_containers() {
+  local id wd svc image services="" repos=""
+  while IFS= read -r id; do
+    if [ -z "$id" ]; then
+      continue
+    fi
+    if [ -z "$services" ]; then
+      services=" $(stack_compose_keys services | tr '\n' ' ') "
+      repos=" $(stack_images | sed 's/:[^:/]*$//' | tr '\n' ' ') "
+    fi
+    IFS='|' read -r wd svc image <<< "$(docker inspect --format '{{index .Config.Labels "com.docker.compose.project.working_dir"}}|{{index .Config.Labels "com.docker.compose.service"}}|{{.Config.Image}}' "$id" 2>/dev/null)"
+    if [ -n "$wd" ] && { [ "$wd" = "$WORK_DIR" ] || [ "$wd" -ef "$WORK_DIR" ]; }; then
+      printf '%s|here|%s\n' "$id" "$image"
+    elif wiz_dir_gone "$wd" && [[ "$services" == *" $svc "* ]] && [[ "$repos" == *" ${image%:*} "* ]]; then
+      printf '%s|here|%s\n' "$id" "$image"
+    else
+      printf '%s|%s|%s\n' "$id" "${wd:-an unknown folder}" "$image"
+    fi
+  done < <(docker ps -aq --filter "label=com.docker.compose.project=$(stack_project)" 2>/dev/null)
+}
+
+# Containers of this installation, one ID per line
+remove_containers() {
+  stack_containers | awk -F'|' '$2 == "here" { print $1 }'
+}
+
+# Prints the first folder whose containers share the project name of this folder without being
+# this installation; fails when there is none
+stack_foreign() {
+  local id owner image
+  while IFS='|' read -r id owner image; do
+    if [ -n "$id" ] && [ "$owner" != "here" ]; then
+      printf '%s' "$owner"
+      return 0
+    fi
+  done < <(stack_containers)
+  return 1
+}
+
+# Prints the folder of another Catalog installation - running or stopped - with the project name of
+# this folder (its data volumes have the same names); fails when there is none
+stack_foreign_catalog() {
+  local id owner image project dir p mine
+  if ! command -v docker >/dev/null 2>&1; then
+    return 1
+  fi
+  while IFS='|' read -r id owner image; do
+    if [ -n "$id" ] && [ "$owner" != "here" ] && [[ "$image" == *rayventory-catalog* ]]; then
+      printf '%s' "$owner"
+      return 0
+    fi
+  done < <(stack_containers)
+  mine="$(stack_project)"
+  while IFS='|' read -r project dir _; do
+    p="${project#"${project%%[!_-]*}"}"
+    if [ -n "$dir" ] && [ "$p" = "${mine#"${mine%%[!_-]*}"}" ] && [ "$dir" != "$WORK_DIR" ] && ! [ "$dir" -ef "$WORK_DIR" ]; then
+      printf '%s' "$dir"
+      return 0
+    fi
+  done < <(find_installations 2>/dev/null)
+  return 1
+}
+
+# Catalog stacks under another project name whose folder no longer exists: PROJECT|FOLDER per line.
+# It can be this installation after its folder was renamed.
+stack_lost() {
+  local project wd mine
+  mine="$(stack_project)"
+  while IFS='|' read -r project wd; do
+    if [ -n "$project" ] && [ "$project" != "$mine" ] && wiz_dir_gone "$wd"; then
+      printf '%s|%s\n' "$project" "$wd"
+    fi
+  done < <(docker ps -a --filter "label=com.docker.compose.service=catalog-web" \
+    --format '{{.Label "com.docker.compose.project"}}|{{.Label "com.docker.compose.project.working_dir"}}' 2>/dev/null | sort -u)
+}
+
+# Data volumes of this installation: the volumes this installer declares, named after the project -
+# only when the files or the containers here show that it was installed here, and never when
+# another Catalog installation has the same project name.
+remove_volumes() {
+  local project key v
+  if [ ! -f "$ENV_FILE" ] && [ ! -f "$COMPOSE_FILE" ] && [ -z "$(remove_containers)" ]; then
+    return 0
+  fi
+  if stack_foreign_catalog >/dev/null; then
+    return 0
+  fi
+  project="$(stack_project)"
+  while IFS= read -r key; do
+    v="${project}_$key"
+    if [ -n "$key" ] && docker volume inspect "$v" >/dev/null 2>&1; then
+      printf '%s\n' "$v"
+    fi
+  done < <(stack_compose_keys volumes)
+}
+
+# remove_users VOLUME|IMAGE KIND -> names of containers that are not this installation's and use
+# the volume (KIND volume) or the image (KIND ancestor); empty when none
+remove_users() {
+  local id ours
+  ours=" $(remove_containers | tr '\n' ' ') "
+  while IFS= read -r id; do
+    if [ -n "$id" ] && [[ "$ours" != *" $id "* ]]; then
+      docker inspect --format '{{.Name}}' "$id" 2>/dev/null | sed 's#^/##'
+    fi
+  done < <(docker ps -aq --filter "$2=$1" 2>/dev/null)
+}
+
+# Images of this installation that are here and that no other container uses
+remove_images() {
+  local img
+  {
+    stack_containers | awk -F'|' '$2 == "here" { print $3 }'
+    if remove_compose_ok; then
+      compose config --images 2>/dev/null || true
+    fi
+    stack_images
+  } | sort -u | while IFS= read -r img; do
+    if [ -n "$img" ] && docker image inspect "$img" >/dev/null 2>&1 && [ -z "$(remove_users "$img" ancestor)" ]; then
+      printf '%s\n' "$img"
+    fi
+  done
+}
+
+# True when the generated files are here and docker compose can use them
+remove_compose_ok() {
+  [ -f "$ENV_FILE" ] && [ -f "$COMPOSE_FILE" ] && detect_compose >/dev/null 2>&1
+}
+
+# Worker of the remove task: remove_stack VOLUMES IMAGES (yes or no) - the containers and networks
+# always. Fails, naming what is left, when a container or a chosen volume could not be removed.
+remove_stack() {
+  local volumes="$1" images="$2" ids img v out left="" kept=0 gone=0
+  local -a vols=() imgs=()
+  require_docker
+  if [ "$volumes" = "yes" ]; then
+    while IFS= read -r v; do
+      if [ -n "$v" ] && [ -z "$(remove_users "$v" volume)" ]; then
+        vols+=("$v")
+      fi
+    done < <(remove_volumes)
+  fi
+  if [ "$images" = "yes" ]; then
+    mapfile -t imgs < <(remove_images)
+  fi
+  # docker compose down would also remove the containers of others with the same project name
+  if remove_compose_ok && ! stack_foreign >/dev/null; then
+    job_step "Removing the containers"
+    info "Removing the containers"
+    compose down --remove-orphans || warn "docker compose down reported an error - removing what is left directly."
+  fi
+  ids="$(remove_containers | tr '\n' ' ')"
+  if [ -n "${ids// /}" ]; then
+    # shellcheck disable=SC2086
+    docker rm -f $ids >/dev/null 2>&1 || true
+  fi
+  for v in ${vols[@]+"${vols[@]}"}; do
+    job_step "Removing the data volumes"
+    if docker volume inspect "$v" >/dev/null 2>&1; then
+      docker volume rm "$v" >/dev/null 2>&1 || true
+    fi
+  done
+  while IFS= read -r v; do
+    if [ -n "$v" ]; then
+      docker network rm "$v" >/dev/null 2>&1 || true
+    fi
+  done < <(docker network ls -q --filter "label=com.docker.compose.project=$(stack_project)" 2>/dev/null)
+  for img in ${imgs[@]+"${imgs[@]}"}; do
+    job_step "Removing the images"
+    if out="$(docker image rm "$img" 2>&1)"; then
+      ok "Image removed: $img"
+      gone=$((gone + 1))
+    else
+      warn "Image kept: $img (${out##*: })"
+      kept=$((kept + 1))
+    fi
+  done
+  # what is still there?
+  ids="$(remove_containers | tr '\n' ' ')"
+  if [ -n "${ids// /}" ]; then
+    left="$left containers: $ids;"
+  fi
+  for v in ${vols[@]+"${vols[@]}"}; do
+    if docker volume inspect "$v" >/dev/null 2>&1; then
+      left="$left volume $v;"
+    fi
+  done
+  if [ -n "$left" ]; then
+    err "Still there:${left%;} - docker could not remove it (in use?)."
+    return 1
+  fi
+  ok "Containers$(if [ "${#vols[@]}" -gt 0 ]; then printf ' and %s data volume(s)' "${#vols[@]}"; fi) removed$(if [ "$images" = "yes" ]; then printf ', %s image(s) removed, %s kept' "$gone" "$kept"; fi)."
+}
+
+# Worker of the remove task: a last MongoDB backup
+remove_backup() {
+  require_docker
+  mongo_backup
+}
+
+# remove_files KEY -> the paths of a file item of the remove task, one per line (only those that
+# exist). Of snapshots/ and backups/ only the files the installer writes there.
+remove_files() {
+  local f
+  local -a list=()
+  case "$1" in
+    files) list=("$WORK_DIR/$ENV_FILE" "$WORK_DIR/$COMPOSE_FILE" "$WORK_DIR/$ENV_FILE".bak-* "$WORK_DIR/$COMPOSE_FILE".bak-*) ;;
+    jobs) list=("$JOBS_DIR" "$API_KEY_FILE" "$LOCAL_KEY_FILE" "$TZ_KEEP_FILE" "$UPGRADE_FAILED_FILE") ;;
+    snapshots) list=("$WORK_DIR"/snapshots/*.tar.gz "$WORK_DIR"/snapshots/*.tar.gz.part "$WORK_DIR"/snapshots/chain-*.tsv "$WORK_DIR"/snapshots/plan-*.tsv) ;;
+    backups) list=("$WORK_DIR"/backups/mongo-*.archive.gz) ;;
+    bundles) list=("$WORK_DIR"/RN1-Technology-Catalog-*) ;;
+    installer-backups) if [ -n "$SCRIPT_PATH" ]; then list=("$SCRIPT_PATH".bak-*); fi ;;
+    installer) if [ -n "$SCRIPT_PATH" ] && [ -f "$SCRIPT_PATH" ]; then list=("$SCRIPT_PATH"); fi ;;
+  esac
+  for f in ${list[@]+"${list[@]}"}; do
+    if [ -e "$f" ] || [ -L "$f" ]; then
+      printf '%s\n' "$f"
+    fi
+  done
+}
+
+# True when the job logs show that the stack ran from this folder (started, stopped, upgraded ...)
+wiz_ran_here() {
+  local f
+  for f in "$JOBS_DIR"/[0-9]*/title; do
+    if [ -f "$f" ]; then
+      case "$(cat -- "$f" 2>/dev/null)" in
+        "Start / apply changes"|"Full setup"*|"Install: start"*|"Restart the stack"|"Stop the stack"|"Upgrade to"*|"Go back to"*|"Patch updates"*)
+          return 0
+          ;;
+      esac
+    fi
+  done
+  return 1
+}
+
+# Size of the files of a remove_files item
+remove_size() {
+  local -a list=()
+  mapfile -t list < <(remove_files "$1")
+  wiz_size ${list[@]+"${list[@]}"}
+}
+
+# R: removes the installation from this server - choose what goes, type DELETE, done.
+remove_wizard() {
+  local -a steps=(Overview Choose Confirm Remove Done) keys=() labels=() picked=() toks=() failed=()
+  local jobs id ncont=0 nvol=0 nimg=0 vols="" busy="" lost="" foreign="" foreign_catalog="" choice i tok answer rc ans f key v users
+  local removed="" self_gone="no" vol="no" img="no" anything="no" n files_on="no" keep_env="" since sure="yes"
+
+  wiz_head "Remove" 1 "${steps[@]}"
+  jobs="$(wiz_running_jobs)"
+  if [ -n "$jobs" ]; then
+    warn "These background jobs are running:"
+    printf '    %s\n' "$jobs"
+    if ! confirm "Cancel them first? (each cleans up before it stops)" n; then
+      info "Cancelled - wait for the jobs or cancel them with J."
+      return 0
+    fi
+    while IFS= read -r id; do
+      job_cancel "$id" || true
+    done < <(job_running_ids)
+  fi
+
+  # 1. Overview - without Docker nothing can be checked, so nothing is removed
+  if ! command -v docker >/dev/null 2>&1; then
+    if [ -f "$ENV_FILE" ] || [ -f "$COMPOSE_FILE" ]; then
+      err "The docker command is not found (PATH?) - R cannot check what runs, so nothing was removed."
+      return 0
+    fi
+  elif ! docker info >/dev/null 2>&1; then
+    err "The Docker daemon is not reachable - is Docker running, and is your user in the 'docker' group?"
+    echo "  R needs Docker to remove the containers and data; nothing was removed."
+    return 0
+  else
+    foreign_catalog="$(stack_foreign_catalog)" || foreign_catalog=""
+    foreign="$(stack_foreign)" || foreign=""
+    lost="$(stack_lost)"
+    if [ -z "$foreign_catalog" ]; then
+      ncont="$(count_lines "$(remove_containers)")"
+      while IFS= read -r v; do
+        if [ -z "$v" ]; then
+          continue
+        fi
+        users="$(remove_users "$v" volume | tr '\n' ' ')"
+        if [ -n "$users" ]; then
+          busy="$busy$v (used by ${users% }) "
+        else
+          vols="$vols$v "
+        fi
+      done < <(remove_volumes)
+      nvol="$(count_lines "$(printf '%s' "$vols" | tr ' ' '\n')")"
+      nimg="$(count_lines "$(remove_images)")"
+    fi
+  fi
+  echo "  Found in $WORK_DIR (project $(stack_project)):"
+  echo
+  printf '   %-34s %s\n' "Containers" "$ncont"
+  printf '   %-34s %s\n' "Data volumes" "$nvol"
+  if [ -n "$vols" ]; then
+    printf '%s\n' "${vols% }" | fold -s -w $(($(settings_width) - 12)) | sed "s/^/      $C_DIM/; s/\$/$C_RST/"
+  fi
+  printf '   %-34s %s\n' "Docker images of the stack" "$nimg"
+  printf '   %-34s %s\n' "$ENV_FILE, $COMPOSE_FILE" "$(if [ -f "$ENV_FILE" ] || [ -f "$COMPOSE_FILE" ]; then echo yes; else echo no; fi)"
+  printf '   %-34s %s\n' "Snapshots (snapshots/)" "$(if [ -n "$(remove_files snapshots)" ]; then remove_size snapshots; else echo none; fi)"
+  printf '   %-34s %s\n' "MongoDB backups (backups/)" "$(if [ -n "$(remove_files backups)" ]; then remove_size backups; else echo none; fi)"
+  printf '   %-34s %s\n' "Offline bundles" "$(if [ -n "$(remove_files bundles)" ]; then remove_size bundles; else echo none; fi)"
+  echo
+  if [ -n "$foreign_catalog" ]; then
+    warn "Another Catalog installation uses the project name \"$(stack_project)\": $foreign_catalog"
+    echo "  Its containers and data volumes have the same names, so R removes no containers, volumes or"
+    echo "  images here. Remove that installation with R in its own folder."
+    echo
+  elif [ -n "$foreign" ]; then
+    warn "Containers of another folder use the project name \"$(stack_project)\" too ($foreign) - they are kept."
+    echo
+  fi
+  if [ -n "$busy" ]; then
+    warn "Data volumes used by other containers are kept: ${busy% }"
+    keep_env="their data needs the passwords in $ENV_FILE"
+    echo
+  fi
+  if [ -n "$lost" ]; then
+    warn "A Catalog stack runs from a folder that no longer exists: $(printf '%s' "$lost" | tr '\n' ' ' | sed 's/|/ in /g')"
+    echo "  It may be this installation after its folder was renamed - option 23 takes it over."
+    keep_env="it may need the passwords in $ENV_FILE"
+    echo
+  fi
+  if [ "$nvol" -gt 0 ] && [ "$ncont" -eq 0 ] && ! wiz_ran_here; then
+    sure="no"
+    warn "No container and no job log here shows that these data volumes are this folder's - they may"
+    echo "  belong to another installation in a folder with the same name. They are not selected."
+    keep_env="data volumes with this project name exist"
+    echo
+  fi
+  if [ -z "$foreign_catalog" ] && [ "$nvol" -eq 0 ] && [ -z "$busy" ] && [ -n "$(project_volumes)" ]; then
+    warn "Docker volumes of project \"$(stack_project)\" exist, but nothing here shows they belong to this folder - they are kept."
+    echo
+  fi
+  for key in files jobs snapshots backups bundles installer-backups; do
+    if [ -n "$(remove_files "$key")" ]; then
+      anything="yes"
+    fi
+  done
+  if [ "$ncont" -eq 0 ] && [ "$nvol" -eq 0 ] && [ "$nimg" -eq 0 ] && [ "$anything" = "no" ]; then
+    ok "There is nothing to remove in this folder."
+    return 0
+  fi
+  if [ "$ncont" -gt 0 ] && remove_compose_ok && [ -n "$(running_tag mongo 2>/dev/null)" ]; then
+    ans=0
+    wiz_yes_no "Take a MongoDB backup first (into backups/)?" n || ans=$?
+    if [ "$ans" -eq 2 ]; then
+      info "Cancelled - nothing was removed."
+      return 0
+    fi
+    if [ "$ans" -eq 0 ]; then
+      since="$(wiz_last_job)"
+      rc=0
+      wiz_run run_job "MongoDB backup before removing" -- remove_backup || rc=$?
+      if [ "$rc" -eq 0 ] || [ "$rc" -eq 3 ]; then
+        rc=0
+        wiz_wait_job "MongoDB backup before removing" "$since" || rc=$?
+      fi
+      if [ "$rc" -eq 3 ]; then
+        info "The backup goes on in the background (J). R starts again when it is done."
+        return 0
+      fi
+      if [ "$rc" -ne 0 ]; then
+        ans=0
+        wiz_yes_no "The backup failed. Remove the Catalog anyway?" n || ans=$?
+        if [ "$ans" -ne 0 ]; then
+          info "Cancelled - nothing was removed."
+          return 0
+        fi
+      fi
+    fi
+  fi
+  ans=0
+  wiz_yes_no "Choose what to remove?" y || ans=$?
+  if [ "$ans" -ne 0 ]; then
+    info "Cancelled - nothing was removed."
+    return 0
+  fi
+
+  # 2. Choose: what is selected by default goes; snapshots, backups, bundles and the installer only on request
+  if [ "$nvol" -gt 0 ] && [ "$sure" = "yes" ]; then
+    keys+=(volumes); labels+=("Data volumes: MongoDB, MinIO, RabbitMQ, OpenSearch, license, certificates ($nvol)"); picked+=(1)
+  elif [ "$nvol" -gt 0 ]; then
+    keys+=(volumes); labels+=("Data volumes with this project name ($nvol) - not selected: they may be another installation's"); picked+=(0)
+  fi
+  if [ "$nimg" -gt 0 ]; then
+    keys+=(images); labels+=("Docker images of the stack ($nimg)"); picked+=(1)
+  fi
+  if [ -n "$(remove_files files)" ]; then
+    if [ -n "$keep_env" ]; then
+      keys+=(files); labels+=("$ENV_FILE (passwords), $COMPOSE_FILE and their backups - kept: $keep_env"); picked+=(0)
+    else
+      keys+=(files); labels+=("$ENV_FILE (passwords), $COMPOSE_FILE and their backups"); picked+=(1)
+    fi
+  fi
+  # the removal runs as a job, so its log is there afterwards in any case
+  if [ -n "$(remove_files jobs)" ] || [ "$ncont" -gt 0 ] || [ "$nvol" -gt 0 ] || [ "$nimg" -gt 0 ]; then
+    keys+=(jobs); labels+=("Job logs, stored API keys and markers"); picked+=(1)
+  fi
+  if [ -n "$(remove_files snapshots)" ]; then
+    keys+=(snapshots); labels+=("Downloaded snapshots ($(remove_size snapshots))"); picked+=(0)
+  fi
+  if [ -n "$(remove_files backups)" ]; then
+    keys+=(backups); labels+=("MongoDB backups ($(remove_size backups))"); picked+=(0)
+  fi
+  if [ -n "$(remove_files bundles)" ]; then
+    keys+=(bundles); labels+=("Offline bundles ($(remove_size bundles))"); picked+=(0)
+  fi
+  n="$(count_lines "$(remove_files installer-backups)")"
+  if [ "$n" -gt 0 ]; then
+    keys+=(installer-backups); labels+=("Backups of the installer ($n)"); picked+=(0)
+  fi
+  if [ -n "$(remove_files installer)" ]; then
+    keys+=(installer); labels+=("This installer ($SCRIPT_NAME)"); picked+=(0)
+  fi
+  while true; do
+    wiz_head "Remove" 2 "${steps[@]}"
+    if [ "$ncont" -gt 0 ]; then
+      printf '   %s %s  %s\n' "$C_GRN$UI_ON$C_RST" " " "Containers and networks of the stack ($ncont) $C_DIM(always)$C_RST"
+    fi
+    for i in "${!keys[@]}"; do
+      printf '   %s %s  %s\n' "$(if [ "${picked[i]}" = 1 ]; then printf '%s' "$C_RED$UI_ON$C_RST"; else printf '%s' "$C_DIM$UI_OFF$C_RST"; fi)" "$C_BLD$((i + 1))$C_RST" "${labels[i]}"
+    done
+    echo
+    ui_keys "1-${#keys[@]}|toggle" "A|all" "Enter|continue" "0|cancel"
+    ui_ask choice "Toggle, or Enter to continue:" || choice="0"
+    case "$choice" in
+      "") break ;;
+      0) info "Cancelled - nothing was removed."; return 0 ;;
+      a|A)
+        for i in "${!keys[@]}"; do
+          picked[i]=1
+        done
+        ;;
+      *)
+        read -r -a toks <<< "$choice"
+        for tok in "${toks[@]}"; do
+          if [[ "$tok" =~ ^[0-9]{1,2}$ ]]; then
+            tok=$((10#$tok))
+            if [ "$tok" -ge 1 ] && [ "$tok" -le "${#keys[@]}" ]; then
+              picked[tok - 1]=$((1 - picked[tok - 1]))
+            fi
+          fi
+        done
+        ;;
+    esac
+  done
+  for i in "${!keys[@]}"; do
+    if [ "${picked[i]}" = 1 ]; then
+      case "${keys[i]}" in
+        volumes) vol="yes" ;;
+        images) img="yes" ;;
+        files) files_on="yes" ;;
+      esac
+    fi
+  done
+
+  # 3. Confirm
+  wiz_head "Remove" 3 "${steps[@]}"
+  warn "This removes from this server (it cannot be undone):"
+  if [ "$ncont" -gt 0 ]; then
+    echo "    - the containers and networks of the stack"
+  fi
+  for i in "${!keys[@]}"; do
+    if [ "${picked[i]}" = 1 ]; then
+      echo "    - ${labels[i]}"
+    fi
+  done
+  if [ "$files_on" = "yes" ] && { { [ "$nvol" -gt 0 ] && [ "$vol" = "no" ]; } || [ -n "$keep_env" ]; }; then
+    echo
+    warn "Data stays on this server, but its passwords are in $ENV_FILE: without it the data cannot be used again."
+  fi
+  echo
+  if ! read -r -p "Type DELETE to remove it: " answer || [ "$answer" != "DELETE" ]; then
+    echo
+    info "Cancelled - nothing was removed."
+    return 0
+  fi
+
+  # 4. Remove: Docker first; the files only when Docker removed everything chosen
+  wiz_head "Remove" 4 "${steps[@]}"
+  if [ "$ncont" -gt 0 ] || [ "$vol" = "yes" ] || [ "$img" = "yes" ]; then
+    since="$(wiz_last_job)"
+    rc=0
+    wiz_run run_job "Remove the Catalog" -- remove_stack "$vol" "$img" || rc=$?
+    if [ "$rc" -eq 0 ] || [ "$rc" -eq 3 ]; then
+      rc=0
+      wiz_wait_job "Remove the Catalog" "$since" || rc=$?
+    fi
+    if [ "$rc" -eq 3 ]; then
+      info "The removal goes on in the background (J). R starts again when it is done; choose the items again."
+      return 0
+    fi
+    if [ "$rc" -ne 0 ]; then
+      err "Docker could not remove everything (see above) - the files with the passwords were kept. R tries again."
+      return 0
+    fi
+  fi
+  for i in "${!keys[@]}"; do
+    if [ "${picked[i]}" != 1 ]; then
+      continue
+    fi
+    case "${keys[i]}" in
+      volumes|images) continue ;;
+      installer) self_gone="yes" ;;
+    esac
+    while IFS= read -r f; do
+      if [ -z "$f" ]; then
+        continue
+      fi
+      if rm -rf -- "$f" 2>/dev/null && [ ! -e "$f" ]; then
+        removed="$removed $(basename -- "$f")"
+      else
+        failed+=("$f")
+      fi
+    done < <(remove_files "${keys[i]}")
+    case "${keys[i]}" in
+      snapshots) rmdir -- "$WORK_DIR/snapshots" 2>/dev/null || true ;;
+      backups) rmdir -- "$WORK_DIR/backups" 2>/dev/null || true ;;
+    esac
+  done
+  if [ "${#failed[@]}" -gt 0 ]; then
+    echo
+    err "These could not be removed (permissions? sudo may be needed):"
+    printf '    %s\n' "${failed[@]}"
+    warn "The Catalog was only partly removed - R tries again."
+    return 0
+  fi
+
+  # 5. Done
+  wiz_head "Remove" 5 "${steps[@]}"
+  if [ "$ncont" -gt 0 ] || [ "$vol" = "yes" ] || [ "$img" = "yes" ] || [ -n "$removed" ]; then
+    ok "The Catalog was removed from this server."
+  else
+    info "Nothing was removed."
+  fi
+  if [ -n "$removed" ]; then
+    echo "  Files removed:$removed" | fold -s -w $(($(settings_width) - 4))
+  fi
+  if [ "$self_gone" = "yes" ]; then
+    echo
+    echo "  The installer was removed too. To install again, download it with:"
+    echo "  wget -nv -O rn1-technology-catalog-installer.sh $CURRENT_INSTALLER_URL && chmod +x rn1-technology-catalog-installer.sh && ./rn1-technology-catalog-installer.sh"
+    exit 0
+  fi
+  echo "  I installs it again; the settings at the top of $SCRIPT_NAME were kept."
+}
+
+# wiz_card KEY INSTALLED STACK-STATE WIDTH [VERSION] -> TITLE|COLOR|LINE1|LINE2 of a card at the top
+# of the menu; short texts when the card has less than 34 characters of room. VERSION: the installed one.
+wiz_card() {
+  local installed="$2" state="$3" short="no" target running current="${5:-$CATALOG_VERSION}"
+  if [ "$4" -lt 34 ]; then
+    short="yes"
+  fi
+  case "$state" in
+    [0-9]*" service(s) running") running="${state%% service(s) running} running" ;;
+    "not generated yet") running="files missing" ;;
+    unknown*) running="Docker not reachable" ;;
+    *) running="no Docker" ;;
+  esac
+  case "$1" in
+    I)
+      if [ "$installed" = "yes" ] && [ "$short" = "yes" ]; then
+        printf '%s|%s|%s|%s' "INSTALL" "$C_GRN" "$C_GRN$UI_OK$C_RST Installed $UI_SEP $running" "${C_DIM}repair: check, start again$C_RST"
+      elif [ "$installed" = "yes" ]; then
+        printf '%s|%s|%s|%s' "INSTALL" "$C_GRN" "$C_GRN$UI_OK$C_RST Installed $UI_SEP $state" "${C_DIM}repair: check, files, start again$C_RST"
+      elif [ "$short" = "yes" ]; then
+        printf '%s|%s|%s|%s' "INSTALL" "$C_GRN" "$C_GRN$UI_RUN$C_RST New installation" "${C_DIM}check $UI_SEP settings $UI_SEP start$C_RST"
+      else
+        printf '%s|%s|%s|%s' "INSTALL" "$C_GRN" "$C_GRN$UI_RUN$C_RST New installation, step by step" "${C_DIM}check $UI_SEP settings $UI_SEP start $UI_SEP data$C_RST"
+      fi
+      ;;
+    U)
+      target="${HUB_STABLE:-$LATEST_VERSION}"
+      if [ "$installed" != "yes" ]; then
+        printf '%s|%s|%s|%s' "UPDATE" "$C_YLW" "${C_DIM}Nothing installed yet$C_RST" "${C_DIM}install first (I)$C_RST"
+      elif [ "$HUB_STATUS" = "ok" ] && [ -n "$target" ] && is_version "$current" && version_gt "$target" "$current"; then
+        printf '%s|%s|%s|%s' "UPDATE" "$C_YLW" "$C_YLW$UI_UP $target$C_RST available" "${C_DIM}backup $UI_SEP upgrade $UI_SEP patches$C_RST"
+      elif [ "$HUB_STATUS" = "ok" ]; then
+        printf '%s|%s|%s|%s' "UPDATE" "$C_YLW" "$C_GRN$UI_OK$C_RST Catalog up to date" "${C_DIM}installer and patches$C_RST"
+      else
+        printf '%s|%s|%s|%s' "UPDATE" "$C_YLW" "$UI_UP Installer and Catalog" "${C_DIM}backup $UI_SEP upgrade $UI_SEP checks$C_RST"
+      fi
+      ;;
+    R)
+      if [ "$installed" = "yes" ]; then
+        printf '%s|%s|%s|%s' "REMOVE" "$C_RED" "$C_RED$UI_DEL$C_RST Remove completely" "${C_DIM}containers $UI_SEP data $UI_SEP files$C_RST"
+      else
+        printf '%s|%s|%s|%s' "REMOVE" "$C_RED" "${C_DIM}Nothing installed$C_RST" "${C_DIM}leftover files only$C_RST"
+      fi
+      ;;
+  esac
+}
+
+# tui_cards COLS STACK-STATE [HEIGHT] -> the three cards (4 lines, or a 1-line strip), aligned with
+# the columns of the menu below them
+tui_cards() {
+  local cols="$1" state="$2" height="${3:-4}" col_w w key title color l1 l2 spec r line inner installed="no" i current=""
+  local -a top=() mid1=() mid2=() bot=() strip=()
+  col_w=$(((cols - 4) / 3))
+  w=$((col_w - 2))
+  inner=$((w - 2))
+  if wiz_installed; then
+    installed="yes"
+    current="$(env_value CATALOG_IMAGE)"
+    current="${current##*:}"
+  fi
+  for key in I U R; do
+    spec="$(wiz_card "$key" "$installed" "$state" $((inner - 2)) "$current")"
+    IFS='|' read -r title color l1 l2 <<< "$spec"
+    top+=("$C_DIM$UI_TL$UI_H$C_RST $C_BLD$key$C_RST  $color$title$C_RST $C_DIM$(ui_repeat "$UI_H" $((inner - ${#key} - ${#title} - 5)))$UI_TR$C_RST")
+    mid1+=("$C_DIM$UI_V$C_RST $(ui_pad "$l1" $((inner - 2))) $C_DIM$UI_V$C_RST")
+    mid2+=("$C_DIM$UI_V$C_RST $(ui_pad "$l2" $((inner - 2))) $C_DIM$UI_V$C_RST")
+    bot+=("$C_DIM$UI_BL$(ui_repeat "$UI_H" "$inner")$UI_BR$C_RST")
+    strip+=("$(ui_pad "$C_BLD$key$C_RST $color$title$C_RST  $l1" "$w")")
+  done
+  if [ "$height" -lt 4 ]; then
+    printf '  %s  %s  %s\n' "${strip[0]}" "${strip[1]}" "${strip[2]}"
+    return 0
+  fi
+  for r in top mid1 mid2 bot; do
+    line=" "
+    for ((i = 0; i < 3; i++)); do
+      case "$r" in
+        top) line="$line ${top[i]} " ;;
+        mid1) line="$line ${mid1[i]} " ;;
+        mid2) line="$line ${mid2[i]} " ;;
+        bot) line="$line ${bot[i]} " ;;
+      esac
+    done
+    printf '%s\n' "$line"
+  done
+}
+
 # help_item KEY KIND NAME TEXT [MORE TEXT] -> one aligned entry of the help
 help_item() {
   printf '  %2s %s %s %s' "$1" "$(menu_icon "$2")" "$(printf '%-26s' "$3")" "$4"
@@ -7420,8 +8703,13 @@ ${c}THE ICONS$r
   $(menu_icon view)  view      only shows information
   $(menu_icon del)  delete    removes data - you are asked to type DELETE first
 
+${c}START HERE - GUIDED TASKS$r
+$(help_item I run "Install" "A new installation, step by step: checks, the main settings (version," "proxy, port, time zone), files, start with health check, catalog data.")
+$(help_item U run "Update" "This installer first, then the Catalog: backup, new version, health" "check, patch updates of MongoDB, OpenSearch, RabbitMQ and the others.")
+$(help_item R del "Remove" "Removes the Catalog from this server: you choose data, images, files," "snapshots, backups, the installer; then type DELETE.")
+
 ${c}SETUP$r
-$(help_item 7 run "Full setup" "Generates .env and docker-compose.yml, validates them and starts the stack." "Start here on a new server.")
+$(help_item 7 run "Full setup" "Generates .env and docker-compose.yml, validates them and starts the stack" "in one go, without questions (I is the guided way).")
 $(help_item 1 edit "Settings" "All settings on one screen, grouped by name (CATALOG_*, MINIO_*," "*_TAG ...); checked before they are saved. E opens them in $(editor_short).")
 $(help_item 2 run "Generate" "Writes .env and docker-compose.yml from the settings. Passwords are kept;" "asks to align TZ with the server's time zone.")
 $(help_item 3 edit ".env file" "Shows or edits the generated .env (passwords included).")
@@ -7456,7 +8744,8 @@ $(help_item 16 view "Check prerequisites" "Docker, Compose, kernel, ports, vm.ma
 $(help_item 99 del "Reset" "Removes all containers AND all data volumes.")
 
 ${c}KEYS IN THE MENU$r
-  Number + Enter   run an option          H or ?   this help          J   jobs
+  Number + Enter   run an option          I U R    guided tasks       H or ?   this help
+  J                jobs
   Tab              select a running job   hold X   cancel it (2 s)    Q   quit
   The box "Current processes" shows running jobs with progress, speed and remaining time.
 
@@ -7506,6 +8795,9 @@ menu_dispatch() {
     23) adopt_installation || true ;;
     99) run_action menu_reset ;;
     j|J) run_action jobs_menu ;;
+    i|I) install_wizard ;;
+    u|U) update_wizard ;;
+    r|R) remove_wizard ;;
     h|H|help|\?) show_help ;;
     *) warn "Unknown option: $1"; return 1 ;;
   esac
@@ -7596,13 +8888,15 @@ tui_cell() {
 
 tui_draw() {
   reload_settings
-  local tz_note sib cols="$1" line col key kind label i n col_w found head2 head3 version
+  local tz_note sib cols="$1" rows="${2:-40}" line col key kind label i n col_w found head2 head3 version state need cards keys
   local -a c1=() c2=() c3=()
   version="$(version_label)"
   head2="Catalog $CATALOG_VERSION"
   if [[ "$version" == *"update available"* ]]; then
     head2="$head2   $C_YLW$UI_UP ${version#*update available: }$C_RST"
-    head2="${head2%, option 8*}$C_YLW $UI_SEP option 21$C_RST"
+    if [ -n "$HUB_STABLE" ] && is_version "$CATALOG_VERSION" && version_gt "$HUB_STABLE" "$CATALOG_VERSION"; then
+      head2="${head2%, option 8*}$C_YLW $UI_SEP U or option 21$C_RST"
+    fi
   elif [[ "$version" == *"up to date"* ]]; then
     head2="$head2   $C_GRN$UI_OK up to date$C_RST"
   fi
@@ -7612,7 +8906,8 @@ tui_draw() {
   fi
   head3="$head3 $UI_SEP .env $(if [ -f "$ENV_FILE" ]; then printf '%s' "$C_GRN$UI_OK$C_RST"; else printf '%s' "$C_YLW$UI_NO$C_RST"; fi)"
   head3="$head3 $UI_SEP compose $(if [ -f "$COMPOSE_FILE" ]; then printf '%s' "$C_GRN$UI_OK$C_RST"; else printf '%s' "$C_YLW$UI_NO$C_RST"; fi)"
-  head3="$head3 $UI_SEP stack $(stack_state)"
+  state="$(stack_state)"
+  head3="$head3 $UI_SEP stack $state"
   local notes=()
   if [ ! -f "$ENV_FILE" ]; then
     found="$(first_installation_dir)"
@@ -7633,8 +8928,6 @@ tui_draw() {
     notes+=("$C_YLW$UI_ARROW $tz_note$C_RST")
   fi
   clear_screen
-  ui_box "$cols" "RAYNET ONE TECHNOLOGY CATALOG $UI_SEP Installation Portal" "$head2" "$head3" ${notes[@]+"${notes[@]}"}
-  echo
   col_w=$(( (cols - 4) / 3 ))
   while IFS='|' read -r col key kind label; do
     case "$col" in
@@ -7650,13 +8943,36 @@ tui_draw() {
   if [ ${#c3[@]} -gt "$n" ]; then
     n=${#c3[@]}
   fi
+  # all of it must end above the "Current processes" box (the last 10 rows): on a short terminal
+  # the legend moves into the prompt line, then the cards shrink to one line
+  need=$((4 + ${#notes[@]} + 1 + 4 + 1 + n + 3 + (${#TUI_NOTICE} > 0 ? 1 : 0)))
+  cards=4
+  TUI_COMPACT="no"
+  if [ "$need" -gt $((rows - 10)) ]; then
+    TUI_COMPACT="yes"
+    need=$((need - 3))
+  fi
+  if [ "$need" -gt $((rows - 10)) ]; then
+    cards=1
+  fi
+  ui_box "$cols" "RAYNET ONE TECHNOLOGY CATALOG $UI_SEP Installation Portal" "$head2" "$head3" ${notes[@]+"${notes[@]}"}
+  echo
+  tui_cards "$cols" "$state" "$cards"
+  echo
   for ((i = 0; i < n; i++)); do
     printf '  %s%s%s\n' "$(tui_cell "${c1[i]:-}" "$col_w")" "$(tui_cell "${c2[i]:-}" "$col_w")" "$(tui_cell "${c3[i]:-}" "$col_w")"
   done
-  echo
-  printf '  %s\n' "$(menu_legend)"
-  printf '  %s\n' "${C_DIM}Number + Enter $UI_SEP H help $UI_SEP J jobs $UI_SEP Tab next process $UI_SEP hold X cancel process $UI_SEP Q quit$C_RST"
+  if [ "$TUI_COMPACT" = "no" ]; then
+    echo
+    printf '  %s\n' "$(menu_legend)"
+    keys="Number + Enter $UI_SEP I U R guided tasks $UI_SEP H help $UI_SEP J jobs $UI_SEP Tab next process $UI_SEP hold X cancel process $UI_SEP Q quit"
+    if [ "$(ui_len "$keys")" -gt $((cols - 2)) ]; then
+      keys="I U R guided tasks $UI_SEP H help $UI_SEP J jobs $UI_SEP hold X cancel process $UI_SEP Q quit"
+    fi
+    printf '  %s\n' "$C_DIM$keys$C_RST"
+  fi
 }
+TUI_COMPACT="no"
 
 tui_draw_box() {
   local cols="$1" rows="$2" width=48 row col boxlines=() i blank
@@ -7730,7 +9046,7 @@ tui_menu() {
       if [ "$cols" -lt 100 ] || [ "$rows" -lt 36 ]; then
         return 2
       fi
-      tui_draw "$cols"
+      tui_draw "$cols" "$rows"
       if [ -n "$TUI_NOTICE" ]; then
         printf '  %s\n' "$C_GRN$UI_OK $TUI_NOTICE$C_RST"
         TUI_NOTICE=""
@@ -7749,6 +9065,9 @@ tui_menu() {
       held=0
     fi
     printf '\033[%d;3H%s Select: %s\033[K' $((rows - 1)) "$C_CYN$UI_ARROW$C_RST" "$buf"
+    if [ "$TUI_COMPACT" = "yes" ]; then
+      printf '\0337\033[%d;%dH%s\0338' $((rows - 1)) $((cols - 44)) "${C_DIM}I U R guided tasks $UI_SEP H help $UI_SEP J jobs $UI_SEP Q quit$C_RST"
+    fi
     tui_heartbeat "$cols" "$rows"
     key=""
     if ! read -rsn1 -t 0.1 key; then
@@ -7775,6 +9094,9 @@ tui_menu() {
         ;;
       $'\033') read -rsn5 -t 0.01 rest || true ;;
       j|J) tui_run J; redraw=1 ;;
+      i|I) tui_run I; redraw=1 ;;
+      u|U) tui_run U; redraw=1 ;;
+      r|R) tui_run R; redraw=1 ;;
       h|H|\?) tui_run H; redraw=1 ;;
       q|Q)
         tput cup $((rows - 1)) 0
@@ -7823,7 +9145,7 @@ tui_run() {
 }
 
 menu() {
-  local choice notice="${RVC_NOTICE:-}"
+  local choice notice="${RVC_NOTICE:-}" resume="${1:-}"
   INTERACTIVE="true"
   TUI_NOTICE="$notice"
   unset RVC_NOTICE
@@ -7839,6 +9161,15 @@ menu() {
       info "Checking Docker Hub for new Catalog versions..."
     fi
     check_latest_version
+  fi
+
+  if [ "$resume" = "resume-update" ]; then
+    clear_screen
+    update_wizard 2 "$notice" || true
+    notice=""
+    TUI_NOTICE=""
+    echo
+    pause
   fi
 
   if ui_fancy; then
@@ -7869,6 +9200,7 @@ menu() {
       done < <(job_running_ids)
       echo
     fi
+    printf '  %s\n' "${C_DIM}I install $UI_SEP U update $UI_SEP R remove $UI_SEP H help $UI_SEP 0 exit$C_RST"
     if ! read -r -p "Select an option: " choice; then
       echo
       exit 0
@@ -7941,7 +9273,7 @@ main() {
         do_generate keep
       fi
       ;;
-    menu) menu ;;
+    menu) menu "${1:-}" ;;
     generate)
       case "${1:-}" in
         "") do_generate keep ;;

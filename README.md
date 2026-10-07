@@ -49,6 +49,16 @@ Long tasks run as background jobs: start, pull, restart, stop, snapshot download
 
 ## Menu
 
+Three cards at the top lead through the usual tasks step by step:
+
+| Key | Task | Steps |
+|---|---|---|
+| **I** | **Install** | Checks the server, asks for the main settings (Catalog version, Nginx Proxy Manager, port of Catalog Web, MongoDB 7.0 on kernels that cannot run 8, time zone), writes the files, starts the stack with a health check, offers the catalog data (daily self-sync or snapshots) and shows the URLs. In a folder that is already installed it offers repair, update or remove instead. |
+| **U** | **Update** | Updates this installer first. If there is a new version, the menu restarts and continues with the next step. Then the guided upgrade of the Catalog (backup, new version, health check) and the patch updates of the other components. |
+| **R** | **Remove** | Shows what is installed. You choose what goes: data volumes, images, `.env` and `docker-compose.yml`, job logs and keys are selected; snapshots, backups, offline bundles and the installer itself only if you select them. Containers and networks always go. Type `DELETE` to confirm. R removes only what clearly belongs to this folder: nothing of another installation or app with the same project name, only the files the installer wrote in `snapshots/` and `backups/`, and never `.env` while data that needs its passwords stays. |
+
+The full list below the cards has every single step:
+
 | Option | Purpose |
 |---|---|
 | 1 | **Settings**: all settings of the script on one screen, grouped by name (see below) |
@@ -217,6 +227,7 @@ bash tests/run_selfupdate_tests.sh "$PWD/rn1-technology-catalog-installer.sh"
 bash tests/run_adopt_tests.sh "$PWD/rn1-technology-catalog-installer.sh"
 bash tests/run_jobs_tests.sh "$PWD/rn1-technology-catalog-installer.sh"
 bash tests/run_timezone_tests.sh "$PWD/rn1-technology-catalog-installer.sh"
+bash tests/run_wizard_tests.sh "$PWD/rn1-technology-catalog-installer.sh"
 ```
 
-Docker, ssh, scp and the Raynet APIs are replaced by fakes. The Updates tests query Docker Hub and GHCR, so they need internet access. The jobs tests close the menu's session the way a lost SSH connection does, cancel jobs, and hold X in the full screen menu; they need Linux (`setsid` and `script` from util-linux). The time zone tests need tzdata. GitHub Actions runs all eight suites on every push.
+Docker, ssh, scp and the Raynet APIs are replaced by fakes. The Updates tests query Docker Hub and GHCR, so they need internet access. The jobs tests close the menu's session the way a lost SSH connection does, cancel jobs, and hold X in the full screen menu; they need Linux (`setsid` and `script` from util-linux). The time zone tests need tzdata. GitHub Actions runs all nine suites on every push.
