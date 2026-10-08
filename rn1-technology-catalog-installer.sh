@@ -3732,6 +3732,8 @@ upgrade_rollback() {
 # Installers from before the rename to rn1-technology-catalog-installer.sh carry this INSTALLER_URL.
 LEGACY_INSTALLER_URL="https://raw.githubusercontent.com/AKARABEL/rn1-technology-catalog-installer/main/catalog.sh"
 CURRENT_INSTALLER_URL="https://raw.githubusercontent.com/AKARABEL/rn1-technology-catalog-installer/main/rn1-technology-catalog-installer.sh"
+# "yes" once update_installer has replaced this file with a newer version
+INSTALLER_UPDATED="no"
 
 # The line that downloads and starts the installer: with wget, or with curl where wget is missing
 install_line() {
@@ -3744,7 +3746,7 @@ install_line() {
 
 # Downloads the newest installer and carries the current settings over to it.
 update_installer() {
-  local mode="${1:-interactive}" tmp line name value backup new_names url="$INSTALLER_URL"
+  local mode="${1:-interactive}" tmp line name value backup new_names pairs url="$INSTALLER_URL"
   if [ -z "$SCRIPT_PATH" ] || [ ! -w "$SCRIPT_PATH" ]; then
     err "Cannot update ${SCRIPT_PATH:-the installer} (not a writable file)."
     return 1
@@ -3765,14 +3767,21 @@ update_installer() {
     return 1
   fi
   new_names="$(settings_pairs "$tmp" | cut -d'|' -f1)"
+  if ! pairs="$(settings_pairs "$SCRIPT_PATH")" || [ -z "$pairs" ]; then
+    rm -f -- "$tmp"
+    err "Cannot read the settings of $SCRIPT_NAME - not updated."
+    return 1
+  fi
   while IFS='|' read -r name value; do
     if [ "$name" = "INSTALLER_URL" ] && [ "$value" = "$LEGACY_INSTALLER_URL" ]; then
       continue
     fi
-    if grep -qx -- "$name" <<< "$new_names"; then
-      set_setting "$name" "$value" "$tmp"
+    if grep -qx -- "$name" <<< "$new_names" && ! set_setting "$name" "$value" "$tmp"; then
+      rm -f -- "$tmp"
+      err "Cannot carry the setting $name over (disk full?) - not updated."
+      return 1
     fi
-  done < <(settings_pairs "$SCRIPT_PATH")
+  done <<< "$pairs"
   if [ "$(cksum < "$tmp")" = "$(cksum < "$SCRIPT_PATH")" ]; then
     rm -f -- "$tmp"
     ok "The installer is up to date."
@@ -3780,7 +3789,7 @@ update_installer() {
   fi
   if [ "$INSTALLER_URL" = "$LEGACY_INSTALLER_URL" ] && [ "$(grep -v '^INSTALLER_URL=' "$tmp" | cksum)" = "$(grep -v '^INSTALLER_URL=' "$SCRIPT_PATH" | cksum)" ]; then
     rm -f -- "$tmp"
-    set_setting INSTALLER_URL "$CURRENT_INSTALLER_URL"
+    set_setting INSTALLER_URL "$CURRENT_INSTALLER_URL" || return 1
     ok "The installer is up to date. Its update address is now $CURRENT_INSTALLER_URL."
     return 0
   fi
@@ -3808,6 +3817,7 @@ update_installer() {
     return 1
   fi
   rm -f -- "$tmp"
+  INSTALLER_UPDATED="yes"
   ok "Installer updated (previous version: $backup)."
   if [ "$mode" = "interactive" ]; then
     export RVC_NOTICE="Installer updated - your settings were kept."
@@ -4365,6 +4375,23 @@ ui_pause_tty() {
     read -r -s -n 1 -p "  ${C_DIM}Press any key to continue$C_RST" _ || true
     echo
   fi
+}
+
+# True when this process may read from the terminal: stdin and stdout are one, and it runs in the
+# terminal's foreground (under "timeout" or "&" a read would stop it)
+ui_foreground() {
+  local stat state ppid pgrp session tty tpgid rest
+  if [ ! -t 0 ] || [ ! -t 1 ]; then
+    return 1
+  fi
+  if ! { read -r stat < "/proc/$$/stat"; } 2>/dev/null; then
+    return 0
+  fi
+  read -r state ppid pgrp session tty tpgid rest <<< "${stat##*) }"
+  if [[ "$pgrp" =~ ^[0-9]+$ ]] && [[ "$tpgid" =~ ^-?[0-9]+$ ]] && [ "$pgrp" != "$tpgid" ]; then
+    return 1
+  fi
+  return 0
 }
 
 ui_fancy() {
@@ -9382,7 +9409,7 @@ Commands:
   timezone                    Use the time zone of this server for TZ (the job times are converted)
   updates                     Show available updates for all components
   upgrade                     Guided upgrade (asks first, then runs as a background job)
-  self-update                 Update this installer from GitHub, keeping the settings
+  self-update [--no-menu]     Update this installer from GitHub (settings kept), then open the menu
   adopt [FOLDER]              Take over an existing installation (its .env, docker-compose.yml and data)
   jobs [follow N|cancel N|log N]  Background tasks: list, follow, cancel (cleans up first), log
   download                    Download all images into a new offline bundle folder (+ .tar.gz)
@@ -9441,7 +9468,26 @@ main() {
     __settings_groups) settings_grouped "$SCRIPT_PATH" ;;
     updates) show_updates_cli ;;
     upgrade) INTERACTIVE="true"; do_upgrade ;;
-    self-update) update_installer cli ;;
+    self-update)
+      case "${1:-}" in
+        ""|--no-menu) ;;
+        *)
+          err "Unknown option for self-update: $1 (only --no-menu)"
+          return 2
+          ;;
+      esac
+      update_installer cli
+      # in the foreground of a terminal the menu of the (new) installer opens right away;
+      # --no-menu, cron, pipes and runs in the background (timeout, &) just end
+      if [ "${1:-}" != "--no-menu" ] && ui_foreground; then
+        if [ "$INSTALLER_UPDATED" = "yes" ]; then
+          export RVC_NOTICE="Installer updated - your settings were kept."
+        else
+          export RVC_NOTICE="The installer is up to date."
+        fi
+        exec bash "$SCRIPT_PATH" menu
+      fi
+      ;;
     adopt) adopt_installation cli "${1:-}" ;;
     jobs) jobs_cli "$@" ;;
     __job) job_run "$@" ;;

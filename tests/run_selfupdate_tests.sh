@@ -60,11 +60,43 @@ check "updated script still valid" 'bash -n "$D/rn1-technology-catalog-installer
 # 3. Again -> up to date
 out="$(bash "$D/rn1-technology-catalog-installer.sh" self-update </dev/null 2>&1)"
 check "second run: up to date" 'grep -q "The installer is up to date." <<< "$out"'
+check "no terminal (script, cron): the menu does not open" '! grep -q "Installation Portal" <<< "$out"'
 
 # 4. Menu: update and reload into the new version
 cp "$NEW" "$D/rn1-technology-catalog-installer.sh"; sed -i 's/^CHECK_FOR_UPDATES=.*/CHECK_FOR_UPDATES="false"/' "$D/rn1-technology-catalog-installer.sh"
 out="$(printf '22\ny\n0\n' | bash "$D/rn1-technology-catalog-installer.sh" menu 2>&1)"; rc=$?
 check "menu: reloaded into the new version with notice" '[ "$rc" -eq 0 ] && grep -q "Installer updated - your settings were kept." <<< "$out" && grep -q "Installation Portal v2" <<< "$out"'
+
+# 4b. self-update in a terminal opens the menu of the new version (0 leaves it)
+if command -v script >/dev/null 2>&1 && [ "$(uname -s)" = "Linux" ]; then
+  cp "$NEW" "$D/rn1-technology-catalog-installer.sh"; sed -i 's/^CHECK_FOR_UPDATES=.*/CHECK_FOR_UPDATES="false"/' "$D/rn1-technology-catalog-installer.sh"
+  # tty_run COMMAND: runs it in a pseudo-terminal, types 0 once the menu asks (or the command ended),
+  # keeps the input open until the command has ended, then prints what the terminal showed
+  tty_run() {
+    local log="$T/tty.log" i
+    : > "$log"
+    { for i in $(seq 1 240); do grep -q "Select an option\|TTY-END" "$log" 2>/dev/null && break; sleep 0.5; done
+      printf '0\n'
+      for i in $(seq 1 240); do grep -q "TTY-END" "$log" 2>/dev/null && break; sleep 0.5; done
+    } | TERM=dumb timeout 300 script -qfec "$1; echo TTY-END" /dev/null > "$log" 2>&1
+    sed 's/\x1b[[(][0-9;?]*[A-Za-z]//g' "$log" | tr -d '\r'
+  }
+  SU="bash $D/rn1-technology-catalog-installer.sh self-update"
+  out="$(tty_run "$SU")"
+  check "terminal: updated, then the new menu with the notice" 'grep -q "Installer updated (previous version" <<< "$out" && grep -q "Installer updated - your settings were kept." <<< "$out" && grep -q "Installation Portal v2" <<< "$out" && grep -q TTY-END <<< "$out"'
+  out="$(tty_run "$SU")"
+  check "terminal: up to date, the menu opens too" 'grep -q "The installer is up to date." <<< "$out" && grep -q "Installation Portal v2" <<< "$out"'
+  out="$(tty_run "$SU --no-menu")"
+  check "terminal: --no-menu just ends" 'grep -q "The installer is up to date." <<< "$out" && ! grep -q "Installation Portal" <<< "$out" && grep -q TTY-END <<< "$out"'
+  out="$(tty_run "timeout 120 $SU")"
+  check "terminal, but in the background (timeout): no menu, no stop" 'grep -q "The installer is up to date." <<< "$out" && ! grep -q "Installation Portal" <<< "$out" && grep -q TTY-END <<< "$out"'
+  out="$(SHIM_SERVE=down tty_run "$SU")"
+  check "terminal: failed download, no menu" 'grep -q "not a valid installer" <<< "$out" && ! grep -q "Installation Portal" <<< "$out"'
+  out="$(bash "$D/rn1-technology-catalog-installer.sh" self-update --menu </dev/null 2>&1)"; rc=$?
+  check "unknown self-update option refused" '[ "$rc" -eq 2 ] && grep -q "only --no-menu" <<< "$out"'
+else
+  echo "SKIP: script (util-linux) missing - no terminal test of self-update"
+fi
 
 # 5. Installation from before the rename: catalog.sh with the old update address
 NEWURL="https://raw.githubusercontent.com/AKARABEL/rn1-technology-catalog-installer/main/rn1-technology-catalog-installer.sh"
@@ -122,6 +154,34 @@ EOF
   out="$(PATH="$W/bin:$PATH" REAL_CAT="$REAL_CAT" CAT_FAILED="$W/failed" CAT_TARGET="$(readlink -f "$W/rn1-technology-catalog-installer.sh")" bash "$W/rn1-technology-catalog-installer.sh" self-update </dev/null 2>&1)"; rc=$?
   check "failed write: installer restored, not reported as updated" '[ "$rc" -ne 0 ] && [ -e "$W/failed" ] && grep -q "it was restored from" <<< "$out" && ! grep -q "Installer updated" <<< "$out" && [ "$(cksum < "$W/rn1-technology-catalog-installer.sh")" = "$before" ]'
 fi
+
+# 11. /tmp full after the download: the settings cannot be carried over, so nothing is replaced
+#     (on the command line and with option 22, which runs the update without errexit)
+F="$T/fulltmp"; mkdir -p "$F/bin"
+REAL_MKTEMP="$(command -v mktemp)"
+cat > "$F/bin/mktemp" <<'EOF'
+#!/usr/bin/env bash
+# temp files work until the installer was downloaded, then fail like on a full /tmp
+if [ "$(cat "$SRV/urls" 2>/dev/null | wc -l)" -gt "$URLS_BEFORE" ]; then
+  echo "mktemp: failed to create file via template: No space left on device" >&2
+  exit 1
+fi
+exec "$REAL_MKTEMP" "$@"
+EOF
+chmod +x "$F/bin/mktemp"
+for how in cli menu; do
+  cp "$NEW" "$F/rn1-technology-catalog-installer.sh"
+  sed -i 's/^CHECK_FOR_UPDATES=.*/CHECK_FOR_UPDATES="false"/; 0,/^CATALOG_WEB_PORT=/s/^CATALOG_WEB_PORT=.*/CATALOG_WEB_PORT="9090"/' "$F/rn1-technology-catalog-installer.sh"
+  before="$(cksum < "$F/rn1-technology-catalog-installer.sh")"
+  ub="$(cat "$SRV/urls" 2>/dev/null | wc -l)"
+  if [ "$how" = cli ]; then
+    out="$(PATH="$F/bin:$PATH" REAL_MKTEMP="$REAL_MKTEMP" URLS_BEFORE="$ub" bash "$F/rn1-technology-catalog-installer.sh" self-update </dev/null 2>&1)"; rc=$?
+    check "full /tmp (command line): not updated, settings untouched" '[ "$rc" -ne 0 ] && grep -q "Cannot carry the setting .* over (disk full?) - not updated." <<< "$out" && ! grep -q "Installer updated" <<< "$out" && [ "$(cksum < "$F/rn1-technology-catalog-installer.sh")" = "$before" ]'
+  else
+    out="$(printf '22\n\n\n0\n' | PATH="$F/bin:$PATH" REAL_MKTEMP="$REAL_MKTEMP" URLS_BEFORE="$ub" bash "$F/rn1-technology-catalog-installer.sh" menu 2>&1)"
+    check "full /tmp (option 22): not updated, settings untouched" 'grep -q "not updated." <<< "$out" && ! grep -q "Installer updated" <<< "$out" && [ "$(cksum < "$F/rn1-technology-catalog-installer.sh")" = "$before" ]'
+  fi
+done
 
 echo "== $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]

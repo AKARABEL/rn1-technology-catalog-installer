@@ -25,7 +25,7 @@ curl -fsSL -o rn1-technology-catalog-installer.sh https://raw.githubusercontent.
 Then press **I** for the guided installation, or choose **7** to generate, validate and start in one go. The settings are at the top of `rn1-technology-catalog-installer.sh`; option **1** shows them on one screen to change and check them (**E** there opens them in `vi`).
 
 - Run the script as a file, as shown above. Piping it into bash (`wget -O- ... | bash`) does not work, because the menu needs the keyboard and the script stores its settings in its own file.
-- **Later updates:** use option **22** (or `./rn1-technology-catalog-installer.sh self-update`) instead of the `wget` line. It downloads the newest version and keeps all your settings. The previous version is kept as `rn1-technology-catalog-installer.sh.bak-<timestamp>`. Running the `wget` line again would overwrite your settings. If the line seems to do nothing, the download failed: `wget -nv` prints why (network, DNS, proxy).
+- **Later updates:** use option **22** (or `./rn1-technology-catalog-installer.sh self-update`) instead of the `wget` line. It downloads the newest version, keeps all your settings and then opens the menu. It just ends with `--no-menu` (for scripts run in a terminal), and without a terminal: cron, pipes, redirected input or output, or a run in the background (`timeout`, `&`). The first update of an installer from before this feature still ends without the menu, because the old version decides that; start the script again. The previous version is kept as `rn1-technology-catalog-installer.sh.bak-<timestamp>`. Running the `wget` line again would overwrite your settings. If the line seems to do nothing, the download failed: `wget -nv` prints why (network, DNS, proxy).
 
 ## A Catalog already runs on the server
 
@@ -112,7 +112,7 @@ A setting added to the script later appears in its group by itself.
 ./rn1-technology-catalog-installer.sh timezone                use the server's time zone for TZ (job times converted)
 ./rn1-technology-catalog-installer.sh upgrade                 guided upgrade (asks first, then runs as a job)
 ./rn1-technology-catalog-installer.sh jobs [list | follow N | cancel N | log N]
-./rn1-technology-catalog-installer.sh self-update             newest installer from GitHub, settings kept
+./rn1-technology-catalog-installer.sh self-update [--no-menu] newest installer from GitHub, settings kept, then the menu
 ./rn1-technology-catalog-installer.sh adopt [FOLDER]          take over an existing installation
 ./rn1-technology-catalog-installer.sh download                offline bundle with all images (+ .tar.gz)
 ./rn1-technology-catalog-installer.sh versions | set-version VERSION|stable
