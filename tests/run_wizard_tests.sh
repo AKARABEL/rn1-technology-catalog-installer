@@ -347,21 +347,27 @@ check "install: repair takes the passwords from the newest .env backup" 'grep -q
 # 21. Full screen: the lines above the prompt say what the typed number does
 if command -v script >/dev/null 2>&1 && [ "$(uname -s)" = "Linux" ]; then
   fresh
-  tui_type() { # KEYS [COLUMNS]
-    local log="$T/tui.log" i
+  tui_type() { # KEYS [COLUMNS] [TEXT TO WAIT FOR BEFORE QUITTING]
+    local log="$T/tui.log" i k
     : > "$log"
     { for i in $(seq 1 120); do grep -q "Select:" "$log" 2>/dev/null && break; sleep 0.5; done
-      printf '%s' "$1"; sleep 2; printf q; sleep 2
+      for ((k = 0; k < ${#1}; k++)); do printf '%s' "${1:k:1}"; sleep 0.3; done
+      if [ -n "${3:-}" ]; then
+        for i in $(seq 1 60); do grep -aq -- "$3" "$log" 2>/dev/null && break; sleep 0.5; done
+      else
+        sleep 2
+      fi
+      printf q; sleep 2
     } | TERM=xterm LANG=C.UTF-8 timeout 90 script -qfec "stty cols ${2:-120} rows 40; bash $I menu" /dev/null > "$log" 2>&1
     sed 's/\x1b[[(][0-9;?]*[A-Za-z]//g; s/\x1b[78]//g' "$log" | tr -d '\r'
   }
   out="$(tui_type "")"
   check "full screen: asks for a number and says it will explain it" 'grep -q "Type a number - what it does shows here" <<< "$out"'
-  out="$(tui_type 13)"
+  out="$(tui_type 13 120 "data volumes stay")"
   check "full screen: typing 13 says what it does" 'grep -q "13 .* Stop (data is kept)" <<< "$out" && grep -q "docker compose down - data volumes stay" <<< "$out"'
-  out="$(tui_type 99)"
+  out="$(tui_type 99 120 "AND data volumes")"
   check "full screen: typing 99 warns" 'grep -q "Reset: delete all data - asks for DELETE" <<< "$out" && grep -q "Removes ALL containers AND data volumes" <<< "$out"'
-  out="$(tui_type 24)"
+  out="$(tui_type 24 120 "No option 24")"
   check "full screen: an unknown number is named" 'grep -q "No option 24" <<< "$out"'
   installed; rm -f "$D/.env"
   out="$(tui_type "" 132)"
