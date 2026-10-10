@@ -15,8 +15,46 @@ cat > "$T/bin/timedatectl" <<'EOF'
 [ "${SHIM_TZ:-}" = none ] && exit 1
 printf '%s\n' "${SHIM_TZ:-Europe/Berlin}"
 EOF
-printf '#!/usr/bin/env bash\nexit 0\n' > "$T/bin/docker"
-chmod +x "$T/bin/"*
+# An empty, ready Podman engine: rootful Podman 5.7.0, podman.socket active, the Docker Compose
+# provider in place, no containers, volumes or images. Calls it does not know are logged to $UNH.
+export UNH="$T/unhandled.log" RN1_COMPOSE_PROVIDER="$T/cli-plugins/docker-compose"
+: > "$UNH"
+cat > "$T/bin/podman" <<'EOF'
+#!/usr/bin/env bash
+a="$*"
+case "$a" in
+  --version) echo "podman version 5.7.0" ;;
+  info) ;;
+  "info --format {{.Host.Security.Rootless}}") echo false ;;
+  "volume ls -q --filter label=com.docker.compose.project="*|"ps -aq --filter label="*) ;;
+  "compose --env-file .env -f docker-compose.yml "*)
+    [ "${PODMAN_COMPOSE_PROVIDER:-}" = "$RN1_COMPOSE_PROVIDER" ] || { printf 'UNHANDLED podman %s (PODMAN_COMPOSE_PROVIDER=%s)\n' "$a" "${PODMAN_COMPOSE_PROVIDER:-unset}" >> "$UNH"; exit 125; }
+    case "${a#compose --env-file .env -f docker-compose.yml }" in
+      "config --quiet"|ps|"ps --services --filter status=running"|"up -d --remove-orphans") ;;
+      *) printf 'UNHANDLED podman %s\n' "$*" >> "$UNH"; exit 125 ;;
+    esac ;;
+  *) printf 'UNHANDLED podman %s\n' "$*" >> "$UNH"; exit 125 ;;
+esac
+exit 0
+EOF
+mkdir -p "$T/cli-plugins"
+cat > "$RN1_COMPOSE_PROVIDER" <<'EOF'
+#!/usr/bin/env bash
+case "$*" in
+  version) echo "Docker Compose version v5.6.0" ;;
+  "version --short") echo "5.6.0" ;;
+  *) printf 'UNHANDLED provider %s\n' "$*" >> "$UNH"; exit 125 ;;
+esac
+EOF
+cat > "$T/bin/systemctl" <<'EOF'
+#!/usr/bin/env bash
+case "$*" in
+  "is-active --quiet podman.socket"|"is-active podman.socket") exit 0 ;;
+  "is-enabled podman-restart.service") echo enabled ;;
+  *) printf 'UNHANDLED systemctl %s\n' "$*" >> "$UNH"; exit 1 ;;
+esac
+EOF
+chmod +x "$T/bin/"* "$RN1_COMPOSE_PROVIDER"
 # the kernel of the test machine must not change the generated files (MongoDB workaround on 6.19 to 7.0.x)
 REAL_UNAME="$(command -v uname)"
 printf '#!/usr/bin/env bash
@@ -97,6 +135,7 @@ out="$(SHIM_TZ=Asia/Singapore bash "$I" generate </dev/null 2>&1)"
 check "CLI generate does not ask" '! grep -q "This server runs in the time zone" <<< "$out" && grep -q "^TZ=Europe/Berlin$" "$D/.env"'
 out="$(SHIM_TZ=Asia/Singapore bash "$I" check </dev/null 2>&1)"
 check "check reports the different zones" 'grep -q "Time zone: the Catalog uses Europe/Berlin, this server Asia/Singapore" <<< "$out"'
+check "check: the empty Podman engine is ready, all required checks pass" 'grep -q "All required checks passed." <<< "$out" && grep -q "Podman 5.7.0" <<< "$out" && grep -q "Podman runs rootful." <<< "$out" && grep -q "Podman API socket (podman.socket) is active." <<< "$out" && grep -q "Compose: podman compose with Docker Compose version v5.6.0" <<< "$out" && ! grep -q "podman-restart.service is not enabled" <<< "$out"'
 out="$(SHIM_TZ=Not/AZone bash "$I" check </dev/null 2>&1)"
 check "server zone without data is named" 'grep -q "there is no time zone data for Not/AZone here" <<< "$out"'
 
@@ -174,6 +213,8 @@ fresh
 sed -i 's#^AUTOSYNC_CRON=.*#AUTOSYNC_CRON="0 22 1 * *"#' "$I"
 out="$(printf 'y\n' | SHIM_TZ=Asia/Singapore bash "$I" timezone 2>&1)"
 check "not convertible: warned, TZ changed, expression kept" 'grep -q "AUTOSYNC_CRON \"0 22 1 \* \*\" cannot be converted automatically" <<< "$out" && grep -q "^TZ=\"Asia/Singapore\"$" "$I" && grep -q "^AUTOSYNC_CRON=\"0 22 1 \* \*\"$" "$I"'
+
+check "no Podman, Compose or systemctl call the fakes do not know" '[ ! -s "$UNH" ] || { sort -u "$UNH"; false; }'
 
 echo "== $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]

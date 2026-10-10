@@ -3,6 +3,16 @@ if [ -z "${BASH_VERSION:-}" ]; then
   exec bash "$0" "$@"
 fi
 set -euo pipefail
+if [ "${BASH_VERSINFO[0]}" -lt 4 ] || { [ "${BASH_VERSINFO[0]}" -eq 4 ] && [ "${BASH_VERSINFO[1]}" -lt 2 ]; }; then
+  for b in /opt/homebrew/bin/bash /usr/local/bin/bash; do
+    if [ -x "$b" ] && [ "${RN1_BASH_REEXEC:-}" != "1" ]; then
+      export RN1_BASH_REEXEC=1
+      exec "$b" "$0" ${1+"$@"}
+    fi
+  done
+  echo "ERROR bash 4.2 or newer is needed (this is bash $BASH_VERSION). On macOS: brew install bash coreutils gnu-sed grep findutils" >&2
+  exit 1
+fi
 
 ###############################################################################
 # CONFIGURE ONLY THIS SECTION
@@ -83,6 +93,24 @@ LOG_LEVEL_DEFAULT="Information"
 # DO NOT CHANGE ANYTHING BELOW
 ###############################################################################
 
+OS_KIND="$(uname -s 2>/dev/null || echo Linux)"
+# macOS: the script uses GNU date, sed, stat, readlink ... (brew install coreutils gnu-sed grep findutils);
+# a gnubin folder already on the PATH keeps its place
+mac_gnu_path() {
+  local p t
+  for p in /opt/homebrew /usr/local; do
+    for t in findutils grep gnu-sed coreutils; do
+      if [ -d "$p/opt/$t/libexec/gnubin" ] && [[ ":$PATH:" != *":$p/opt/$t/libexec/gnubin:"* ]]; then
+        PATH="$p/opt/$t/libexec/gnubin:$PATH"
+      fi
+    done
+  done
+  export PATH
+}
+if [ "$OS_KIND" = "Darwin" ]; then
+  mac_gnu_path
+fi
+
 SCRIPT_NAME="$(basename -- "$0")"
 if [ -f "${BASH_SOURCE[0]:-}" ]; then
   # Resolve symlinks so the files always land next to the real script.
@@ -108,6 +136,19 @@ GENERATE_CANCELLED="false"
 TZ_CHANGED="false"
 COMPOSE=()
 COMPOSE_PROBLEM=""
+# Podman only: "podman compose" runs the official Docker Compose (the provider) against Podman's API
+# socket. A DOCKER_HOST from the environment would make it talk to something else.
+unset DOCKER_HOST DOCKER_CONTEXT
+export PODMAN_COMPOSE_WARNING_LOGS=false
+PODMAN_MIN="4.9.0"
+if [ -n "${RN1_COMPOSE_PROVIDER:-}" ]; then
+  COMPOSE_PROVIDER="$RN1_COMPOSE_PROVIDER"
+elif [ "$OS_KIND" = "Darwin" ]; then
+  COMPOSE_PROVIDER="$HOME/.docker/cli-plugins/docker-compose"
+else
+  COMPOSE_PROVIDER="/usr/local/lib/docker/cli-plugins/docker-compose"
+fi
+SUDO=()
 LATEST_VERSION=""
 HUB_STATUS="unchecked"
 HUB_VERSIONS=""
@@ -258,6 +299,11 @@ hint() {
 
 host_ip() {
   local addr=""
+  if [ "$OS_KIND" = "Darwin" ]; then
+    addr="$(ipconfig getifaddr en0 2>/dev/null || ipconfig getifaddr en1 2>/dev/null)" || addr=""
+    printf '%s' "${addr:-localhost}"
+    return 0
+  fi
   addr="$(hostname -I 2>/dev/null | awk '{print $1}')" || addr=""
   if [ -z "$addr" ]; then
     addr="$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for (i = 1; i < NF; i++) if ($i == "src") { print $(i + 1); exit }}')" || addr=""
@@ -285,12 +331,16 @@ port_settings() {
 }
 
 ###############################################################################
-# Docker / Compose
+# Podman / Compose
 ###############################################################################
 
 # pkg_hint PACKAGE... -> the command that installs them on this machine ("sudo dnf install jq")
 pkg_hint() {
   local pm
+  if [ "$OS_KIND" = "Darwin" ]; then
+    echo "brew install $*"
+    return 0
+  fi
   for pm in apt-get dnf yum zypper apk; do
     if command -v "$pm" >/dev/null 2>&1; then
       case "$pm" in
@@ -314,63 +364,6 @@ os_release() {
   printf '%s' "${v//\'/}"
 }
 
-# The package with the Docker Compose plugin
-compose_package() {
-  if command -v apt-get >/dev/null 2>&1; then
-    if [ "$(os_release ID)" = "ubuntu" ] && command -v dpkg >/dev/null 2>&1 && dpkg -s docker.io >/dev/null 2>&1; then
-      echo "docker-compose-v2"
-    else
-      echo "docker-compose-plugin"
-    fi
-  elif ! command -v dnf >/dev/null 2>&1 && ! command -v yum >/dev/null 2>&1 && command -v zypper >/dev/null 2>&1; then
-    echo "docker-compose"
-  else
-    echo "docker-compose-plugin"
-  fi
-}
-
-# How to install Docker Engine with the Compose plugin on this Linux, as indented lines
-docker_install_hint() {
-  local id like repo="" pm="dnf"
-  id="$(os_release ID)"
-  like=" $(os_release ID_LIKE) "
-  case "$id" in
-    rhel) repo="rhel" ;;
-    fedora) repo="" ;;
-    centos|rocky|almalinux|ol) repo="centos" ;;
-    *)
-      case "$like" in
-        *" rhel "*|*" centos "*) repo="centos" ;;
-      esac
-      ;;
-  esac
-  if [ -n "$repo" ]; then
-    if ! command -v dnf >/dev/null 2>&1 && command -v yum >/dev/null 2>&1; then
-      pm="yum"
-      echo "      sudo yum -y install yum-utils"
-      echo "      sudo yum-config-manager --add-repo https://download.docker.com/linux/$repo/docker-ce.repo"
-    else
-      echo "      sudo dnf -y install dnf-plugins-core"
-      echo "      sudo dnf config-manager --add-repo https://download.docker.com/linux/$repo/docker-ce.repo"
-    fi
-    echo "      sudo $pm -y install docker-ce docker-ce-cli containerd.io docker-compose-plugin"
-    echo "      sudo systemctl enable --now docker"
-    echo "      If $pm reports a conflict with podman or runc, remove them first: sudo $pm remove podman-docker podman runc"
-    echo "      Details: https://docs.docker.com/engine/install/$repo/"
-    return 0
-  fi
-  case "$id $like" in
-    ubuntu*|*" ubuntu "*) echo "      See https://docs.docker.com/engine/install/ubuntu/ (docker-ce and docker-compose-plugin from Docker's repository)" ;;
-    debian*|*" debian "*) echo "      See https://docs.docker.com/engine/install/debian/ (docker-ce and docker-compose-plugin from Docker's repository)" ;;
-    fedora*) echo "      See https://docs.docker.com/engine/install/fedora/ (docker-ce and docker-compose-plugin from Docker's repository)" ;;
-    *suse*|sles*|sled*)
-      echo "      sudo zypper install docker docker-compose"
-      echo "      sudo systemctl enable --now docker"
-      ;;
-    *) echo "      See https://docs.docker.com/engine/install/" ;;
-  esac
-}
-
 # The package with ssh, scp and ssh-keygen
 ssh_package() {
   if command -v apt-get >/dev/null 2>&1 || command -v apk >/dev/null 2>&1; then
@@ -380,14 +373,107 @@ ssh_package() {
   fi
 }
 
-# True when the docker command is Podman's emulation (podman-docker), which is not supported
-docker_is_podman() {
+# The version of the podman command (podman version 5.7.0 -> 5.7.0)
+podman_version() {
   local v
-  v="$(docker --version 2>/dev/null)" || v=""
-  case "$v" in
-    *[Pp]odman*) return 0 ;;
+  v="$(podman --version 2>/dev/null)" || v=""
+  v="${v##* }"
+  printf '%s' "${v%%[!0-9.]*}"
+}
+
+# "false" when Podman runs rootful (what the Catalog needs), "true" when rootless
+engine_rootless() {
+  podman info --format '{{.Host.Security.Rootless}}' 2>/dev/null || true
+}
+
+# True when Podman's API answers: on Linux the systemd socket (podman.socket), on macOS the machine
+engine_socket_ok() {
+  local state m
+  if [ "$OS_KIND" = "Darwin" ]; then
+    m="$(mac_machine)"
+    state=""
+    if [ -n "$m" ]; then
+      state="$(podman machine inspect --format '{{.State}}' "$m" 2>/dev/null)" || state=""
+    fi
+    [ "${state%%$'\n'*}" = "running" ]
+  elif command -v systemctl >/dev/null 2>&1; then
+    systemctl is-active --quiet podman.socket
+  else
+    [ -S /run/podman/podman.sock ]
+  fi
+}
+
+# The Podman machine the stack uses (macOS): the running one, else podman-machine-default, else the first
+mac_machine() {
+  local name running first="" def=""
+  while IFS='|' read -r name running; do
+    name="${name%\*}"
+    if [ -z "$name" ]; then
+      continue
+    fi
+    if [ "$running" = "true" ]; then
+      printf '%s' "$name"
+      return 0
+    fi
+    if [ -z "$first" ]; then
+      first="$name"
+    fi
+    if [ "$name" = "podman-machine-default" ]; then
+      def="$name"
+    fi
+  done < <(podman machine list --format '{{.Name}}|{{.Running}}' 2>/dev/null)
+  printf '%s' "${def:-$first}"
+}
+
+# The kernel the containers run on: this machine's, or the Podman machine's on macOS
+engine_kernel() {
+  if [ "$OS_KIND" = "Darwin" ]; then
+    podman info --format '{{.Host.Kernel}}' 2>/dev/null || true
+  else
+    uname -r 2>/dev/null || true
+  fi
+}
+
+# amd64 or arm64 (an Apple Silicon Mac counts as arm64 even when the shell runs under Rosetta)
+engine_arch() {
+  local m
+  if [ "$OS_KIND" = "Darwin" ]; then
+    if [ "$(sysctl -n hw.optional.arm64 2>/dev/null)" = "1" ]; then
+      printf 'arm64'
+    else
+      printf 'amd64'
+    fi
+    return 0
+  fi
+  m="$(uname -m 2>/dev/null)" || m=""
+  case "$m" in
+    x86_64|amd64) printf 'amd64' ;;
+    aarch64|arm64) printf 'arm64' ;;
+    *) printf '%s' "$m" ;;
   esac
-  return 1
+}
+
+# short_ref docker.io/library/mongo:8 -> mongo:8 (the inverse of qualify_ref)
+short_ref() {
+  local r="${1#docker.io/library/}"
+  printf '%s' "${r#docker.io/}"
+}
+
+# use_sudo -> SUDO=() as root and on macOS (Homebrew, the Podman machine and ~/.docker belong to the
+# user), SUDO=(sudo) otherwise; 1 when there is no sudo
+use_sudo() {
+  if [ "$OS_KIND" = "Darwin" ] || [ "$(id -u)" -eq 0 ]; then
+    SUDO=()
+  elif command -v sudo >/dev/null 2>&1; then
+    SUDO=(sudo)
+  else
+    return 1
+  fi
+}
+
+# True when Podman is ready for the stack (quiet; for the menu): installed, rootful, compose there
+engine_ready() {
+  command -v podman >/dev/null 2>&1 && [ "$(engine_rootless)" = "false" ] && detect_compose >/dev/null 2>&1
 }
 
 detect_compose() {
@@ -395,42 +481,494 @@ detect_compose() {
   if [ "${#COMPOSE[@]}" -gt 0 ]; then
     return 0
   fi
-  if docker compose version >/dev/null 2>&1; then
-    COMPOSE=(docker compose)
-  elif command -v docker-compose >/dev/null 2>&1; then
-    # The generated file has no "version:" key, which needs docker-compose 1.27 or newer.
-    v="$(docker-compose version --short 2>/dev/null)" || v=""
-    v="${v#v}"
-    case "$v" in
-      1.2[7-9]*|[2-9]*) COMPOSE=(docker-compose) ;;
-      *)
-        COMPOSE_PROBLEM="docker-compose ${v:-(unknown version)} is too old (1.27 or newer needed) - install the Compose plugin: $(pkg_hint "$(compose_package)")"
-        return 1
-        ;;
-    esac
-  else
-    COMPOSE_PROBLEM="Docker Compose is not available (neither 'docker compose' nor 'docker-compose') - install the Compose plugin: $(pkg_hint "$(compose_package)")"
+  if ! command -v podman >/dev/null 2>&1; then
+    COMPOSE_PROBLEM="Podman is not installed - './$SCRIPT_NAME install-podman' installs it (option 16 shows the commands)."
     return 1
   fi
+  v="$(podman_version)"
+  if [ -z "$v" ] || version_gt "$PODMAN_MIN" "$v"; then
+    COMPOSE_PROBLEM="Podman ${v:-(unknown version)} is too old: $PODMAN_MIN or newer is needed ('podman compose' came with 4.7; Debian 12 has 4.3 - use Debian 13)."
+    return 1
+  fi
+  if [ ! -x "$COMPOSE_PROVIDER" ]; then
+    COMPOSE_PROBLEM="Docker Compose, the engine behind 'podman compose', is missing ($COMPOSE_PROVIDER) - './$SCRIPT_NAME install-podman' installs the newest one."
+    return 1
+  fi
+  v="$("$COMPOSE_PROVIDER" version 2>/dev/null)" || v=""
+  case "${v%%$'\n'*}" in
+    "Docker Compose version v"*) ;;
+    *)
+      COMPOSE_PROBLEM="$COMPOSE_PROVIDER is not Docker Compose - './$SCRIPT_NAME install-podman' installs it."
+      return 1
+      ;;
+  esac
+  export PODMAN_COMPOSE_PROVIDER="$COMPOSE_PROVIDER"
+  COMPOSE=(podman compose)
 }
 
-require_docker() {
-  if ! command -v docker >/dev/null 2>&1; then
-    err "Docker is not installed (or not in PATH) - option 16 shows how to install it."
+require_podman() {
+  if ! command -v podman >/dev/null 2>&1; then
+    err "Podman is not installed - './$SCRIPT_NAME install-podman' installs it (option 16 shows the commands)."
     return 1
   fi
-  if docker_is_podman; then
-    err "'docker' on this server is Podman (podman-docker), which this installer does not support - option 16 shows how to install Docker Engine."
+  if [ "$OS_KIND" != "Darwin" ] && [ "$(engine_arch)" != "amd64" ]; then
+    err "The Catalog images exist only for amd64 (x86_64); this machine is $(uname -m 2>/dev/null)."
     return 1
   fi
-  if ! docker info >/dev/null 2>&1; then
-    err "Cannot reach the Docker daemon. Is Docker running, and is your user in the 'docker' group?"
+  if [ "$OS_KIND" = "Darwin" ] && ! engine_socket_ok; then
+    err "The Podman machine is not running - start it: podman machine start $(mac_machine)"
+    return 1
+  fi
+  if ! podman info >/dev/null 2>&1; then
+    err "Podman does not answer (podman info failed)."
+    return 1
+  fi
+  if [ "$(engine_rootless)" != "false" ]; then
+    if [ "$OS_KIND" = "Darwin" ]; then
+      err "The Podman machine is rootless; the Catalog needs it rootful: podman machine stop && podman machine set --rootful && podman machine start"
+    else
+      err "Run $SCRIPT_NAME as root (sudo): the Catalog runs with rootful Podman."
+    fi
+    return 1
+  fi
+  if [ "$OS_KIND" != "Darwin" ] && ! engine_socket_ok; then
+    err "The Podman API socket is not active - start it: systemctl enable --now podman.socket"
     return 1
   fi
   if ! detect_compose; then
     err "$COMPOSE_PROBLEM"
     return 1
   fi
+}
+
+###############################################################################
+# Install Podman and the newest Docker Compose (the engine behind "podman compose")
+###############################################################################
+
+# podman_install_plan -> the commands (as root, one per line) that install Podman on this Linux.
+# 2 (the reason on stderr) when Podman cannot run the Catalog here.
+podman_install_plan() {
+  local id like ver pkgs="podman netavark aardvark-dns"
+  id="$(os_release ID)"
+  like=" $(os_release ID_LIKE) "
+  ver="$(os_release VERSION_ID)"
+  if [ "$(engine_arch)" != "amd64" ]; then
+    echo "The Catalog images exist only for amd64 (x86_64); this machine is $(uname -m 2>/dev/null)." >&2
+    return 2
+  fi
+  if ! command -v curl >/dev/null 2>&1; then
+    pkgs="$pkgs curl"
+  fi
+  case "$id $like" in
+    ubuntu*|*" ubuntu "*)
+      if [ "$id" = "ubuntu" ] && [ -n "$ver" ] && version_gt "24.04" "$ver"; then
+        echo "Ubuntu $ver has no Podman 4.9 or newer - use Ubuntu 24.04 or newer." >&2
+        return 2
+      fi
+      echo "apt-get update"
+      echo "DEBIAN_FRONTEND=noninteractive apt-get install -y $pkgs"
+      ;;
+    debian*|*" debian "*)
+      if [ "$id" = "debian" ] && [[ "$ver" =~ ^[0-9]+$ ]] && [ "$ver" -lt 13 ]; then
+        echo "Debian $ver has Podman 4.3, without 'podman compose' - use Debian 13 or newer." >&2
+        return 2
+      fi
+      echo "apt-get update"
+      echo "DEBIAN_FRONTEND=noninteractive apt-get install -y $pkgs"
+      ;;
+    *)
+      if command -v dnf >/dev/null 2>&1; then
+        echo "dnf install -y $pkgs"
+      elif command -v yum >/dev/null 2>&1; then
+        echo "The Podman of this Linux (RHEL/CentOS 7) is too old - use version 8 or newer." >&2
+        return 2
+      elif command -v zypper >/dev/null 2>&1; then
+        echo "zypper -n install ${pkgs/ netavark aardvark-dns/}"
+      else
+        echo "This Linux is not covered - install Podman $PODMAN_MIN or newer with its package manager." >&2
+        return 2
+      fi
+      ;;
+  esac
+}
+
+# The systemd units the stack needs: the API socket for "podman compose", and the restart of the
+# containers after a reboot
+podman_service_plan() {
+  echo "systemctl enable --now podman.socket"
+  echo "systemctl enable podman-restart.service"
+  # Podman before 5.3 ignores PODMAN_COMPOSE_WARNING_LOGS: its notice on every podman compose goes off here
+  echo "mkdir -p /etc/containers/containers.conf.d && printf '[engine]\\ncompose_warning_logs = false\\n' > /etc/containers/containers.conf.d/50-rn1-compose.conf"
+}
+
+# run_plan "STEP" ... -> runs each step as root (sudo when needed), stops at the first failure
+run_plan() {
+  local step n=0
+  for step in "$@"; do
+    n=$((n + 1))
+    info "Step $n of $#: $step"
+    if ! ${SUDO[@]+"${SUDO[@]}"} sh -c "$step"; then
+      err "Step $n failed (see above)."
+      return 1
+    fi
+  done
+}
+
+# The tag of the newest Docker Compose release (v5.6.0), from the redirect of GitHub's latest-release page
+compose_latest_tag() {
+  local head
+  head="$(curl -fsSI --max-time 20 https://github.com/docker/compose/releases/latest 2>/dev/null)" || head=""
+  head="$(printf '%s\n' "$head" | tr -d '\r' | sed -n 's#^[Ll]ocation: .*/releases/tag/##p')"
+  printf '%s' "${head%%$'\n'*}"
+}
+
+# install_compose_provider ask|yes -> keeps Docker Compose (the engine behind "podman compose") at the
+# newest release: downloads it from GitHub, checks the checksum and that it works with this Podman.
+# A newest release that does not work here is not installed: the previous one stays.
+install_compose_provider() {
+  local mode="$1" tag have os arch url tmp exp got v rc
+  if ! command -v curl >/dev/null 2>&1; then
+    err "curl is needed to download Docker Compose ($(pkg_hint curl))."
+    return 1
+  fi
+  tag="$(compose_latest_tag)"
+  have=""
+  if [ -x "$COMPOSE_PROVIDER" ]; then
+    have="$("$COMPOSE_PROVIDER" version --short 2>/dev/null)" || have=""
+    have="${have#v}"
+  fi
+  if [ -z "$tag" ]; then
+    if [ -n "$have" ]; then
+      warn "GitHub cannot be reached - Docker Compose $have stays."
+      return 0
+    fi
+    err "GitHub cannot be reached, and Docker Compose (the engine behind 'podman compose') is missing."
+    echo "  On a server without internet, use an offline bundle: it carries Docker Compose."
+    return 1
+  fi
+  if [ "$have" = "${tag#v}" ]; then
+    ok "Docker Compose ${tag#v} (the newest) runs 'podman compose'."
+    return 0
+  fi
+  info "Docker Compose ${tag#v} is the newest release${have:+ (installed: $have)}; 'podman compose' runs it."
+  if [ "$mode" = "ask" ] && ! confirm "Install Docker Compose ${tag#v} from github.com/docker/compose?" y; then
+    info "Docker Compose was not changed."
+    [ -n "$have" ]
+    return
+  fi
+  case "$OS_KIND" in
+    Darwin) os="darwin" ;;
+    *) os="linux" ;;
+  esac
+  case "$(engine_arch)" in
+    arm64) arch="aarch64" ;;
+    *) arch="x86_64" ;;
+  esac
+  url="https://github.com/docker/compose/releases/download/$tag/docker-compose-$os-$arch"
+  # the download lands next to its target: a /tmp mounted noexec could not run the checks below
+  if ! ${SUDO[@]+"${SUDO[@]}"} mkdir -p "${COMPOSE_PROVIDER%/*}" \
+    || ! tmp="$(${SUDO[@]+"${SUDO[@]}"} mktemp "${COMPOSE_PROVIDER%/*}/.docker-compose.XXXXXX")"; then
+    err "Cannot write to ${COMPOSE_PROVIDER%/*}."
+    return 1
+  fi
+  if ! ${SUDO[@]+"${SUDO[@]}"} curl -fsSL --proto '=https' --max-time 600 -o "$tmp" "$url"; then
+    ${SUDO[@]+"${SUDO[@]}"} rm -f -- "$tmp"
+    err "The download failed: $url"
+    return 1
+  fi
+  exp="$(curl -fsSL --proto '=https' --max-time 30 "$url.sha256" 2>/dev/null)" || exp=""
+  exp="${exp%% *}"
+  got="$(sha256sum "$tmp" 2>/dev/null)" || got="$(shasum -a 256 "$tmp" 2>/dev/null)" || got=""
+  got="${got%% *}"
+  if [ -z "$exp" ] || [ "$exp" != "$got" ]; then
+    ${SUDO[@]+"${SUDO[@]}"} rm -f -- "$tmp"
+    err "The checksum of $url does not match - nothing was installed."
+    return 1
+  fi
+  ${SUDO[@]+"${SUDO[@]}"} chmod 755 "$tmp"
+  rc=0
+  v="$("$tmp" version 2>/dev/null)" || rc=$?
+  case "${v%%$'\n'*}" in
+    "Docker Compose version v"*) ;;
+    *)
+      ${SUDO[@]+"${SUDO[@]}"} rm -f -- "$tmp"
+      if [ "$rc" -eq 126 ]; then
+        err "Programs cannot run from ${COMPOSE_PROVIDER%/*} (mounted noexec?) - nothing was installed."
+      else
+        err "The download is not Docker Compose - nothing was installed."
+      fi
+      return 1
+      ;;
+  esac
+  # try it against this Podman first: a release that needs a newer Podman API is not installed
+  if engine_socket_ok && [ "$(engine_rootless)" = "false" ] && ! PODMAN_COMPOSE_PROVIDER="$tmp" podman compose ls -q >/dev/null 2>&1; then
+    ${SUDO[@]+"${SUDO[@]}"} rm -f -- "$tmp"
+    if [ -n "$have" ]; then
+      warn "Docker Compose ${tag#v} does not work with Podman $(podman_version) here - Docker Compose $have stays."
+      return 0
+    fi
+    err "Docker Compose ${tag#v} does not work with Podman $(podman_version) here."
+    return 1
+  fi
+  if [ -n "$have" ]; then
+    ${SUDO[@]+"${SUDO[@]}"} cp -p -- "$COMPOSE_PROVIDER" "$COMPOSE_PROVIDER.previous" 2>/dev/null || true
+  fi
+  if ! ${SUDO[@]+"${SUDO[@]}"} mv -f -- "$tmp" "$COMPOSE_PROVIDER"; then
+    ${SUDO[@]+"${SUDO[@]}"} rm -f -- "$tmp"
+    err "Cannot write $COMPOSE_PROVIDER."
+    return 1
+  fi
+  COMPOSE=()
+  ok "Docker Compose ${tag#v} installed ($COMPOSE_PROVIDER); 'podman compose' runs it."
+}
+
+# install_podman_linux ask|yes -> Podman with its socket and restart service on this Linux
+install_podman_linux() {
+  local mode="$1" plan="" v="" rc=0
+  local -a steps=()
+  if [ "$(engine_arch)" != "amd64" ]; then
+    err "The Catalog images exist only for amd64 (x86_64); this machine is $(uname -m 2>/dev/null)."
+    return 1
+  fi
+  if [ ! -d "${RN1_SYSTEMD_DIR:-/run/systemd/system}" ]; then
+    err "This Linux does not run systemd, which rootful Podman needs here (API socket, restart after a reboot)."
+    return 1
+  fi
+  if command -v podman >/dev/null 2>&1; then
+    v="$(podman_version)"
+    if [ -z "$v" ] || version_gt "$PODMAN_MIN" "$v"; then
+      err "Podman ${v:-(unknown version)} is too old: $PODMAN_MIN or newer is needed. Update it with the package manager."
+      return 1
+    fi
+  else
+    plan="$(podman_install_plan)" || rc=$?
+    if [ "$rc" -ne 0 ]; then
+      err "Podman cannot be installed here by the installer."
+      return 1
+    fi
+    mapfile -t steps <<< "$plan"
+  fi
+  mapfile -t -O "${#steps[@]}" steps < <(podman_service_plan)
+  echo
+  info "Podman $(if [ -n "$plan" ]; then printf 'is installed from the packages of %s, then its' "$(os_release PRETTY_NAME)"; else printf '%s is installed; its' "$(podman_version)"; fi) API socket and restart service are enabled:"
+  printf '      %s\n' "${steps[@]}"
+  if [ "$mode" = "ask" ] && ! confirm "Run these commands${SUDO[*]:+ with sudo}?" y; then
+    info "Podman was not set up."
+    return 1
+  fi
+  run_plan "${steps[@]}" || return 1
+  COMPOSE=()
+  ok "Podman $(podman_version) is ready (rootful, API socket on, containers restart after a reboot)."
+}
+
+# The LaunchAgent that starts the Podman machine when the user logs in (macOS)
+MAC_AGENT="$HOME/Library/LaunchAgents/de.raynet.rn1-podman-machine.plist"
+
+# The type of a Podman machine (applehv, libkrun, ...)
+mac_vmtype() {
+  local name type
+  while IFS='|' read -r name type; do
+    if [ "${name%\*}" = "$1" ]; then
+      printf '%s' "$type"
+      return 0
+    fi
+  done < <(podman machine list --format '{{.Name}}|{{.VMType}}' 2>/dev/null)
+}
+
+# True when Rosetta runs amd64 programs in the Podman machine NAME
+mac_rosetta_on() {
+  local s
+  s="$(podman machine ssh "$1" cat /proc/sys/fs/binfmt_misc/rosetta 2>/dev/null)" || s=""
+  [ "${s%%$'\n'*}" = "enabled" ]
+}
+
+# mac_agent NAME -> the LaunchAgent that starts the Podman machine NAME at login. launchd stops what a
+# job leaves behind unless AbandonProcessGroup is set - the machine would stop right after its start.
+mac_agent() {
+  cat <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>de.raynet.rn1-podman-machine</string>
+  <key>ProgramArguments</key><array><string>$(command -v podman)</string><string>machine</string><string>start</string><string>$1</string></array>
+  <key>RunAtLoad</key><true/>
+  <key>AbandonProcessGroup</key><true/>
+</dict>
+</plist>
+EOF
+}
+
+# mac_prepare ask|yes -> Homebrew packages, a rootful Podman machine with enough memory and Rosetta,
+# vm.max_map_count and the restart service in it, and the LaunchAgent
+mac_prepare() {
+  local mode="$1" t mem cpus ram name rootful state type osver
+  local -a missing=()
+  if [ "$(engine_arch)" != "arm64" ]; then
+    err "Intel Macs are not supported: Podman runs only on Apple Silicon (M1 or newer)."
+    return 1
+  fi
+  if [ "$(id -u)" -eq 0 ]; then
+    err "On macOS run $SCRIPT_NAME as your normal user, not as root: the Podman machine belongs to the user."
+    return 1
+  fi
+  # Rosetta runs the amd64 Catalog images; with the Linux kernel of current Podman machines it works
+  # only from macOS 26
+  osver="$(sw_vers -productVersion 2>/dev/null)" || osver=""
+  if [[ "${osver%%.*}" =~ ^[0-9]+$ ]] && [ "${osver%%.*}" -lt 26 ]; then
+    err "macOS $osver is too old for the Catalog: macOS 26 (Tahoe) or newer is needed."
+    echo "  The Catalog images are amd64; Rosetta runs them in the Podman machine, and with its Linux kernel"
+    echo "  Rosetta works only from macOS 26."
+    return 1
+  fi
+  if ! command -v brew >/dev/null 2>&1; then
+    err "Homebrew is needed: install it from https://brew.sh, then start $SCRIPT_NAME again."
+    return 1
+  fi
+  command -v podman >/dev/null 2>&1 || missing+=(podman)
+  for t in coreutils gnu-sed grep findutils; do
+    if [ ! -d "$(brew --prefix 2>/dev/null)/opt/$t" ]; then
+      missing+=("$t")
+    fi
+  done
+  if [ "${#missing[@]}" -gt 0 ]; then
+    info "Homebrew installs: ${missing[*]}"
+    echo "      brew install ${missing[*]}"
+    if [ "$mode" = "ask" ] && ! confirm "Run it now?" y; then
+      info "Nothing was installed."
+      return 1
+    fi
+    brew install "${missing[@]}" || return 1
+    # the GNU tools count from now on, not only from the next start
+    mac_gnu_path
+  fi
+  # the Catalog images are amd64: Apple's hypervisor with Rosetta runs them
+  t="$HOME/.config/containers/containers.conf.d/50-rn1-machine.conf"
+  if [ ! -f "$t" ]; then
+    mkdir -p "${t%/*}"
+    printf '%s\n' '[machine]' 'provider = "applehv"' 'rosetta = true' > "$t"
+  fi
+  name="$(mac_machine)"
+  if [ -z "$name" ]; then
+    ram="$(sysctl -n hw.memsize 2>/dev/null)" || ram=0
+    cpus="$(sysctl -n hw.ncpu 2>/dev/null)" || cpus=4
+    if [ "$cpus" -gt 6 ]; then
+      cpus=6
+    fi
+    mem=8192
+    if [ "$ram" -ge $((24 * 1024 * 1024 * 1024)) ]; then
+      mem=12288
+    elif [ "$ram" -lt $((16 * 1024 * 1024 * 1024)) ]; then
+      warn "This Mac has less than 16 GB of memory; the Catalog needs about 8 GB in the Podman machine."
+    fi
+    info "A Podman machine (Linux VM) is created: rootful, $cpus CPUs, $((mem / 1024)) GB memory, 100 GB disk."
+    echo "      podman machine init --rootful --cpus $cpus --memory $mem --disk-size 100 --now"
+    if [ "$mode" = "ask" ] && ! confirm "Create it now?" y; then
+      info "No Podman machine was created."
+      return 1
+    fi
+    podman machine init --rootful --cpus "$cpus" --memory "$mem" --disk-size 100 --now || return 1
+    name="$(mac_machine)"
+    name="${name:-podman-machine-default}"
+  else
+    type="$(mac_vmtype "$name")"
+    if [ -n "$type" ] && [ "$type" != "applehv" ]; then
+      err "The Podman machine $name runs with $type, which cannot use Rosetta for the amd64 Catalog images."
+      echo "  The Catalog needs a machine with Apple's hypervisor. Removing $name deletes its containers and data:"
+      echo "      podman machine rm $name, then start $SCRIPT_NAME again."
+      return 1
+    fi
+    rootful="$(podman machine inspect --format '{{.Rootful}}' "$name" 2>/dev/null)" || rootful=""
+    state="$(podman machine inspect --format '{{.State}}' "$name" 2>/dev/null)" || state=""
+    if [ "${rootful%%$'\n'*}" != "true" ]; then
+      info "The Podman machine $name runs rootless; the Catalog needs it rootful."
+      if [ "$mode" = "ask" ] && ! confirm "Switch it to rootful (it restarts)?" y; then
+        return 1
+      fi
+      podman machine stop "$name" >/dev/null 2>&1 || true
+      podman machine set --rootful "$name" || return 1
+      state="stopped"
+    fi
+    if [ "${state%%$'\n'*}" != "running" ]; then
+      podman machine start "$name" || return 1
+    fi
+    mem="$(podman machine inspect --format '{{.Resources.Memory}}' "$name" 2>/dev/null)" || mem=0
+    if [[ "${mem%%$'\n'*}" =~ ^[0-9]+$ ]] && [ "${mem%%$'\n'*}" -lt 8192 ]; then
+      warn "The Podman machine has ${mem%%$'\n'*} MB of memory; the Catalog needs 8192 MB. A bigger machine means a new one"
+      echo "      (its containers and data are lost): podman machine rm $name, then start $SCRIPT_NAME again."
+    fi
+  fi
+  if ! mac_rosetta_on "$name"; then
+    info "Rosetta is not active in the Podman machine $name; turning it on restarts the machine."
+    if [ "$mode" = "ask" ] && ! confirm "Restart the Podman machine now?" y; then
+      return 1
+    fi
+    # Podman 5.6 to 5.8 also wants this file in the machine
+    podman machine ssh "$name" sudo touch /etc/containers/enable-rosetta >/dev/null 2>&1 || true
+    podman machine stop "$name" >/dev/null 2>&1 || true
+    podman machine start "$name" || return 1
+    if ! mac_rosetta_on "$name"; then
+      err "Rosetta does not run in the Podman machine $name, and the Catalog images (amd64) need it."
+      echo "  Update Podman (brew upgrade podman), or create a new machine (its containers and data are lost):"
+      echo "      podman machine rm $name, then start $SCRIPT_NAME again."
+      return 1
+    fi
+  fi
+  podman machine ssh "$name" sudo systemctl enable podman-restart.service >/dev/null 2>&1 || true
+  t="$(podman machine ssh "$name" sysctl -n vm.max_map_count 2>/dev/null)" || t=0
+  t="${t//[^0-9]/}"
+  if [ "${t:-0}" -lt 262144 ]; then
+    podman machine ssh "$name" "sudo sh -c 'echo vm.max_map_count=262144 > /etc/sysctl.d/99-opensearch.conf && sysctl --system'" >/dev/null 2>&1 || true
+  fi
+  if [ ! -f "$MAC_AGENT" ]; then
+    info "The Podman machine does not start by itself after a restart of the Mac. A LaunchAgent can start it"
+    echo "  when you log in; the Catalog then comes back by itself ($MAC_AGENT)."
+    if [ "$mode" = "yes" ] || confirm "Add the LaunchAgent?" y; then
+      mkdir -p "${MAC_AGENT%/*}"
+      mac_agent "$name" > "$MAC_AGENT"
+      launchctl load -w "$MAC_AGENT" >/dev/null 2>&1 || true
+      ok "LaunchAgent added: the Podman machine starts when you log in."
+    fi
+  elif [ "$(mac_agent "$name")" != "$(cat "$MAC_AGENT" 2>/dev/null)" ]; then
+    # an older LaunchAgent, or one for another machine or Podman: brought up to date
+    launchctl unload "$MAC_AGENT" >/dev/null 2>&1 || true
+    mac_agent "$name" > "$MAC_AGENT"
+    launchctl load -w "$MAC_AGENT" >/dev/null 2>&1 || true
+    ok "LaunchAgent updated: it starts the Podman machine $name when you log in."
+  fi
+  COMPOSE=()
+}
+
+# podman_offer -> in a terminal: when Podman is not ready, says why and offers to set it up
+podman_offer() {
+  if [ ! -t 0 ] || engine_ready; then
+    return 0
+  fi
+  if [ "$OS_KIND" != "Darwin" ] && [ "$(id -u)" -ne 0 ]; then
+    warn "Prerequisites are not met: run $SCRIPT_NAME as root (sudo) - the Catalog uses rootful Podman."
+    echo
+    return 0
+  fi
+  detect_compose >/dev/null 2>&1 || true
+  warn "Prerequisites are not met: ${COMPOSE_PROBLEM:-Podman is not ready for the Catalog}"
+  podman_setup ask || true
+  echo
+}
+
+# podman_setup ask|yes -> everything the stack needs: Podman, its services or machine, and Docker Compose
+podman_setup() {
+  local mode="${1:-ask}"
+  if ! use_sudo; then
+    err "Setting up Podman needs root: run $SCRIPT_NAME as root, or install sudo."
+    return 1
+  fi
+  if [ "$OS_KIND" = "Darwin" ]; then
+    mac_prepare "$mode" || return 1
+  else
+    install_podman_linux "$mode" || return 1
+  fi
+  install_compose_provider "$mode" || return 1
+  require_podman
 }
 
 compose() {
@@ -448,13 +986,12 @@ require_files() {
   fi
 }
 
-# Docker volumes that already belong to this Compose project (empty if none
-# or if Docker cannot be reached).
+# Volumes that already belong to this Compose project (empty if none, or if Podman cannot be reached).
 project_volumes() {
-  if ! command -v docker >/dev/null 2>&1; then
+  if ! command -v podman >/dev/null 2>&1; then
     return 0
   fi
-  docker volume ls -q --filter "label=com.docker.compose.project=$(stack_project)" 2>/dev/null || true
+  podman volume ls -q --filter "label=com.docker.compose.project=$(stack_project)" 2>/dev/null || true
 }
 
 # True when the generated files differ from what the current settings would
@@ -552,7 +1089,8 @@ kernel_upstream_version() {
 
 kernel_blocks_mongo8() {
   local release major minor patch
-  release="$(uname -r 2>/dev/null)" || return 1
+  release="$(engine_kernel)"
+  [ -n "$release" ] || return 1
   if ! [[ "$release" =~ ^([0-9]+)\.([0-9]+)(\.([0-9]+))? ]]; then
     return 1
   fi
@@ -1387,7 +1925,7 @@ pick_component() {
           *) warn "MongoDB $sel_major.0 can only be reached from $cur_major.0 or $last_series - upgrade to $(grep -F "$last_series." <<< "$versions" | head -n 1) first." ;;
         esac
         ;;
-      rabbitmq) warn "Before RabbitMQ $cur_major.x -> $sel_major.x enable all feature flags: docker compose exec rabbitmq rabbitmqctl enable_feature_flag all" ;;
+      rabbitmq) warn "Before RabbitMQ $cur_major.x -> $sel_major.x enable all feature flags (with the stack running): podman exec rabbitmq rabbitmqctl enable_feature_flag all" ;;
       *) warn "$C_LABEL $cur_major.x -> $sel_major.x is a major upgrade - check its release notes." ;;
     esac
     if ! confirm "Select $(version_core "$selected")?" n; then
@@ -1396,7 +1934,7 @@ pick_component() {
     fi
   fi
   if [ "$key" = "mongo" ] && [[ "$sel_major" =~ ^[0-9]+$ ]] && [ "$sel_major" -ge 8 ] && kernel_blocks_mongo8; then
-    info "MongoDB $sel_major on this kernel ($(uname -r)) starts with GLIBC_TUNABLES=glibc.pthread.rseq=1 (SERVER-121912);"
+    info "MongoDB $sel_major on this kernel ($(engine_kernel)) starts with GLIBC_TUNABLES=glibc.pthread.rseq=1 (SERVER-121912);"
     info "the generated files get it by themselves."
   fi
   for setting in $C_SETTINGS; do
@@ -1498,9 +2036,7 @@ show_updates_cli() {
 # Offline bundle
 
 container_engine() {
-  if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
-    printf 'docker'
-  elif command -v podman >/dev/null 2>&1; then
+  if command -v podman >/dev/null 2>&1 && podman info >/dev/null 2>&1; then
     printf 'podman'
   else
     return 1
@@ -1545,11 +2081,7 @@ progress_bar() {
 # save_image ENGINE REF FILE EXPECTED_BYTES [LABEL]
 save_image() {
   local engine="$1" ref="$2" out="$3" total="$4" label="${5:-Saving}" pid cur
-  if [ "$engine" = "podman" ]; then
-    podman save --format docker-archive -o "$out" "$ref" &
-  else
-    docker save -o "$out" "$ref" &
-  fi
+  podman save --format docker-archive -o "$out" "$ref" &
   pid=$!
   if [ -n "$JOB_DIR" ]; then
     job_watch_bytes "$pid" "$out" "$total" "$label"
@@ -1588,22 +2120,32 @@ fi
 set -euo pipefail
 cd -- "$(dirname -- "$(readlink -f -- "$0")")"
 
-engine="${1:-}"
-if [ -z "$engine" ]; then
-  if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
-    engine="docker"
-  elif command -v podman >/dev/null 2>&1; then
-    engine="podman"
-  else
-    echo "ERROR Neither docker nor podman is available on this machine." >&2
-    exit 1
-  fi
+engine="podman"
+if ! command -v podman >/dev/null 2>&1; then
+  echo "ERROR Podman is not installed on this machine - the installer sets it up (install-podman)." >&2
+  exit 1
+fi
+if [ "$(uname -s)" = "Linux" ] && [ "$(id -u)" -ne 0 ]; then
+  echo "ERROR Run it as root (sudo ./import-images.sh): the Catalog runs in the Podman of root, which does not see images loaded by $(id -un)." >&2
+  exit 1
 fi
 echo "==> Container engine: $engine"
 
+# Docker Hub names as Podman stores them (podman tag with a short name would create localhost/...)
+qualify() {
+  local first="${1%%/*}"
+  if [[ "$1" == */* ]] && { [[ "$first" == *.* ]] || [[ "$first" == *:* ]] || [ "$first" = "localhost" ]; }; then
+    printf '%s' "$1"
+  elif [[ "$1" == */* ]]; then
+    printf 'docker.io/%s' "$1"
+  else
+    printf 'docker.io/library/%s' "$1"
+  fi
+}
+
 if command -v sha256sum >/dev/null 2>&1; then
   echo "==> Verifying the image files (SHA256SUMS)"
-  if ! awk '$2 ~ /^[*]?images(\/|\.txt$)/' SHA256SUMS | sha256sum -c --quiet -; then
+  if ! awk '$2 ~ /^[*]?(images|compose)(\/|\.txt$)/' SHA256SUMS | sha256sum -c --quiet -; then
     echo "ERROR Checksum mismatch - copy the bundle again." >&2
     exit 1
   fi
@@ -1621,15 +2163,16 @@ while IFS='|' read -r ref file id; do
     continue
   fi
   echo "==> $ref"
+  qref="$(qualify "$ref")"
   if ! "$engine" load -i "$file" >/dev/null; then
     echo "ERROR Loading $file failed" >&2
     failed=$((failed + 1))
     continue
   fi
-  if ! "$engine" image inspect "$ref" >/dev/null 2>&1; then
-    "$engine" tag "$id" "$ref" >/dev/null 2>&1 || true
+  if ! "$engine" image inspect "$qref" >/dev/null 2>&1; then
+    "$engine" tag "$id" "$qref" >/dev/null 2>&1 || true
   fi
-  if "$engine" image inspect "$ref" >/dev/null 2>&1; then
+  if "$engine" image inspect "$qref" >/dev/null 2>&1; then
     echo " OK $ref"
     loaded=$((loaded + 1))
   else
@@ -1640,6 +2183,28 @@ done < images.txt
 
 echo
 echo "$loaded image(s) loaded, $failed failed."
+# the API socket "podman compose" needs, and the restart of the containers after a reboot
+if [ "$(uname -s)" = "Linux" ] && command -v systemctl >/dev/null 2>&1 && [ -d "${RN1_SYSTEMD_DIR:-/run/systemd/system}" ]; then
+  systemctl enable --now podman.socket >/dev/null 2>&1 || echo "WARNING podman.socket could not be started: systemctl enable --now podman.socket" >&2
+  systemctl enable podman-restart.service >/dev/null 2>&1 || true
+fi
+# Docker Compose (the engine behind "podman compose") from the bundle, when this server has none or
+# another one - the installed one stays when the bundled one does not work with this Podman
+if [ -f compose/docker-compose-linux-x86_64 ] && [ "$(id -u)" -eq 0 ]; then
+  target="${RN1_COMPOSE_TARGET:-/usr/local/lib/docker/cli-plugins/docker-compose}"
+  if [ ! -x "$target" ] || ! cmp -s compose/docker-compose-linux-x86_64 "$target"; then
+    if [ -x "$target" ] && ! PODMAN_COMPOSE_PROVIDER="$PWD/compose/docker-compose-linux-x86_64" PODMAN_COMPOSE_WARNING_LOGS=false podman compose ls -q >/dev/null 2>&1; then
+      echo "WARNING The Docker Compose of the bundle does not work with this Podman - the installed one stays." >&2
+    else
+      mkdir -p "${target%/*}"
+      if [ -x "$target" ]; then
+        cp -p "$target" "$target.previous"
+      fi
+      install -m 755 compose/docker-compose-linux-x86_64 "$target"
+      echo " OK Docker Compose installed: $target"
+    fi
+  fi
+fi
 if [ "$failed" -gt 0 ]; then
   exit 1
 fi
@@ -1647,6 +2212,38 @@ echo "Next: ./@INSTALLER@  (menu option 7: generate + validate + start)"
 IMPORT_EOF
   sed -i "s/@INSTALLER@/$installer/" "$file"
   chmod +x "$file"
+}
+
+# bundle_compose DIR -> DIR/compose/docker-compose-linux-x86_64: the newest Docker Compose for the
+# offline server (the engine behind "podman compose"); import-images.sh installs it there
+bundle_compose() {
+  local dir="$1" tag url exp got
+  if ! command -v curl >/dev/null 2>&1; then
+    warn "curl is missing - the bundle has no Docker Compose ($(pkg_hint curl))."
+    return 1
+  fi
+  tag="$(compose_latest_tag)"
+  if [ -z "$tag" ]; then
+    warn "GitHub cannot be reached - the bundle has no Docker Compose (the offline server needs one)."
+    return 1
+  fi
+  url="https://github.com/docker/compose/releases/download/$tag/docker-compose-linux-x86_64"
+  mkdir -p -- "$dir/compose"
+  job_step "Downloading Docker Compose ${tag#v}"
+  info "Docker Compose ${tag#v} for the offline server"
+  if ! curl -fsSL --proto '=https' --max-time 600 -o "$dir/compose/docker-compose-linux-x86_64" "$url"; then
+    rm -rf -- "$dir/compose"
+    warn "Docker Compose could not be downloaded - the bundle has none."
+    return 1
+  fi
+  exp="$(curl -fsSL --proto '=https' --max-time 30 "$url.sha256" 2>/dev/null)" || exp=""
+  got="$(sha256sum -- "$dir/compose/docker-compose-linux-x86_64")"
+  if [ -z "$exp" ] || [ "${exp%% *}" != "${got%% *}" ]; then
+    rm -rf -- "$dir/compose"
+    warn "The checksum of Docker Compose does not match - the bundle has none."
+    return 1
+  fi
+  chmod 755 "$dir/compose/docker-compose-linux-x86_64"
 }
 
 # make_archive DIR -> DIR.tar.gz next to DIR, with a progress bar
@@ -1899,10 +2496,14 @@ scp_copy() {
     info "Verifying the copy on $SCP_HOST"
     if ${SCP_PASS[@]+"${SCP_PASS[@]}"} ssh "${SCP_OPTS[@]}" "$SCP_USER@$SCP_HOST" "$verify"; then
       ok "Copied to $SCP_USER@$SCP_HOST:$SCP_TARGET - checksums match."
+      local import="./import-images.sh"
+      if [ "$SCP_USER" != "root" ]; then
+        import="sudo ./import-images.sh"
+      fi
       if [ -d "$1" ]; then
-        echo "  On $SCP_HOST: cd $SCP_TARGET/$name && ./import-images.sh"
+        echo "  On $SCP_HOST: cd $SCP_TARGET/$name && $import"
       else
-        echo "  On $SCP_HOST: cd $SCP_TARGET && tar -xzf $name && cd ${name%.tar.gz} && ./import-images.sh"
+        echo "  On $SCP_HOST: cd $SCP_TARGET && tar -xzf $name && cd ${name%.tar.gz} && $import"
       fi
     else
       err "Checksum verification on $SCP_HOST failed - copy again."
@@ -1930,7 +2531,7 @@ download_bundle() {
   local mode="${1:-interactive}" engine ref choice tok base name dir count=0 i floating=0 archive_wanted="no" scp_wanted="no" scp_rc
   local -a images=() picked=() toks=() refs=()
   if ! engine="$(container_engine)"; then
-    err "Downloading needs docker or podman on this machine."
+    err "Downloading needs Podman on this machine ('./$SCRIPT_NAME install-podman' sets it up)."
     return 1
   fi
   while IFS= read -r ref; do
@@ -2057,7 +2658,7 @@ bundle_cleanup() {
 
 # Worker: bundle_build ENGINE DIR ARCHIVE SCP HOST SCPHOST PORT USER TARGET RT AUTH KEYFILE CTL SSHPASS REF...
 bundle_build() {
-  local engine="$1" dir="$2" archive_wanted="$3" scp_wanted="$4" base name ref pref id size free_kb file n=0 count installer archive="" secret
+  local engine="$1" dir="$2" archive_wanted="$3" scp_wanted="$4" base name ref pref id size free_kb file n=0 count installer archive="" secret old
   SCP_HOST="$5"
   SCP_SCPHOST="$6"
   SCP_PORT="$7"
@@ -2094,13 +2695,17 @@ bundle_build() {
     echo
     info "[$n/$count] $ref"
     pref="$(qualify_ref "$ref")"
+    old=""
+    if [ "$OS_KIND" = "Darwin" ]; then
+      old="$("$engine" image inspect --format '{{.ID}}' "$pref" 2>/dev/null)" || old=""
+    fi
     job_step "[$n/$count] Pulling $ref"
     if [ -n "$JOB_DIR" ]; then
       "$engine" pull -q --platform linux/amd64 "$pref"
     else
       "$engine" pull --platform linux/amd64 "$pref"
     fi
-    id="$("$engine" image inspect --format '{{.Id}}' "$pref")"
+    id="$("$engine" image inspect --format '{{.ID}}' "$pref")"
     id="${id#sha256:}"
     size="$("$engine" image inspect --format '{{.Size}}' "$pref")"
     free_kb="$(df -Pk -- "$dir" | awk 'NR == 2 { print $4 }')" || free_kb=0
@@ -2111,6 +2716,10 @@ bundle_build() {
     file="images/$(printf '%s' "$ref" | tr '/:' '__').tar"
     save_image "$engine" "$pref" "$dir/$file" "$size" "[$n/$count] Saving $ref"
     printf '%s|%s|%s\n' "$ref" "$file" "$id" >> "$dir/images.txt"
+    # the amd64 pull moved the tag of an image the local stack uses: it goes back to that image
+    if [ -n "$old" ] && [ "${old#sha256:}" != "$id" ]; then
+      "$engine" tag "$old" "$pref" >/dev/null 2>&1 || true
+    fi
   done
 
   installer=""
@@ -2122,15 +2731,16 @@ bundle_build() {
     chmod +x "$dir/$installer"
   fi
   write_import_script "$dir/import-images.sh" "${installer:-rn1-technology-catalog-installer.sh}"
+  bundle_compose "$dir" || true
   job_step "Writing SHA256SUMS"
-  (cd -- "$dir" && sha256sum -- images/*.tar images.txt import-images.sh ${installer:+"$installer"} > SHA256SUMS)
+  (cd -- "$dir" && sha256sum -- images/*.tar images.txt import-images.sh ${installer:+"$installer"} $(ls compose/* 2>/dev/null) > SHA256SUMS)
   BUNDLE_PARTIAL=""
   if [ -z "$JOB_DIR" ]; then
     trap - EXIT
   fi
   echo
   ok "Bundle ready: $dir ($(du -sh -- "$dir" | cut -f1))"
-  echo "  images/ ($count image(s)), images.txt, SHA256SUMS, import-images.sh${installer:+, $installer}"
+  echo "  images/ ($count image(s)), images.txt, SHA256SUMS, import-images.sh${installer:+, $installer}$([ -d "$dir/compose" ] && printf ', compose/ (Docker Compose)')"
   echo "  No $ENV_FILE / $COMPOSE_FILE inside - the target machine generates its own (with new passwords)."
 
   if [ "$archive_wanted" = "yes" ]; then
@@ -3009,7 +3619,7 @@ catalog_fixed_upload_limit() {
 upload_limit() {
   local version value num unit
   version=""
-  if command -v docker >/dev/null 2>&1 && detect_compose 2>/dev/null; then
+  if command -v podman >/dev/null 2>&1 && detect_compose 2>/dev/null; then
     version="$(running_tag catalog-web 2>/dev/null)" || version=""
   fi
   if ! [[ "$version" =~ ^[0-9]+\. ]]; then
@@ -3332,39 +3942,57 @@ running_tag() {
   if [ -z "$id" ]; then
     return 0
   fi
-  image="$(docker inspect --format '{{.Config.Image}}' "$id" 2>/dev/null)" || image=""
+  image="$(podman container inspect --format '{{.Config.Image}}' "$id" 2>/dev/null)" || image=""
   printf '%s' "${image##*:}"
 }
 
 mongo_running_version() {
-  compose exec -T mongo mongod --version 2>/dev/null | sed -n 's/^db version v//p' | head -n 1 || true
+  local id
+  id="$(compose ps -q mongo 2>/dev/null | head -n 1)" || id=""
+  if [ -n "$id" ]; then
+    podman exec "$id" mongod --version 2>/dev/null | sed -n 's/^db version v//p' | head -n 1 || true
+  fi
 }
 
 # Waits until every service runs (and is healthy where it has a healthcheck) and Catalog Web answers.
+# The timeout is wall-clock time: each round also spends time in podman and curl.
 stack_health() {
-  local timeout="${1:-$HEALTH_TIMEOUT}" waited=0 svc id state health restarts bad code warned
-  local -a services=()
+  local timeout="${1:-$HEALTH_TIMEOUT}" start="$SECONDS" waited=0 shown=0 svc id state health restarts bad code warned i
+  local -a services=() ids=() seen=()
   while IFS= read -r svc; do
     if [ -n "$svc" ]; then
       services+=("$svc")
+      ids+=("")
+      seen+=("")
     fi
   done < <(compose config --services 2>/dev/null)
   info "Health check of ${#services[@]} services (up to $((timeout / 60)) minutes)"
   while true; do
     bad=""
     warned=""
-    for svc in ${services[@]+"${services[@]}"}; do
-      id="$(compose ps -q "$svc" 2>/dev/null | head -n 1)" || id=""
+    for ((i = 0; i < ${#services[@]}; i++)); do
+      svc="${services[$i]}"
+      # the container of a service keeps its ID while it restarts: look it up once
+      if [ -z "${ids[$i]}" ]; then
+        ids[$i]="$(compose ps -q "$svc" 2>/dev/null | head -n 1)" || ids[$i]=""
+      fi
+      id="${ids[$i]}"
       if [ -z "$id" ]; then
         bad="$bad $svc(missing)"
         continue
       fi
-      read -r state health restarts <<< "$(docker inspect --format '{{.State.Status}} {{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}} {{.RestartCount}}' "$id" 2>/dev/null)" || true
+      IFS='|' read -r state health restarts <<< "$(podman container inspect --format '{{.State.Status}}|{{with .State.Health}}{{or .Status "none"}}{{else}}none{{end}}|{{.RestartCount}}' "$id" 2>/dev/null)" || true
+      if [ -z "${state:-}" ]; then
+        ids[$i]=""
+      fi
       if [ "${state:-}" != "running" ] || { [ "${health:-none}" != "none" ] && [ "$health" != "healthy" ]; }; then
         bad="$bad $svc(${state:-?}/${health:-?})"
+      elif [ -n "${seen[$i]}" ] && [ "${restarts:-0}" != "${seen[$i]}" ]; then
+        bad="$bad $svc(restarting, ${restarts}x)"
       elif [ "${restarts:-0}" != "0" ]; then
         warned="$warned $svc(${restarts}x)"
       fi
+      seen[$i]="${restarts:-0}"
     done
     code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 "$(local_url)/" || true)"
     if [ -z "$bad" ] && [ "$code" = "200" ]; then
@@ -3388,22 +4016,26 @@ stack_health() {
       job_progress "$((timeout > 0 ? waited * 100 / timeout : 0))" "Health check ${waited}s: waiting for${bad:- -} web=$code"
     elif [ -t 1 ]; then
       printf '\r       %4ss  waiting for:%s web=%s          ' "$waited" "${bad:- -}" "$code"
+    elif [ $((waited / 60)) -gt "$shown" ]; then
+      shown=$((waited / 60))
+      echo "  ${waited}s, waiting for:${bad:- -} web=$code"
     fi
     sleep 5
-    waited=$((waited + 5))
+    waited=$((SECONDS - start))
   done
 }
 
 # Writes a compressed mongodump of all databases to backups/; the password stays inside the container.
 mongo_backup() {
-  local dir file
+  local dir file id
   dir="$WORK_DIR/backups"
   mkdir -p -- "$dir"
   file="$dir/mongo-$(date +%Y%m%d-%H%M%S).archive.gz"
   info "MongoDB backup -> $file"
   job_step "MongoDB backup"
   BACKUP_PARTIAL="$file"
-  if (umask 077 && compose exec -T mongo sh -c '
+  id="$(compose ps -q mongo 2>/dev/null | head -n 1)" || id=""
+  if [ -n "$id" ] && (umask 077 && podman exec "$id" sh -c '
       umask 077
       printf "password: \"%s\"\n" "$MONGO_INITDB_ROOT_PASSWORD" > /tmp/.rvc-dump.yml
       mongodump --quiet --archive --gzip --config=/tmp/.rvc-dump.yml \
@@ -3521,7 +4153,7 @@ PATCH_STAGE=""
 # Worker: patch_apply NAME|OLD|NEW... - a cancel or an error before the services run goes back
 patch_apply() {
   local spec name old new
-  require_docker || return 1
+  require_podman || return 1
   PATCH_CHANGES=("$@")
   JOB_CLEANUP="patch_cleanup"
   PATCH_STAGE="pull"
@@ -3584,7 +4216,7 @@ upgrade_offer_rollback() {
 do_upgrade() {
   local installed target backup="no" rc
   require_files || return 1
-  require_docker || return 1
+  require_podman || return 1
   sibling_guard || return 1
   upgrade_offer_rollback || return 0
   if ! command -v curl >/dev/null 2>&1; then
@@ -3614,9 +4246,9 @@ do_upgrade() {
  Upgrade plan
    1. MongoDB backup (recommended; the new version may migrate the database)
    2. Pull the images of $target while the old version still runs
-   3. docker compose down (data volumes are kept)
+   3. podman compose down (data volumes are kept)
    4. CATALOG_VERSION $installed -> $target, regenerate the files (passwords are kept)
-   5. docker compose up -d
+   5. podman compose up -d
    6. Health check of all services and Catalog Web
  It runs as a background job: closing the SSH session does not stop it, and a cancel
  before step 3 changes nothing while a cancel after it goes back to $installed.
@@ -3680,7 +4312,7 @@ upgrade_cleanup() {
 # Worker: upgrade_run TARGET INSTALLED BACKUP(yes|no)
 upgrade_run() {
   local target="$1" installed="$2" backup="$3"
-  require_docker || return 1
+  require_podman || return 1
   UPG_OLD="$CATALOG_VERSION"
   JOB_CLEANUP="upgrade_cleanup"
   rm -f -- "$UPGRADE_FAILED_FILE"
@@ -3706,11 +4338,11 @@ upgrade_run() {
     return 1
   fi
   UPG_STAGE="switch"
-  job_step "docker compose down"
-  info "Stopping the stack (docker compose down)"
+  job_step "podman compose down"
+  info "Stopping the stack (podman compose down)"
   compose down --remove-orphans
   job_step "Starting $target"
-  info "Starting $target (docker compose up -d)"
+  info "Starting $target (podman compose up -d)"
   compose up -d --remove-orphans
   if stack_health && [ "$(running_tag catalog-web)" = "$target" ]; then
     UPG_STAGE=""
@@ -3729,7 +4361,7 @@ upgrade_run() {
 # Worker: upgrade_rollback OLD TARGET BACKUP
 upgrade_rollback() {
   local old="$1" target="$2" backup="$3"
-  require_docker || return 1
+  require_podman || return 1
   rm -f -- "$UPGRADE_FAILED_FILE"
   UPG_OLD="$old"
   upgrade_revert_settings
@@ -3738,7 +4370,7 @@ upgrade_rollback() {
   stack_health || true
   if [ -n "$backup" ]; then
     warn "If $target already migrated the database, restore the backup:"
-    echo "      docker compose exec -T mongo sh -c 'mongorestore --drop --archive --gzip -u \"\$MONGO_INITDB_ROOT_USERNAME\" -p \"\$MONGO_INITDB_ROOT_PASSWORD\" --authenticationDatabase admin' < $backup"
+    echo "      podman exec -i \"\$(podman compose ps -q mongo)\" sh -c 'mongorestore --drop --archive --gzip -u \"\$MONGO_INITDB_ROOT_USERNAME\" -p \"\$MONGO_INITDB_ROOT_PASSWORD\" --authenticationDatabase admin' < $backup"
   fi
 }
 
@@ -3778,7 +4410,7 @@ update_installer() {
   else
     wget -q -T 120 -O "$tmp" "$url" || : > "$tmp"
   fi
-  if ! head -n 1 "$tmp" | grep -q '^#!/usr/bin/env bash' || ! settings_section "$tmp" >/dev/null || ! bash -n "$tmp" 2>/dev/null; then
+  if ! head -n 1 "$tmp" | grep -q '^#!/usr/bin/env bash' || ! settings_section "$tmp" >/dev/null || ! "$BASH" -n "$tmp" 2>/dev/null; then
     rm -f -- "$tmp"
     err "The download failed or is not a valid installer."
     return 1
@@ -3810,7 +4442,7 @@ update_installer() {
     ok "The installer is up to date. Its update address is now $CURRENT_INSTALLER_URL."
     return 0
   fi
-  if ! bash "$tmp" check-settings >/dev/null; then
+  if ! "$BASH" "$tmp" check-settings >/dev/null; then
     rm -f -- "$tmp"
     err "The new installer does not accept the current settings - not updated."
     return 1
@@ -3838,7 +4470,7 @@ update_installer() {
   ok "Installer updated (previous version: $backup)."
   if [ "$mode" = "interactive" ]; then
     export RVC_NOTICE="Installer updated - your settings were kept."
-    exec bash "$SCRIPT_PATH" menu ${WIZ_RESUME:+"$WIZ_RESUME"}
+    exec "$BASH" "$SCRIPT_PATH" menu ${WIZ_RESUME:+"$WIZ_RESUME"}
   fi
 }
 
@@ -3850,10 +4482,20 @@ project_name_of() {
   printf '%s' "$1" | tr '[:upper:]' '[:lower:]' | tr -cd 'a-z0-9_-'
 }
 
+# catalog_web_containers TEMPLATE -> the catalog-web containers of all projects, formatted
+catalog_web_containers() {
+  local ids
+  ids="$(podman ps -aq --filter "label=com.docker.compose.service=catalog-web" 2>/dev/null)" || ids=""
+  if [ -n "$ids" ]; then
+    # shellcheck disable=SC2086
+    podman container inspect --format "$1" $ids 2>/dev/null || true
+  fi
+}
+
 # Existing Catalog installations, one per line: project|folder|compose file|env file|image|status
 find_installations() {
   local project dir cfg envf image status f d seen=" "
-  if command -v docker >/dev/null 2>&1; then
+  if command -v podman >/dev/null 2>&1; then
     while IFS='|' read -r project dir cfg envf image status; do
       if [ -z "$dir" ] || { [ "$dir" = "$WORK_DIR" ] || [ "$dir" -ef "$WORK_DIR" ]; } || [[ "$seen" == *" $dir "* ]]; then
         continue
@@ -3861,8 +4503,7 @@ find_installations() {
       seen="$seen$dir "
       cfg="${cfg%%,*}"
       printf '%s|%s|%s|%s|%s|%s\n' "$project" "$dir" "${cfg:-$dir/docker-compose.yml}" "${envf:-$dir/.env}" "$image" "$status"
-    done < <(docker ps -a --filter "label=com.docker.compose.service=catalog-web" \
-      --format '{{.Label "com.docker.compose.project"}}|{{.Label "com.docker.compose.project.working_dir"}}|{{.Label "com.docker.compose.project.config_files"}}|{{.Label "com.docker.compose.project.environment_file"}}|{{.Image}}|{{.Status}}' 2>/dev/null || true)
+    done < <(catalog_web_containers '{{index .Config.Labels "com.docker.compose.project"}}|{{index .Config.Labels "com.docker.compose.project.working_dir"}}|{{index .Config.Labels "com.docker.compose.project.config_files"}}|{{index .Config.Labels "com.docker.compose.project.environment_file"}}|{{.Config.Image}}|{{.State.Status}}')
   fi
   while IFS= read -r f; do
     d="$(dirname -- "$f")"
@@ -3871,10 +4512,22 @@ find_installations() {
     fi
     seen="$seen$d "
     printf '%s|%s|%s|%s|%s|%s\n' "$(project_name_of "$(basename -- "$d")")" "$d" "$f" "$d/.env" "" "not running"
-  done < <(find /root /home /opt /srv -maxdepth 3 \( -name docker-compose.yml -o -name docker-compose.yaml -o -name compose.yml -o -name compose.yaml \) 2>/dev/null || true)
+  done < <(find_compose_files)
 }
 
-# A value of an env file as docker compose reads it: the text inside single or double quotes, or
+# Compose files where installations usually live. macOS: the home folder, without the folders that
+# would make macOS ask for permission (Desktop, Documents, Downloads, ...)
+find_compose_files() {
+  local -a roots=(/root /home /opt /srv)
+  if [ "$OS_KIND" = "Darwin" ]; then
+    roots=("$HOME")
+  fi
+  find "${roots[@]}" -maxdepth 3 \( -path "$HOME/Desktop" -o -path "$HOME/Documents" -o -path "$HOME/Downloads" \
+    -o -path "$HOME/Library" -o -path "$HOME/Pictures" -o -path "$HOME/Movies" -o -path "$HOME/Music" \) -prune \
+    -o \( -name docker-compose.yml -o -name docker-compose.yaml -o -name compose.yml -o -name compose.yaml \) -print 2>/dev/null || true
+}
+
+# A value of an env file as Docker Compose (behind podman compose) reads it: the text inside single or double quotes, or
 # the text before an inline " #" comment.
 env_unquote() {
   local v="$1" rest
@@ -4046,7 +4699,7 @@ takeover_settings() {
     fi
     n=$((n + 1))
   done
-  if ! bash -n "$SCRIPT_PATH" || ! bash "$SCRIPT_PATH" check-settings; then
+  if ! "$BASH" -n "$SCRIPT_PATH" || ! "$BASH" "$SCRIPT_PATH" check-settings; then
     cat -- "$backup" > "$SCRIPT_PATH"
     err "The settings of $(basename -- "$src") do not fit - nothing was changed in $SCRIPT_NAME."
     return 1
@@ -4059,7 +4712,7 @@ takeover_settings() {
   fi
   if [ "$mode" = "interactive" ]; then
     export RVC_NOTICE="Settings of $(basename -- "$src") taken over."
-    exec bash "$SCRIPT_PATH" menu
+    exec "$BASH" "$SCRIPT_PATH" menu
   fi
 }
 
@@ -4232,7 +4885,7 @@ adopt_installation() {
       printf '\nCOMPOSE_PROJECT_NAME=%s\n' "$project" >> "$ENV_FILE"
     fi
   fi
-  if ! bash -n "$SCRIPT_PATH" || ! bash "$SCRIPT_PATH" check-settings; then
+  if ! "$BASH" -n "$SCRIPT_PATH" || ! "$BASH" "$SCRIPT_PATH" check-settings; then
     cat -- "$backup" > "$SCRIPT_PATH"
     err "The values of $envf do not fit the settings - nothing was changed in $SCRIPT_NAME."
     return 1
@@ -4261,7 +4914,7 @@ adopt_installation() {
   echo "  From now on manage the stack from $WORK_DIR. The files in $dir are left as they are."
   if [ "$mode" = "interactive" ]; then
     export RVC_NOTICE="Installation in $dir taken over."
-    exec bash "$SCRIPT_PATH" menu
+    exec "$BASH" "$SCRIPT_PATH" menu
   fi
 }
 
@@ -4807,9 +5460,12 @@ job_start() {
     (umask 077 && printf '%s' "$secret" > "$dir/secret")
   fi
   if command -v setsid >/dev/null 2>&1; then
-    setsid nohup bash "$SCRIPT_PATH" __job "$id" "$@" > "$dir/log" 2>&1 < /dev/null &
+    setsid nohup "$BASH" "$SCRIPT_PATH" __job "$id" "$@" > "$dir/log" 2>&1 < /dev/null &
+  elif command -v perl >/dev/null 2>&1; then
+    # macOS has no setsid: the job gets its own session (and process group for the cancel) through perl
+    nohup perl -MPOSIX -e 'POSIX::setsid(); exec @ARGV' "$BASH" "$SCRIPT_PATH" __job "$id" "$@" > "$dir/log" 2>&1 < /dev/null &
   else
-    nohup bash "$SCRIPT_PATH" __job "$id" "$@" > "$dir/log" 2>&1 < /dev/null &
+    nohup "$BASH" "$SCRIPT_PATH" __job "$id" "$@" > "$dir/log" 2>&1 < /dev/null &
   fi
   echo "$!" > "$dir/pid"
   printf '%s' "$id"
@@ -5724,6 +6380,7 @@ EOF
   opensearch:
     image: opensearchproject/opensearch:${OPENSEARCH_TAG}
     container_name: opensearch
+    restart: always
     environment:
       cluster.name: opensearch
       node.name: opensearch
@@ -5742,6 +6399,7 @@ EOF
   opensearch-dashboards:
     image: opensearchproject/opensearch-dashboards:${OPENSEARCH_DASHBOARDS_TAG}
     container_name: opensearch-dashboards
+    restart: always
     ports:
       - "${OPENSEARCH_DASHBOARDS_PORT}:5601"
     expose:
@@ -5754,7 +6412,7 @@ EOF
 
   mongo:
     image: mongo:${MONGO_TAG}
-    restart: unless-stopped
+    restart: always
     depends_on:
       - opensearch-dashboards
     volumes:
@@ -5783,6 +6441,7 @@ EOF
     environment:
       MINIO_ROOT_USER: "${MINIO_ROOT_USER}"
       MINIO_ROOT_PASSWORD: "${MINIO_ROOT_PASSWORD}"
+      HOME: /root
     command: server /container/vol --console-address :9001
 
   rabbitmq:
@@ -5916,7 +6575,7 @@ EOF
       - minio
       - rabbitmq
       - catalog-web
-    restart: unless-stopped
+    restart: always
     volumes:
       - worker_token:/app/tokens
     environment:
@@ -5946,7 +6605,7 @@ EOF
       - minio
       - rabbitmq
       - catalog-web
-    restart: unless-stopped
+    restart: always
     volumes:
       - worker_search_token:/app/tokens
     environment:
@@ -5986,6 +6645,10 @@ volumes:
   npm_letsencrypt:
 EOF
   } > "$COMPOSE_FILE"
+  # the Catalog images exist only for amd64: Apple Silicon runs them with Rosetta
+  if [ "$OS_KIND" = "Darwin" ] && [ "$(engine_arch)" = "arm64" ]; then
+    sed -i 's#^    image: ${CATALOG\(_WORKER\)\{0,1\}_IMAGE}$#&\n    platform: linux/amd64#' "$COMPOSE_FILE"
+  fi
 }
 
 # do_generate [ask|keep|new] [show-next|no-next]
@@ -6030,7 +6693,7 @@ do_generate() {
       fi
     elif [ "$mode" = "new" ]; then
       warn "Generating NEW passwords. MongoDB and RabbitMQ keep the original ones in their data volumes,"
-      warn "so the new passwords only work after those volumes are removed (docker compose down -v)."
+      warn "so the new passwords only work after those volumes are removed (podman compose down -v)."
     fi
     if [ "$mode" = "keep" ]; then
       pw_file="$ENV_FILE"
@@ -6046,10 +6709,10 @@ do_generate() {
     else
       volumes="$(project_volumes)"
       if [ -n "$volumes" ]; then
-        warn "There is no $ENV_FILE (and no backup of it), but Docker volumes of this stack already exist."
+        warn "There is no $ENV_FILE (and no backup of it), but Podman volumes of this stack already exist."
         warn "MongoDB keeps its original password in these volumes - NEW passwords will not work with them."
         warn "Restore the old $ENV_FILE, or remove the volumes if the old data is not needed:"
-        warn "  docker volume rm ${volumes//$'\n'/ }"
+        warn "  podman volume rm ${volumes//$'\n'/ }"
         if [ "$mode" = "new" ]; then
           : # explicitly requested with --new-passwords
         elif [ "$INTERACTIVE" = "true" ] && confirm "Generate new passwords anyway?" n; then
@@ -6124,8 +6787,8 @@ do_generate() {
       echo "Next steps: 3/4) review the files (optional), 5) validate, 6) start the stack."
     else
       echo "Next steps:"
-      echo "  $0 validate    (docker compose config)"
-      echo "  $0 up          (docker compose up -d)"
+      echo "  $0 validate    (podman compose config)"
+      echo "  $0 up          (podman compose up -d)"
     fi
   fi
 }
@@ -6161,9 +6824,9 @@ show_access_info() {
   printf '  %-24s http://%s:%s\n' "RabbitMQ management" "$addr" "$(setting RABBITMQ_UI_PORT)"
   printf '  %-24s http://%s:%s\n' "MinIO console" "$addr" "$(setting MINIO_CONSOLE_PORT_HOST)"
   printf '  %-24s http://%s:%s\n' "OpenSearch Dashboards" "$addr" "$(setting OPENSEARCH_DASHBOARDS_PORT)"
-  echo "Note: these ports are published on all network interfaces, and Docker-published ports are"
-  echo "      NOT filtered by ufw/firewalld. OpenSearch Dashboards has no login - restrict access to it"
-  echo "      (network firewall or the DOCKER-USER iptables chain)."
+  echo "Note: these ports are published on all network interfaces, and Podman forwards them before"
+  echo "      ufw/firewalld see them. OpenSearch Dashboards has no login - restrict access to it"
+  echo "      (network firewall)."
   echo
 
   if [ "$npm" = "true" ]; then
@@ -6208,7 +6871,7 @@ edit_generated() {
 
 do_validate() {
   require_files || return 1
-  require_docker || return 1
+  require_podman || return 1
   info "Running: ${COMPOSE[*]} config"
   if ! compose config --quiet; then
     err "Docker Compose reported a problem in $COMPOSE_FILE / $ENV_FILE (see above)."
@@ -6224,12 +6887,12 @@ do_validate() {
 
 do_up() {
   require_files || return 1
-  require_docker || return 1
+  require_podman || return 1
   if mongo_kernel_problem; then
-    warn "MongoDB $(setting MONGO_TAG) refuses to start on Linux kernel $(uname -r) without a workaround (SERVER-121912)."
+    warn "MongoDB $(setting MONGO_TAG) refuses to start on kernel $(engine_kernel) without a workaround (SERVER-121912)."
     warn "Regenerate the files ($(hint 2 generate)): MongoDB then starts with GLIBC_TUNABLES=glibc.pthread.rseq=1."
   elif mongo_workaround_unneeded; then
-    info "This kernel ($(uname -r)) no longer needs the MongoDB workaround that the files have - that is why they differ."
+    info "This kernel ($(engine_kernel)) no longer needs the MongoDB workaround that the files have - that is why they differ."
     info "They work as they are; regenerating ($(hint 2 generate)) gives MongoDB its faster per-CPU caches back."
   fi
   if settings_stale; then
@@ -6246,7 +6909,7 @@ do_up() {
   ok "Configuration is valid."
   # --remove-orphans also removes services that are no longer in the file
   # (e.g. Nginx Proxy Manager after INSTALL_NGINX_PROXY_MANAGER="false").
-  info "Starting the stack (docker compose up -d --remove-orphans)..."
+  info "Starting the stack (podman compose up -d --remove-orphans)..."
   compose up -d --remove-orphans
   echo
   ok "Stack is up."
@@ -6268,14 +6931,14 @@ do_full_setup() {
 
 do_status() {
   require_files || return 1
-  require_docker || return 1
+  require_podman || return 1
   compose ps
 }
 
 do_logs() {
   local service="${1:-}" services=() list line i choice
   require_files || return 1
-  require_docker || return 1
+  require_podman || return 1
   if ! list="$(compose config --services)"; then
     err "Could not read the services from $COMPOSE_FILE (see above)."
     return 1
@@ -6311,21 +6974,21 @@ do_logs() {
 
 do_pull() {
   require_files || return 1
-  require_docker || return 1
+  require_podman || return 1
   compose pull
   ok "Images pulled. Apply them with $(hint 6 up)."
 }
 
 do_restart() {
   require_files || return 1
-  require_docker || return 1
-  compose restart
+  require_podman || return 1
+  compose restart -t 30
   ok "Stack restarted."
 }
 
 do_down() {
   require_files || return 1
-  require_docker || return 1
+  require_podman || return 1
   if [ "$INTERACTIVE" = "true" ]; then
     if ! confirm "Stop and remove all containers of this stack? (data volumes are kept)" n; then
       info "Cancelled."
@@ -6339,7 +7002,7 @@ do_down() {
 do_reset() {
   local answer
   require_files || return 1
-  require_docker || return 1
+  require_podman || return 1
   warn "This removes ALL containers AND ALL data volumes of this stack:"
   warn "  MongoDB data, MinIO files, RabbitMQ data, OpenSearch index, license volume,"
   warn "  worker tokens and Nginx Proxy Manager data / certificates."
@@ -6357,36 +7020,66 @@ do_reset() {
 }
 
 do_check() {
-  local problems=0 name port mmc host_tz
+  local problems=0 name port mmc host_tz v
   info "Checking prerequisites..."
 
-  if command -v docker >/dev/null 2>&1 && docker_is_podman; then
-    err "'docker' on this server is Podman (podman-docker), which this installer does not support. Install Docker Engine:"
-    docker_install_hint
-    problems=$((problems + 1))
-  elif command -v docker >/dev/null 2>&1; then
-    ok "Docker CLI: $(docker --version 2>/dev/null)"
-    if docker info >/dev/null 2>&1; then
-      ok "Docker daemon is reachable."
-      if command -v systemctl >/dev/null 2>&1 && [ "$(systemctl is-enabled docker.service 2>/dev/null)" = "disabled" ]; then
-        warn "docker.service is not enabled - Docker and this stack will not start again after a reboot:"
-        echo "      sudo systemctl enable --now docker"
-      fi
+  if ! command -v podman >/dev/null 2>&1; then
+    err "Podman is not installed. './$SCRIPT_NAME install-podman' sets it up (I - Install asks first):"
+    if [ "$OS_KIND" = "Darwin" ]; then
+      echo "      brew install podman, a rootful Podman machine, and the newest Docker Compose"
+    elif v="$(podman_install_plan 2>&1)"; then
+      printf '      %s\n' $(printf '%s\n' "$v" | tr ' ' '\001') | tr '\001' ' '
+      podman_service_plan | sed 's/^/      /'
     else
-      err "Cannot reach the Docker daemon. Start Docker, or add your user to the 'docker' group:"
-      echo "      sudo usermod -aG docker \"\$USER\"   (then log out and back in)"
+      echo "      $v"
+    fi
+    problems=$((problems + 1))
+  else
+    v="$(podman_version)"
+    if [ -n "$v" ] && ! version_gt "$PODMAN_MIN" "$v"; then
+      ok "Podman $v"
+    else
+      err "Podman ${v:-(unknown version)} is too old: $PODMAN_MIN or newer is needed ('podman compose' came with 4.7)."
       problems=$((problems + 1))
     fi
+    if [ "$OS_KIND" = "Darwin" ] && ! engine_socket_ok; then
+      err "The Podman machine is not running: podman machine start $(mac_machine)"
+      problems=$((problems + 1))
+    else
+      case "$(engine_rootless)" in
+        false) ok "Podman runs rootful$(if [ "$OS_KIND" = "Darwin" ]; then printf ' (Podman machine)'; fi)." ;;
+        true)
+          if [ "$OS_KIND" = "Darwin" ]; then
+            err "The Podman machine runs rootless: podman machine stop && podman machine set --rootful && podman machine start"
+          else
+            err "Podman runs rootless here: run $SCRIPT_NAME as root (sudo) - the Catalog needs rootful Podman."
+          fi
+          problems=$((problems + 1))
+          ;;
+        *)
+          err "Podman does not answer (podman info failed)."
+          problems=$((problems + 1))
+          ;;
+      esac
+      if [ "$OS_KIND" != "Darwin" ]; then
+        if engine_socket_ok; then
+          ok "Podman API socket (podman.socket) is active."
+        else
+          err "The Podman API socket is not active (podman compose needs it): systemctl enable --now podman.socket"
+          problems=$((problems + 1))
+        fi
+        if command -v systemctl >/dev/null 2>&1 && [ "$(systemctl is-enabled podman-restart.service 2>/dev/null)" != "enabled" ]; then
+          warn "podman-restart.service is not enabled - the stack does not come back after a reboot:"
+          echo "      systemctl enable podman-restart.service"
+        fi
+      fi
+    fi
     if detect_compose; then
-      ok "Compose: $("${COMPOSE[@]}" version 2>/dev/null | head -n 1)"
+      ok "Compose: podman compose with $("$COMPOSE_PROVIDER" version 2>/dev/null | head -n 1)"
     else
       err "$COMPOSE_PROBLEM"
       problems=$((problems + 1))
     fi
-  else
-    err "Docker is not installed (or not in PATH). Install Docker Engine with the Compose plugin:"
-    docker_install_hint
-    problems=$((problems + 1))
   fi
 
   if check_settings; then
@@ -6396,10 +7089,10 @@ do_check() {
   fi
 
   if mongo_kernel_problem; then
-    warn "MongoDB $(setting MONGO_TAG) refuses to start on Linux kernel $(uname -r) (SERVER-121912): the files lack the workaround."
+    warn "MongoDB $(setting MONGO_TAG) refuses to start on kernel $(engine_kernel) (SERVER-121912): the files lack the workaround."
     echo "      Regenerate them (option 2, or I - repair): MongoDB then starts with GLIBC_TUNABLES=glibc.pthread.rseq=1."
   elif mongo_rseq_workaround; then
-    ok "MongoDB $(setting MONGO_TAG) on kernel $(uname -r): starts with GLIBC_TUNABLES=glibc.pthread.rseq=1 (SERVER-121912)."
+    ok "MongoDB $(setting MONGO_TAG) on kernel $(engine_kernel): starts with GLIBC_TUNABLES=glibc.pthread.rseq=1 (SERVER-121912)."
     echo "      TCMalloc then uses per-thread instead of per-CPU caches: some performance cost."
   fi
   local upstream
@@ -6410,10 +7103,37 @@ do_check() {
     echo "      7.0.14 or newer; for linux-generic that is 7.0.0-31 or newer)"
   fi
 
-  if [ -r /proc/sys/vm/max_map_count ]; then
+  if [ "$OS_KIND" = "Darwin" ]; then
+    v="$(sw_vers -productVersion 2>/dev/null)" || v=""
+    if [[ "${v%%.*}" =~ ^[0-9]+$ ]] && [ "${v%%.*}" -lt 26 ]; then
+      err "macOS $v: the amd64 Catalog images need Rosetta in the Podman machine, which works only from macOS 26."
+      problems=$((problems + 1))
+    fi
+    if engine_socket_ok; then
+      if mac_rosetta_on "$(mac_machine)"; then
+        ok "Rosetta runs the amd64 Catalog images in the Podman machine."
+      else
+        err "Rosetta is not active in the Podman machine - './$SCRIPT_NAME install-podman' turns it on."
+        problems=$((problems + 1))
+      fi
+    fi
+  fi
+
+  mmc=""
+  if [ "$OS_KIND" = "Darwin" ]; then
+    if engine_socket_ok; then
+      mmc="$(podman machine ssh "$(mac_machine)" sysctl -n vm.max_map_count 2>/dev/null)" || mmc=""
+      mmc="${mmc//[^0-9]/}"
+    fi
+  elif [ -r /proc/sys/vm/max_map_count ]; then
     mmc="$(cat /proc/sys/vm/max_map_count)"
+  fi
+  if [ -n "$mmc" ]; then
     if [ "$mmc" -ge 262144 ]; then
-      ok "vm.max_map_count = $mmc"
+      ok "vm.max_map_count = $mmc$(if [ "$OS_KIND" = "Darwin" ]; then printf ' (Podman machine)'; fi)"
+    elif [ "$OS_KIND" = "Darwin" ]; then
+      warn "vm.max_map_count = $mmc in the Podman machine - OpenSearch recommends at least 262144:"
+      echo "      podman machine ssh $(mac_machine) \"sudo sh -c 'echo vm.max_map_count=262144 > /etc/sysctl.d/99-opensearch.conf && sysctl --system'\""
     else
       warn "vm.max_map_count = $mmc - OpenSearch recommends at least 262144:"
       echo "      sudo sysctl -w vm.max_map_count=262144"
@@ -6421,10 +7141,10 @@ do_check() {
     fi
   fi
 
-  if command -v ss >/dev/null 2>&1; then
+  if command -v ss >/dev/null 2>&1 || command -v lsof >/dev/null 2>&1; then
     for name in $(port_settings); do
       port="${!name}"
-      if ss -ltn 2>/dev/null | awk -v p=":${port}\$" '$4 ~ p { found = 1 } END { exit !found }'; then
+      if wiz_port_used "$port"; then
         warn "Host port $port ($name) is already in use (fine if this stack is already running)."
       fi
     done
@@ -6622,7 +7342,7 @@ settings_check() {
     echo "Control characters are not allowed."
     return 1
   fi
-  # the generated .env holds the values without quotes: docker compose would read these differently
+  # the generated .env holds the values without quotes: podman compose would read these differently
   if [[ "$value" == *[\"\'\\\$\`]* ]] || [[ "$value" == *" #"* ]]; then
     echo "Not allowed: \" ' \\ \$ \` and \" #\" (the generated $ENV_FILE cannot hold them)."
     return 1
@@ -7290,7 +8010,7 @@ settings_save() {
         return 1
       fi
     done
-    if ! bash -n "$copy" 2>/dev/null || ! out="$(bash "$copy" check-settings 2>&1)"; then
+    if ! "$BASH" -n "$copy" 2>/dev/null || ! out="$("$BASH" "$copy" check-settings 2>&1)"; then
       rm -rf -- "$dir"
       echo
       err "Not saved - the settings do not work together:"
@@ -7340,7 +8060,7 @@ settings_save() {
   else
     unset RVC_HUB_STATUS RVC_LATEST_VERSION RVC_HUB_STABLE
   fi
-  exec bash "$SCRIPT_PATH" menu
+  exec "$BASH" "$SCRIPT_PATH" menu
 }
 
 # Menu option 1: all settings of this script on one screen, grouped by the part of their names
@@ -7457,7 +8177,7 @@ edit_config() {
     fi
     # bash -n finds syntax errors; the check-settings run also catches errors
     # that only show up when the settings are executed (e.g. missing quotes).
-    if bash -n "$SCRIPT_PATH" && bash "$SCRIPT_PATH" check-settings; then
+    if "$BASH" -n "$SCRIPT_PATH" && "$BASH" "$SCRIPT_PATH" check-settings; then
       break
     fi
     err "The script cannot start with these settings (see above). Values that contain spaces must be in double quotes."
@@ -7476,7 +8196,7 @@ edit_config() {
   else
     unset RVC_HUB_STATUS RVC_LATEST_VERSION RVC_HUB_STABLE
   fi
-  exec bash "$SCRIPT_PATH" menu
+  exec "$BASH" "$SCRIPT_PATH" menu
 }
 
 # Runs one menu action in a subshell with errexit enabled, so a failing step
@@ -7509,7 +8229,7 @@ file_state() {
 stack_state() {
   local running n=0
   if [ ! -f "$ENV_FILE" ] || [ ! -f "$COMPOSE_FILE" ]; then
-    if command -v docker >/dev/null 2>&1; then
+    if command -v podman >/dev/null 2>&1; then
       n="$(count_lines "$(here_containers 2>/dev/null)")"
     fi
     case "$n" in
@@ -7519,12 +8239,12 @@ stack_state() {
     esac
     return 0
   fi
-  if ! command -v docker >/dev/null 2>&1 || ! detect_compose; then
-    printf 'Docker / Compose not available'
+  if ! command -v podman >/dev/null 2>&1 || ! detect_compose; then
+    printf 'Podman / Compose not available'
     return 0
   fi
   if ! running="$(compose ps --services --filter status=running 2>/dev/null)"; then
-    printf 'unknown (cannot reach Docker)'
+    printf 'unknown (cannot reach Podman)'
     return 0
   fi
   printf '%s service(s) running' "$(count_lines "$running")"
@@ -7751,13 +8471,13 @@ wiz_job_since() {
 # True when this folder has an installation: its generated files, or containers of this installation
 # (volumes alone may belong to another folder with the same name).
 # The containers of this installation, listed once per menu draw (menu_scan): the cards and the stack
-# line need them, and every listing asks Docker several times. here_containers uses that list during the
-# draw and asks Docker again at any other time.
+# line need them, and every listing asks Podman several times. here_containers uses that list during the
+# draw and asks Podman again at any other time.
 MENU_HERE=""
 MENU_HERE_AT=-10
 menu_scan() {
   MENU_HERE=""
-  if command -v docker >/dev/null 2>&1 && { [ ! -f "$ENV_FILE" ] || [ ! -f "$COMPOSE_FILE" ]; }; then
+  if command -v podman >/dev/null 2>&1 && { [ ! -f "$ENV_FILE" ] || [ ! -f "$COMPOSE_FILE" ]; }; then
     MENU_HERE="$(remove_containers 2>/dev/null)" || MENU_HERE=""
   fi
   MENU_HERE_AT="$SECONDS"
@@ -7789,7 +8509,7 @@ wiz_installed() {
   if [ -f "$ENV_FILE" ]; then
     return 0
   fi
-  command -v docker >/dev/null 2>&1 && [ -n "$(here_containers)" ]
+  command -v podman >/dev/null 2>&1 && [ -n "$(here_containers)" ]
 }
 
 # Names of the running jobs ("#3 Upgrade to ..."), one per line; empty when none runs.
@@ -7878,9 +8598,17 @@ wiz_ask() {
   done
 }
 
-# True when something listens on host port $1 (only checked when ss is there).
+# True when something listens on host port $1 (ss on Linux, lsof on macOS; false when neither is there).
 wiz_port_used() {
-  command -v ss >/dev/null 2>&1 && ss -ltn 2>/dev/null | awk -v p=":$1\$" '$4 ~ p { found = 1 } END { exit !found }'
+  if command -v ss >/dev/null 2>&1; then
+    ss -ltn 2>/dev/null | awk -v p=":$1\$" '$4 ~ p { found = 1 } END { exit !found }'
+  elif [ "$OS_KIND" = "Darwin" ] && command -v nc >/dev/null 2>&1; then
+    nc -z -G 1 127.0.0.1 "$1" >/dev/null 2>&1
+  elif command -v lsof >/dev/null 2>&1; then
+    lsof -nP -iTCP:"$1" -sTCP:LISTEN >/dev/null 2>&1
+  else
+    return 1
+  fi
 }
 
 # Worker of the install task: start the stack and wait until every service is healthy.
@@ -7984,13 +8712,14 @@ install_wizard() {
   fi
 
   if [ "$step" -le 1 ]; then
-    # 1. Check (MongoDB 8 on the kernels 6.19 to 7.0.x needs a workaround, which the files get)
+    # 1. Check (Podman first; MongoDB 8 on the kernels 6.19 to 7.0.x needs a workaround, which the files get)
+    podman_offer
     if mongo_rseq_workaround "$MONGO_TAG"; then
-      info "MongoDB $MONGO_TAG on this kernel ($(uname -r)) starts with GLIBC_TUNABLES=glibc.pthread.rseq=1 (SERVER-121912)."
+      info "MongoDB $MONGO_TAG on this kernel ($(engine_kernel)) starts with GLIBC_TUNABLES=glibc.pthread.rseq=1 (SERVER-121912)."
       echo "  The files get it by themselves. TCMalloc then uses per-thread caches: some performance cost."
       echo
     fi
-    echo "  Docker, Docker Compose, kernel, ports, vm.max_map_count and the time zone:"
+    echo "  Podman, podman compose, the kernel of the containers, ports, vm.max_map_count and the time zone:"
     echo
     ans=0
     if wiz_run do_check; then
@@ -8145,8 +8874,9 @@ install_wizard() {
   echo "  Passwords: option 14 $UI_SEP Nginx Proxy Manager steps: option 15 $UI_SEP status: option 9"
 }
 
-# U: brings the installation up to date - the installer itself, then the Catalog with backup,
-# health check and the patch updates of the other components. update_wizard [STEP [NOTICE]]
+# U: brings the installation up to date - the installer itself, then Docker Compose (the engine
+# behind "podman compose") and the Catalog with backup, health check and the patch updates of the
+# other components. update_wizard [STEP [NOTICE]]
 update_wizard() {
   local -a steps=(Installer Catalog Done)
   local start="${1:-1}" notice="${2:-}" jobs rc ans before after target installed failed_before="no"
@@ -8186,6 +8916,13 @@ update_wizard() {
   wiz_head "Update" 2 "${steps[@]}"
   if [ -n "$notice" ]; then
     ok "$notice"
+    echo
+  fi
+  # the newest Docker Compose; one that does not work with this Podman is not installed (root is
+  # only needed to write a new one)
+  if command -v podman >/dev/null 2>&1; then
+    use_sudo || SUDO=()
+    install_compose_provider yes || warn "Docker Compose was not updated (see above)."
     echo
   fi
   detect_compose >/dev/null 2>&1 || true
@@ -8231,7 +8968,7 @@ update_wizard() {
     warn "The stack is not running - option 6 starts it."
   fi
   if mongo_kernel_problem; then
-    warn "MongoDB refuses to start on this kernel ($(uname -r), SERVER-121912): the files lack the workaround."
+    warn "MongoDB refuses to start on this kernel ($(engine_kernel), SERVER-121912): the files lack the workaround."
     echo "  I (repair) writes them again with GLIBC_TUNABLES=glibc.pthread.rseq=1 and starts the stack."
   fi
   echo
@@ -8240,15 +8977,12 @@ update_wizard() {
   echo "  the changes since their last snapshot with options 17 and 19."
 }
 
-# Project name of the stack, as docker compose names it from the folder (or COMPOSE_PROJECT_NAME)
+# Project name of the stack, as Docker Compose (behind podman compose) names it from the folder
+# (or COMPOSE_PROJECT_NAME): lower case, a-z 0-9 _ -, without leading - and _
 stack_project() {
   local project="${COMPOSE_PROJECT_NAME:-$(basename -- "$WORK_DIR")}"
   project="$(printf '%s' "$project" | tr '[:upper:]' '[:lower:]' | tr -cd 'a-z0-9_-')"
-  # docker compose v2 also drops leading - and _; docker-compose v1 keeps them
-  if detect_compose >/dev/null 2>&1 && [ "${COMPOSE[0]}" = "docker" ]; then
-    project="${project#"${project%%[!_-]*}"}"
-  fi
-  printf '%s' "$project"
+  printf '%s' "${project#"${project%%[!_-]*}"}"
 }
 
 # Size of files or folders, e.g. "1.2 GB"
@@ -8303,7 +9037,8 @@ stack_containers() {
       services=" $(stack_compose_keys services | tr '\n' ' ') "
       repos=" $(stack_images | sed 's/:[^:/]*$//' | tr '\n' ' ') "
     fi
-    IFS='|' read -r wd svc image <<< "$(docker inspect --format '{{index .Config.Labels "com.docker.compose.project.working_dir"}}|{{index .Config.Labels "com.docker.compose.service"}}|{{.Config.Image}}' "$id" 2>/dev/null)"
+    IFS='|' read -r wd svc image <<< "$(podman container inspect --format '{{index .Config.Labels "com.docker.compose.project.working_dir"}}|{{index .Config.Labels "com.docker.compose.service"}}|{{.Config.Image}}' "$id" 2>/dev/null)"
+    image="$(short_ref "$image")"
     if [ -n "$wd" ] && { [ "$wd" = "$WORK_DIR" ] || [ "$wd" -ef "$WORK_DIR" ]; }; then
       printf '%s|here|%s\n' "$id" "$image"
     elif wiz_dir_gone "$wd" && [[ "$services" == *" $svc "* ]] && [[ "$repos" == *" ${image%:*} "* ]]; then
@@ -8311,7 +9046,7 @@ stack_containers() {
     else
       printf '%s|%s|%s\n' "$id" "${wd:-an unknown folder}" "$image"
     fi
-  done < <(docker ps -aq --filter "label=com.docker.compose.project=$(stack_project)" 2>/dev/null)
+  done < <(podman ps -aq --filter "label=com.docker.compose.project=$(stack_project)" 2>/dev/null)
 }
 
 # Containers of this installation, one ID per line
@@ -8332,11 +9067,11 @@ stack_foreign() {
   return 1
 }
 
-# Prints the folder of another Catalog installation - running or stopped - with the project name of
+# Prints the folder of another Catalog installation - running or stopped, its folder still there - with the project name of
 # this folder (its data volumes have the same names); fails when there is none
 stack_foreign_catalog() {
   local id owner image project dir p mine
-  if ! command -v docker >/dev/null 2>&1; then
+  if ! command -v podman >/dev/null 2>&1; then
     return 1
   fi
   while IFS='|' read -r id owner image; do
@@ -8348,7 +9083,7 @@ stack_foreign_catalog() {
   mine="$(stack_project)"
   while IFS='|' read -r project dir _; do
     p="${project#"${project%%[!_-]*}"}"
-    if [ -n "$dir" ] && [ "$p" = "${mine#"${mine%%[!_-]*}"}" ] && [ "$dir" != "$WORK_DIR" ] && ! [ "$dir" -ef "$WORK_DIR" ]; then
+    if [ -n "$dir" ] && [ "$p" = "${mine#"${mine%%[!_-]*}"}" ] && [ "$dir" != "$WORK_DIR" ] && ! [ "$dir" -ef "$WORK_DIR" ] && ! wiz_dir_gone "$dir"; then
       printf '%s' "$dir"
       return 0
     fi
@@ -8365,8 +9100,7 @@ stack_lost() {
     if [ -n "$project" ] && [ "$project" != "$mine" ] && wiz_dir_gone "$wd"; then
       printf '%s|%s\n' "$project" "$wd"
     fi
-  done < <(docker ps -a --filter "label=com.docker.compose.service=catalog-web" \
-    --format '{{.Label "com.docker.compose.project"}}|{{.Label "com.docker.compose.project.working_dir"}}' 2>/dev/null | sort -u)
+  done < <(catalog_web_containers '{{index .Config.Labels "com.docker.compose.project"}}|{{index .Config.Labels "com.docker.compose.project.working_dir"}}' | sort -u)
 }
 
 # Data volumes of this installation: the volumes this installer declares, named after the project -
@@ -8383,7 +9117,7 @@ remove_volumes() {
   project="$(stack_project)"
   while IFS= read -r key; do
     v="${project}_$key"
-    if [ -n "$key" ] && docker volume inspect "$v" >/dev/null 2>&1; then
+    if [ -n "$key" ] && podman volume exists "$v" 2>/dev/null; then
       printf '%s\n' "$v"
     fi
   done < <(stack_compose_keys volumes)
@@ -8392,13 +9126,17 @@ remove_volumes() {
 # remove_users VOLUME|IMAGE KIND -> names of containers that are not this installation's and use
 # the volume (KIND volume) or the image (KIND ancestor); empty when none
 remove_users() {
-  local id ours
+  local id ours what="$1"
   ours=" $(remove_containers | tr '\n' ' ') "
+  if [ "$2" = "ancestor" ]; then
+    # Podman matches image names as a pattern: the image ID is exact
+    what="$(podman image inspect --format '{{.ID}}' "$(qualify_ref "$1")" 2>/dev/null)" || return 0
+  fi
   while IFS= read -r id; do
     if [ -n "$id" ] && [[ "$ours" != *" $id "* ]]; then
-      docker inspect --format '{{.Name}}' "$id" 2>/dev/null | sed 's#^/##'
+      podman container inspect --format '{{.Name}}' "$id" 2>/dev/null | sed 's#^/##'
     fi
-  done < <(docker ps -aq --filter "$2=$1" 2>/dev/null)
+  done < <(podman ps -aq --filter "$2=$what" 2>/dev/null)
 }
 
 # Images of this installation that are here and that no other container uses
@@ -8410,14 +9148,17 @@ remove_images() {
       compose config --images 2>/dev/null || true
     fi
     stack_images
-  } | sort -u | while IFS= read -r img; do
-    if [ -n "$img" ] && docker image inspect "$img" >/dev/null 2>&1 && [ -z "$(remove_users "$img" ancestor)" ]; then
+  } | while IFS= read -r img; do
+    short_ref "$img"
+    echo
+  done | sort -u | while IFS= read -r img; do
+    if [ -n "$img" ] && podman image exists "$(qualify_ref "$img")" 2>/dev/null && [ -z "$(remove_users "$img" ancestor)" ]; then
       printf '%s\n' "$img"
     fi
   done
 }
 
-# True when the generated files are here and docker compose can use them
+# True when the generated files are here and podman compose can use them
 remove_compose_ok() {
   [ -f "$ENV_FILE" ] && [ -f "$COMPOSE_FILE" ] && detect_compose >/dev/null 2>&1
 }
@@ -8427,7 +9168,7 @@ remove_compose_ok() {
 remove_stack() {
   local volumes="$1" images="$2" ids img v out left="" kept=0 gone=0
   local -a vols=() imgs=()
-  require_docker
+  require_podman
   if [ "$volumes" = "yes" ]; then
     while IFS= read -r v; do
       if [ -n "$v" ] && [ -z "$(remove_users "$v" volume)" ]; then
@@ -8438,31 +9179,31 @@ remove_stack() {
   if [ "$images" = "yes" ]; then
     mapfile -t imgs < <(remove_images)
   fi
-  # docker compose down would also remove the containers of others with the same project name
+  # podman compose down would also remove the containers of others with the same project name
   if remove_compose_ok && ! stack_foreign >/dev/null; then
     job_step "Removing the containers"
     info "Removing the containers"
-    compose down --remove-orphans || warn "docker compose down reported an error - removing what is left directly."
+    compose down --remove-orphans || warn "podman compose down reported an error - removing what is left directly."
   fi
   ids="$(remove_containers | tr '\n' ' ')"
   if [ -n "${ids// /}" ]; then
     # shellcheck disable=SC2086
-    docker rm -f $ids >/dev/null 2>&1 || true
+    podman rm -f $ids >/dev/null 2>&1 || true
   fi
   for v in ${vols[@]+"${vols[@]}"}; do
     job_step "Removing the data volumes"
-    if docker volume inspect "$v" >/dev/null 2>&1; then
-      docker volume rm "$v" >/dev/null 2>&1 || true
+    if podman volume exists "$v" 2>/dev/null; then
+      podman volume rm "$v" >/dev/null 2>&1 || true
     fi
   done
   while IFS= read -r v; do
     if [ -n "$v" ]; then
-      docker network rm "$v" >/dev/null 2>&1 || true
+      podman network rm "$v" >/dev/null 2>&1 || true
     fi
-  done < <(docker network ls -q --filter "label=com.docker.compose.project=$(stack_project)" 2>/dev/null)
+  done < <(podman network ls -q --filter "label=com.docker.compose.project=$(stack_project)" 2>/dev/null)
   for img in ${imgs[@]+"${imgs[@]}"}; do
     job_step "Removing the images"
-    if out="$(docker image rm "$img" 2>&1)"; then
+    if out="$(podman image rm "$(qualify_ref "$img")" 2>&1)"; then
       ok "Image removed: $img"
       gone=$((gone + 1))
     else
@@ -8476,12 +9217,12 @@ remove_stack() {
     left="$left containers: $ids;"
   fi
   for v in ${vols[@]+"${vols[@]}"}; do
-    if docker volume inspect "$v" >/dev/null 2>&1; then
+    if podman volume exists "$v" 2>/dev/null; then
       left="$left volume $v;"
     fi
   done
   if [ -n "$left" ]; then
-    err "Still there:${left%;} - docker could not remove it (in use?)."
+    err "Still there:${left%;} - Podman could not remove it (in use?)."
     return 1
   fi
   ok "Containers$(if [ "${#vols[@]}" -gt 0 ]; then printf ' and %s data volume(s)' "${#vols[@]}"; fi) removed$(if [ "$images" = "yes" ]; then printf ', %s image(s) removed, %s kept' "$gone" "$kept"; fi)."
@@ -8489,7 +9230,7 @@ remove_stack() {
 
 # Worker of the remove task: a last MongoDB backup
 remove_backup() {
-  require_docker
+  require_podman
   mongo_backup
 }
 
@@ -8556,15 +9297,15 @@ remove_wizard() {
     done < <(job_running_ids)
   fi
 
-  # 1. Overview - without Docker nothing can be checked, so nothing is removed
-  if ! command -v docker >/dev/null 2>&1; then
+  # 1. Overview - without Podman nothing can be checked, so nothing is removed
+  if ! command -v podman >/dev/null 2>&1; then
     if [ -f "$ENV_FILE" ] || [ -f "$COMPOSE_FILE" ]; then
-      err "The docker command is not found (PATH?) - R cannot check what runs, so nothing was removed."
+      err "The podman command is not found (PATH?) - R cannot check what runs, so nothing was removed."
       return 0
     fi
-  elif ! docker info >/dev/null 2>&1; then
-    err "The Docker daemon is not reachable - is Docker running, and is your user in the 'docker' group?"
-    echo "  R needs Docker to remove the containers and data; nothing was removed."
+  elif ! podman info >/dev/null 2>&1 || [ "$(engine_rootless)" != "false" ]; then
+    err "Podman does not answer$(if [ "$OS_KIND" = "Darwin" ]; then printf ' (podman machine start)'; else printf ' as root (run as root)'; fi) - R cannot check what runs."
+    echo "  R needs Podman to remove the containers and data; nothing was removed."
     return 0
   else
     foreign_catalog="$(stack_foreign_catalog)" || foreign_catalog=""
@@ -8594,7 +9335,7 @@ remove_wizard() {
   if [ -n "$vols" ]; then
     printf '%s\n' "${vols% }" | fold -s -w $(($(settings_width) - 12)) | sed "s/^/      $C_DIM/; s/\$/$C_RST/"
   fi
-  printf '   %-34s %s\n' "Docker images of the stack" "$nimg"
+  printf '   %-34s %s\n' "Images of the stack" "$nimg"
   printf '   %-34s %s\n' "$ENV_FILE, $COMPOSE_FILE" "$(if [ -f "$ENV_FILE" ] || [ -f "$COMPOSE_FILE" ]; then echo yes; else echo no; fi)"
   printf '   %-34s %s\n' "Snapshots (snapshots/)" "$(if [ -n "$(remove_files snapshots)" ]; then remove_size snapshots; else echo none; fi)"
   printf '   %-34s %s\n' "MongoDB backups (backups/)" "$(if [ -n "$(remove_files backups)" ]; then remove_size backups; else echo none; fi)"
@@ -8628,7 +9369,7 @@ remove_wizard() {
     echo
   fi
   if [ -z "$foreign_catalog" ] && [ "$nvol" -eq 0 ] && [ -z "$busy" ] && [ -n "$(project_volumes)" ]; then
-    warn "Docker volumes of project \"$(stack_project)\" exist, but nothing here shows they belong to this folder - they are kept."
+    warn "Podman volumes of project \"$(stack_project)\" exist, but nothing here shows they belong to this folder - they are kept."
     echo
   fi
   for key in files jobs snapshots backups bundles installer-backups; do
@@ -8683,7 +9424,7 @@ remove_wizard() {
     keys+=(volumes); labels+=("Data volumes with this project name ($nvol) - not selected: they may be another installation's"); picked+=(0)
   fi
   if [ "$nimg" -gt 0 ]; then
-    keys+=(images); labels+=("Docker images of the stack ($nimg)"); picked+=(1)
+    keys+=(images); labels+=("Images of the stack ($nimg)"); picked+=(1)
   fi
   if [ -n "$(remove_files files)" ]; then
     if [ -n "$keep_env" ]; then
@@ -8776,7 +9517,7 @@ remove_wizard() {
     return 0
   fi
 
-  # 4. Remove: Docker first; the files only when Docker removed everything chosen
+  # 4. Remove: Podman first; the files only when Podman removed everything chosen
   wiz_head "Remove" 4 "${steps[@]}"
   if [ "$ncont" -gt 0 ] || [ "$vol" = "yes" ] || [ "$img" = "yes" ]; then
     since="$(wiz_last_job)"
@@ -8791,7 +9532,7 @@ remove_wizard() {
       return 0
     fi
     if [ "$rc" -ne 0 ]; then
-      err "Docker could not remove everything (see above) - the files with the passwords were kept. R tries again."
+      err "Podman could not remove everything (see above) - the files with the passwords were kept. R tries again."
       return 0
     fi
   fi
@@ -8904,11 +9645,11 @@ wiz_card() {
             l2="$(ui_fit "$width" "repair: check, files, start again" "repair: check, start again")"
             ;;
           unknown*)
-            l1="Docker not reachable"
+            l1="Podman not reachable"
             l2="16 checks the server"
             ;;
           *)
-            l1="no Docker"
+            l1="no Podman"
             l2="16 checks the server"
             ;;
         esac
@@ -9025,7 +9766,7 @@ ${c}ABOUT RAYNET$r
   Raynet maintains the catalog centrally at $CATALOG_CLOUD_URL. A local Catalog gets it
   as snapshots (option 17 and 19) or synchronizes itself every day (option 20).
 
-  This installer runs the local Catalog with Docker Compose: catalog-web, four workers, MongoDB,
+  This installer runs the local Catalog with Podman (podman compose): catalog-web, four workers, MongoDB,
   OpenSearch with Dashboards, RabbitMQ, MinIO and, optionally, Nginx Proxy Manager.
 
 ${c}THE ICONS$r
@@ -9041,7 +9782,7 @@ $(help_item R del "Remove" "Removes the Catalog from this server: you choose dat
 
 ${c}SETUP $UI_SEP install on this host$r
 $(help_item 7 run "Install in one go" "Generates .env and docker-compose.yml, validates them and starts the stack" "in one go; asks only about existing passwords and the time zone (I guides).")
-$(help_item 16 view "Check this server" "Docker, Compose, kernel, ports, vm.max_map_count, time zone.")
+$(help_item 16 view "Check this server" "Podman, podman compose, kernel, ports, vm.max_map_count, time zone.")
 $(help_item 23 run "Take over installation" "Takes the settings of an existing installation (another folder," "or an older installer in this folder); its passwords and data stay.")
 
 ${c}CONFIGURE $UI_SEP edit settings, 2 writes the files, 6 applies them$r
@@ -9049,19 +9790,19 @@ $(help_item 1 edit "Edit settings" "All settings on one screen, grouped by name 
 $(help_item 2 run "Generate .env + compose" "Writes .env and docker-compose.yml from the settings. Passwords are kept;" "asks to align TZ with the server's time zone.")
 $(help_item 3 edit "Edit .env" "Shows or edits the generated .env (passwords included). 2 writes it" "again from the settings, so lasting changes belong into the settings (1).")
 $(help_item 4 edit "Edit docker-compose.yml" "Shows or edits the generated compose file (2 writes it again).")
-$(help_item 5 view "Check the files" "Lets Docker Compose check both files (docker compose config); starts nothing.")
+$(help_item 5 view "Check the files" "Lets podman compose check both files (podman compose config); starts nothing.")
 
 ${c}ACCESS $UI_SEP addresses and logins$r
 $(help_item 14 view "User names + passwords" "User names and passwords of MongoDB, MinIO and RabbitMQ from .env.")
 $(help_item 15 view "URLs and proxy setup" "Where Catalog Web and the other services answer, and the steps for" "Nginx Proxy Manager (TLS certificate, proxy host).")
 
 ${c}START & STOP $UI_SEP the containers$r
-$(help_item 6 run "Start / apply changes" "docker compose up -d: starts the stack or applies changed files.")
+$(help_item 6 run "Start / apply changes" "podman compose up -d: starts the stack or applies changed files.")
 $(help_item 12 run "Restart the stack" "Restarts all containers; the data is kept.")
-$(help_item 13 run "Stop (data is kept)" "docker compose down; the data volumes are kept.")
+$(help_item 13 run "Stop (data is kept)" "podman compose down; the data volumes are kept.")
 
 ${c}MONITOR $UI_SEP is it running well?$r
-$(help_item 9 view "Status and health" "docker compose ps: which containers run and their health.")
+$(help_item 9 view "Status and health" "podman compose ps: which containers run and their health.")
 $(help_item 10 view "Follow the logs" "Follow the logs of all or one service.")
 $(help_item J view "Background jobs" "Long tasks run as jobs: they continue when you leave the menu or the" "SSH session ends. Follow, cancel or read their log here.")
 
@@ -9150,7 +9891,7 @@ menu_items() {
   cat <<EOF
 1|-||SETUP|install on this host|check the server, then install or take over
 1|7|run|Install in one go|writes files, checks, starts|Generates both files, validates, starts
-1|16|view|Check this server|Docker, ports, kernel, TZ|Checks Docker, Compose, kernel, ports, TZ
+1|16|view|Check this server|Podman, ports, kernel, TZ|Checks Podman, Compose, kernel, ports, TZ
 1|23|run|Take over installation|keeps its passwords and data|Takes over an installation (copies its files)
 1|||
 1|-||CONFIGURE|settings and files|edit settings - 2 writes the files, 6 applies
@@ -9158,15 +9899,15 @@ menu_items() {
 1|2|run|Generate .env + compose|from settings; passwords kept|Writes both files; the passwords are kept
 1|3|edit|Edit .env|by hand; 2 overwrites it|Opens .env (it holds the passwords)
 1|4|edit|Edit docker-compose.yml|by hand; 2 overwrites it|Opens docker-compose.yml in the editor
-1|5|view|Check the files|docker compose config|Lets Docker Compose check both files
+1|5|view|Check the files|podman compose config|Lets podman compose check both files
 1|||
 1|-||ACCESS|addresses and logins|where to sign in, user names and passwords
 1|14|view|User names + passwords|MongoDB, MinIO, RabbitMQ|Logins of MongoDB, MinIO and RabbitMQ
 1|15|view|URLs and proxy setup|addresses, Nginx Proxy steps|Addresses of all services, TLS proxy steps
 2|-||START & STOP|the containers|all containers of this stack
-2|6|run|Start / apply changes|starts, or applies new files|docker compose up -d: starts or applies
+2|6|run|Start / apply changes|starts, or applies new files|podman compose up -d: starts or applies
 2|12|run|Restart the stack|all containers, data kept|Restarts all containers; data is kept
-2|13|run|Stop (data is kept)|containers go, data stays|docker compose down - data volumes stay
+2|13|run|Stop (data is kept)|containers go, data stays|podman compose down - data volumes stay
 2|||
 2|-||MONITOR|is it running well?|status, logs and background jobs
 2|9|view|Status and health|what runs and is healthy|Which containers run, and their health
@@ -9560,6 +10301,9 @@ menu() {
   unset RVC_NOTICE
   trap 'printf "\n"' INT
 
+  # prerequisites first: without Podman nothing can run (asked only in a terminal)
+  podman_offer
+
   if [ -n "${RVC_HUB_STATUS:-}" ]; then
     HUB_STATUS="$RVC_HUB_STATUS"
     LATEST_VERSION="${RVC_LATEST_VERSION:-}"
@@ -9637,17 +10381,19 @@ Commands:
   menu                        Interactive menu (default)
   generate [--new-passwords]  Write $ENV_FILE and $COMPOSE_FILE.
                               Existing passwords are kept unless --new-passwords is given.
-  validate                    Check the configuration (docker compose config)
-  up                          Validate and start / update the stack (docker compose up -d)
+  validate                    Check the configuration (podman compose config)
+  up                          Validate and start / update the stack (podman compose up -d)
   setup                       generate + validate + up
-  status                      Show container status (docker compose ps)
+  status                      Show container status (podman compose ps)
+  health [SECONDS]            Wait until every service runs and Catalog Web answers
+  install-podman              Install Podman and the newest Docker Compose (the engine of podman compose)
   logs [service]              Follow the logs of all services or of one service
   pull                        Pull the images
   restart                     Restart all containers
   down                        Stop and remove the containers (data volumes are kept)
   credentials                 Show the generated credentials
   info                        Show URLs and Nginx Proxy Manager instructions
-  check                       Check prerequisites (Docker, Compose, ports, vm.max_map_count, Docker Hub)
+  check                       Check prerequisites (Podman, podman compose, ports, vm.max_map_count, Docker Hub)
   timezone                    Use the time zone of this server for TZ (the job times are converted)
   updates                     Show available updates for all components
   upgrade                     Guided upgrade (asks first, then runs as a background job)
@@ -9706,6 +10452,8 @@ main() {
     info|urls) show_access_info ;;
     check) do_check ;;
     timezone|tz) timezone_cli ;;
+    install-podman) podman_setup yes ;;
+    health) require_files && require_podman && stack_health "${1:-$HEALTH_TIMEOUT}" ;;
     __cron_convert) cron_convert "$@"; echo ;;
     __settings_groups) settings_grouped "$SCRIPT_PATH" ;;
     __menu_items) menu_items ;;
@@ -9728,7 +10476,7 @@ main() {
         else
           export RVC_NOTICE="The installer is up to date."
         fi
-        exec bash "$SCRIPT_PATH" menu
+        exec "$BASH" "$SCRIPT_PATH" menu
       fi
       ;;
     adopt) adopt_installation cli "${1:-}" ;;

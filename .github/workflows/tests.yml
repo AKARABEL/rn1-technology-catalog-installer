@@ -36,7 +36,7 @@ jobs:
         run: bash tests/run_timezone_tests.sh "$PWD/rn1-technology-catalog-installer.sh"
       - name: Guided tasks install, update and remove
         run: bash tests/run_wizard_tests.sh "$PWD/rn1-technology-catalog-installer.sh"
-      - name: Package and Docker hints of the distribution
+      - name: Podman install and the hints of the distribution, macOS flows
         run: bash tests/run_distro_tests.sh "$PWD/rn1-technology-catalog-installer.sh"
 
   distributions:
@@ -62,3 +62,94 @@ jobs:
           persist-credentials: false
       - name: All suites as a normal user
         run: docker run --rm -v "$PWD:/src:ro" "${{ matrix.image }}" bash /src/tests/run_in_container.sh
+
+  e2e-podman:
+    name: Catalog on real Podman (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 75
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, ubuntu-26.04]
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - name: Room and settings for the stack (disk, vm.max_map_count, no Docker)
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/share/boost
+          sudo sysctl -w vm.max_map_count=262144
+          sudo systemctl disable --now docker.service docker.socket || true
+          df -h /
+      - name: Installer in its own folder
+        run: |
+          mkdir -p "$RUNNER_TEMP/rn1"
+          cp rn1-technology-catalog-installer.sh "$RUNNER_TEMP/rn1/"
+          sed -i 's/^CHECK_FOR_UPDATES=.*/CHECK_FOR_UPDATES="false"/; s/^HEALTH_TIMEOUT=.*/HEALTH_TIMEOUT="1500"/' "$RUNNER_TEMP/rn1/rn1-technology-catalog-installer.sh"
+      - name: install-podman (Podman, socket, restart service, newest Docker Compose)
+        run: sudo bash "$RUNNER_TEMP/rn1/rn1-technology-catalog-installer.sh" install-podman
+      - name: The newest Docker Compose release is the provider
+        run: |
+          tag="$(curl -fsSI https://github.com/docker/compose/releases/latest | tr -d '\r' | sed -n 's#^[Ll]ocation: .*/tag/##p')"
+          have="$(sudo /usr/local/lib/docker/cli-plugins/docker-compose version --short)"
+          echo "newest $tag, installed $have"
+          [ "v${have#v}" = "$tag" ]
+          systemctl is-active podman.socket
+          systemctl is-enabled podman-restart.service
+      - name: setup (generate and start)
+        run: cd "$RUNNER_TEMP/rn1" && sudo bash rn1-technology-catalog-installer.sh setup </dev/null
+      - name: health (every service runs, Catalog Web answers)
+        timeout-minutes: 30
+        run: cd "$RUNNER_TEMP/rn1" && sudo bash rn1-technology-catalog-installer.sh health 1500
+      - name: check (option 16)
+        run: cd "$RUNNER_TEMP/rn1" && sudo bash rn1-technology-catalog-installer.sh check
+      - name: Containers carry the compose labels the installer relies on
+        run: |
+          cd "$RUNNER_TEMP/rn1"
+          want="$(sudo env PODMAN_COMPOSE_PROVIDER=/usr/local/lib/docker/cli-plugins/docker-compose podman compose --env-file .env -f docker-compose.yml config --services | sort | tr '\n' ' ')"
+          have="$(sudo podman ps -q --filter label=com.docker.compose.project=rn1 | xargs sudo podman container inspect --format '{{index .Config.Labels "com.docker.compose.service"}}' | sort | tr '\n' ' ')"
+          echo "want: $want"; echo "have: $have"
+          [ "$want" = "$have" ]
+      - name: down and up again - the data volumes stay
+        run: |
+          cd "$RUNNER_TEMP/rn1"
+          sudo bash rn1-technology-catalog-installer.sh down </dev/null
+          sudo podman volume exists rn1_db_data
+          sudo bash rn1-technology-catalog-installer.sh up </dev/null
+          timeout 1800 sudo bash rn1-technology-catalog-installer.sh health 1500
+      - name: Diagnostics
+        if: failure() || cancelled()
+        run: |
+          cd "$RUNNER_TEMP/rn1" || exit 0
+          sudo podman ps -a || true
+          sudo podman ps -aq | xargs -r sudo podman container inspect --format '{{.Name}} {{.State.Status}} health={{with .State.Health}}{{.Status}}{{end}} restarts={{.RestartCount}} exit={{.State.ExitCode}} {{.State.Error}}' || true
+          curl -sS -o /dev/null -w 'Catalog Web: HTTP %{http_code}\n' --max-time 10 http://localhost:8080/ || true
+          free -m; df -h /
+          sudo env PODMAN_COMPOSE_PROVIDER=/usr/local/lib/docker/cli-plugins/docker-compose podman compose --env-file .env -f docker-compose.yml logs --tail=80 || true
+          journalctl -u podman.socket --no-pager | tail -n 50 || true
+
+  macos:
+    name: macOS (Apple Silicon)
+    runs-on: macos-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - name: The macOS bash 3.2 is refused with a clear message (before Homebrew bash is used)
+        run: |
+          out="$(env RN1_BASH_REEXEC=1 /bin/bash rn1-technology-catalog-installer.sh help 2>&1)" && exit 1
+          echo "$out"
+          grep -q "bash 4.2 or newer is needed" <<< "$out"
+      - name: Homebrew bash and the GNU tools
+        run: |
+          brew install bash coreutils gnu-sed grep findutils
+          p="$(brew --prefix)"
+          for t in coreutils gnu-sed grep findutils; do echo "$p/opt/$t/libexec/gnubin" >> "$GITHUB_PATH"; done
+          echo "$p/bin" >> "$GITHUB_PATH"
+      - name: /bin/bash starts the installer in Homebrew bash
+        run: /bin/bash rn1-technology-catalog-installer.sh help | head -n 5
+      - name: Syntax
+        run: bash -n rn1-technology-catalog-installer.sh
+      - name: Podman install and macOS flows (fake Homebrew, Podman machine, GitHub)
+        run: bash tests/run_distro_tests.sh "$PWD/rn1-technology-catalog-installer.sh"

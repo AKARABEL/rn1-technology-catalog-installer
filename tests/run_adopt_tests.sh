@@ -6,37 +6,133 @@ T="$(mktemp -d)/ad"
 rm -rf "$T"; mkdir -p "$T/bin" "$T/oldroot" "$T/rn1-technology-catalog"
 PASS=0; FAIL=0
 check() { if eval "$2"; then PASS=$((PASS+1)); echo "PASS: $1"; else FAIL=$((FAIL+1)); echo "FAIL: $1"; fi; }
-export LOG="$T/docker.log" OLD="$T/oldroot"
-: > "$LOG"
+export LOG="$T/podman.log" UNHANDLED="$T/unhandled.log" OLD="$T/oldroot"
+: > "$LOG"; : > "$UNHANDLED"
 
 sed -e 's/^CATALOG_WEB_PORT=.*/CATALOG_WEB_PORT="8181"/' -e 's/^INSTALL_NGINX_PROXY_MANAGER=.*/INSTALL_NGINX_PROXY_MANAGER="false"/' \
     -e 's/^MONGO_TAG=.*/MONGO_TAG="7.0"/' -e 's/^AUTOSYNC_CRON=.*/AUTOSYNC_CRON="15 3 * * 1-5"/' "$SP/original.sh" > "$OLD/catalog.sh"
 (cd "$OLD" && bash catalog.sh >/dev/null 2>&1)
 old_env="$(cksum < "$OLD/.env")"; old_compose="$(cksum < "$OLD/docker-compose.yml")"
 
-cat > "$T/bin/docker" <<'EOF'
+# Fake rootful Podman 5.7 with one container: catalog-web of compose project "root", started in $OLD
+# (SHIM_NO_LABELS=1: the container carries no compose labels). Calls it does not know are logged in
+# $UNHANDLED and fail like Podman does (exit 125).
+cat > "$T/bin/podman" <<'EOF'
 #!/usr/bin/env bash
-echo "docker $*" >> "$LOG"
-case "$1" in
-  info) exit 0 ;;
+echo "podman $*" >> "$LOG"
+unhandled() { echo "UNHANDLED podman $ARGS" >> "$UNHANDLED"; echo "Error: fake podman: unhandled: $ARGS" >&2; exit 125; }
+ARGS="$*"
+CID=c0ffee000001
+labels() {
+  if [ "${SHIM_NO_LABELS:-}" != 1 ]; then
+    printf '%s\n' "com.docker.compose.project=root" "com.docker.compose.service=catalog-web" \
+      "com.docker.compose.project.working_dir=$OLD" "com.docker.compose.project.config_files=$OLD/docker-compose.yml"
+  fi
+}
+label() { labels | sed -n "s#^$1=##p" | head -n 1; }
+# render TEMPLATE -> the template filled with the fields of the container (podman container inspect)
+render() {
+  local t="$1" k
+  sub() { t=${t//"$1"/"$2"}; }
+  for k in com.docker.compose.project.working_dir com.docker.compose.project.config_files \
+    com.docker.compose.project.environment_file com.docker.compose.project com.docker.compose.service; do
+    sub "{{index .Config.Labels \"$k\"}}" "$(label "$k")"
+  done
+  sub '{{.Config.Image}}' docker.io/raynetgmbh/rayventory-catalog:25.4.4191.133
+  sub '{{.State.Status}}' running
+  sub '{{with .State.Health}}{{or .Status "none"}}{{else}}none{{end}}' none
+  sub '{{.RestartCount}}' 0
+  sub '{{.Name}}' catalog-web
+  case "$t" in *'{{'*) unhandled ;; esac
+  printf '%s\n' "$t"
+}
+case "${1:-}" in
+  --version) echo "podman version 5.7.0" ;;
+  info)
+    if [ $# -eq 1 ]; then exit 0; fi
+    [ "$2" = --format ] && [ $# -eq 3 ] || unhandled
+    case "$3" in
+      '{{.Host.Security.Rootless}}') echo false ;;
+      *) unhandled ;;
+    esac ;;
   ps)
-    if [ "$2" = -a ] && [ "${SHIM_NO_LABELS:-}" != 1 ]; then
-      echo "root|$OLD|$OLD/docker-compose.yml||raynetgmbh/rayventory-catalog:25.4.4191.133|Up 3 days"
-    fi
-    exit 0 ;;
+    shift; match=1
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        -aq|-qa) ;;
+        --filter)
+          case "${2:-}" in
+            label=*=*) f="${2#label=}"; [ "$(label "${f%%=*}")" = "${f#*=}" ] || match=0 ;;
+            volume=*|ancestor=*) match=0 ;;
+            *) unhandled ;;
+          esac
+          shift ;;
+        *) unhandled ;;
+      esac
+      shift
+    done
+    if [ "$match" = 1 ]; then echo "$CID"; fi ;;
+  container)
+    [ "${2:-}" = inspect ] && [ "${3:-}" = --format ] && [ $# -ge 5 ] || unhandled
+    tmpl="$4"; shift 4
+    for id in "$@"; do
+      if [ "$id" != "$CID" ]; then echo "Error: no such container $id" >&2; exit 125; fi
+      render "$tmpl"
+    done ;;
+  volume)
+    case "${2:-} ${3:-} ${4:-}" in
+      "ls -q --filter") ;;
+      exists\ *) exit 1 ;;
+      *) unhandled ;;
+    esac ;;
   compose)
-    shift
-    while [ $# -gt 0 ]; do case "$1" in -p|--env-file|-f) shift 2 ;; *) break ;; esac; done
-    case "$1" in
-      version) echo "Docker Compose version v2.29.0" ;;
-      ps) [ "${2:-}" = --services ] && echo catalog-web ;;
-      config) [ "${2:-}" = --services ] && echo catalog-web ;;
-    esac
-    exit 0 ;;
+    # like Podman: run the provider the installer exported
+    if [ -z "${PODMAN_COMPOSE_PROVIDER:-}" ]; then
+      echo "Error: looking up compose provider failed" >&2; unhandled
+    fi
+    shift; exec "$PODMAN_COMPOSE_PROVIDER" "$@" ;;
+  *) unhandled ;;
 esac
 exit 0
 EOF
-chmod +x "$T/bin/docker"
+chmod +x "$T/bin/podman"
+# The provider behind "podman compose" (the official Docker Compose)
+cat > "$T/bin/docker-compose" <<'EOF'
+#!/usr/bin/env bash
+ARGS="$*"
+unhandled() { echo "UNHANDLED docker-compose $ARGS" >> "$UNHANDLED"; echo "fake docker-compose: unhandled: $ARGS" >&2; exit 1; }
+while [ $# -gt 0 ]; do case "$1" in -p|--env-file|-f) shift 2 ;; *) break ;; esac; done
+case "${1:-}" in
+  version) if [ "${2:-}" = --short ]; then echo "5.6.0"; else echo "Docker Compose version v5.6.0"; fi ;;
+  ps)
+    case "${2:-}" in
+      "") ;;
+      --services) echo catalog-web ;;
+      *) unhandled ;;
+    esac ;;
+  config)
+    case "${2:-}" in
+      --services) echo catalog-web ;;
+      --quiet|--volumes|--images) ;;
+      *) unhandled ;;
+    esac ;;
+  *) unhandled ;;
+esac
+exit 0
+EOF
+chmod +x "$T/bin/docker-compose"
+export RN1_COMPOSE_PROVIDER="$T/bin/docker-compose"
+# systemd: podman.socket active, podman-restart.service enabled
+cat > "$T/bin/systemctl" <<'EOF'
+#!/usr/bin/env bash
+echo "systemctl $*" >> "$LOG"
+case "$*" in
+  "is-active --quiet podman.socket"|"is-active podman.socket") exit 0 ;;
+  "is-enabled podman-restart.service") echo enabled ;;
+  *) echo "UNHANDLED systemctl $*" >> "$UNHANDLED"; exit 1 ;;
+esac
+EOF
+chmod +x "$T/bin/systemctl"
 cat > "$T/bin/timedatectl" <<'TZEOF'
 #!/usr/bin/env bash
 printf '%s\n' "${SHIM_TZ:-Europe/Berlin}"
@@ -58,6 +154,7 @@ check "menu points to the existing installation" 'grep -q "A Catalog installatio
 # 2. Take over via option 23
 out="$(printf '23\ny\n0\n' | bash "$D/rn1-technology-catalog-installer.sh" menu 2>&1)"
 check "shows what was found, passwords hidden" 'grep -q "Compose project  *root" <<< "$out" && grep -q "Catalog version  *25.4.4191.133" <<< "$out" && grep -q "MONGO_INITDB_ROOT_PASSWORD  *found (not shown)" <<< "$out" && ! grep -q "$(sed -n "s/^MONGO_INITDB_ROOT_PASSWORD=//p" "$OLD/.env")" <<< "$out"'
+check "listing: version of the docker.io image, state from podman" 'grep -q "project root  *Catalog 25.4.4191.133  *running$" <<< "$out"'
 same_pw() { local k; for k in MONGO_INITDB_ROOT_PASSWORD MINIO_ROOT_PASSWORD RABBITMQ_DEFAULT_PASS; do [ "$(grep "^$k=" "$D/.env")" = "$(grep "^$k=" "$OLD/.env")" ] || return 1; done; }
 check ".env copied with the same passwords (+ project name)" 'same_pw && grep -q "^COMPOSE_PROJECT_NAME=root$" "$D/.env"'
 check "compose file copied unchanged" 'cmp -s "$D/docker-compose.yml" "$OLD/docker-compose.yml"'
@@ -70,7 +167,8 @@ check "installer backup kept" 'ls "$D"/rn1-technology-catalog-installer.sh.bak-*
 
 # 3. Compose commands now use the old project (same containers, same volumes)
 : > "$LOG"; bash "$D/rn1-technology-catalog-installer.sh" status </dev/null >/dev/null 2>&1
-check "docker compose runs with -p root" 'grep -q "^docker compose -p root --env-file .env -f docker-compose.yml ps" "$LOG"'
+check "podman compose runs with -p root" 'grep -q "^podman compose -p root --env-file .env -f docker-compose.yml ps$" "$LOG"'
+check "status checks rootful Podman and its API socket first" 'grep -qxF "podman info --format {{.Host.Security.Rootless}}" "$LOG" && grep -qxF "systemctl is-active --quiet podman.socket" "$LOG"'
 
 # 4. Generating keeps the passwords and the project name
 bash "$D/rn1-technology-catalog-installer.sh" generate </dev/null >/dev/null 2>&1
@@ -179,6 +277,9 @@ K="$T/comments"; installer "$K" catalog.sh "0,/^CATALOG_WEB_PORT=/s/^CATALOG_WEB
 gen "$K" catalog.sh; installer "$K" "$N"
 out="$(SHIM_NO_LABELS=1 bash "$K/$N" adopt ./catalog.sh </dev/null 2>&1)"; rc=$?
 check "comments and quotes: values as bash reads them" '[ "$rc" -eq 0 ] && grep -qxF "CATALOG_WEB_PORT=\"9090\"" "$K/$N" && grep -qxF "QUEUE_PREFIX=\"rvc\\\$x\"" "$K/$N" && bash "$K/$N" check-settings >/dev/null 2>&1'
+
+check "no unhandled podman, compose or systemctl calls" '[ ! -s "$UNHANDLED" ]'
+if [ -s "$UNHANDLED" ]; then sort -u "$UNHANDLED" | sed 's/^/  /'; fi
 
 echo "== $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]

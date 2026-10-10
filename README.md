@@ -1,10 +1,12 @@
 # RN1 Technology Catalog Installer
 
-`rn1-technology-catalog-installer.sh` installs and runs the **Raynet One Technology Catalog** with Docker Compose. A menu guides you through setup, updates, offline installations and catalog snapshots.
+`rn1-technology-catalog-installer.sh` installs and runs the **Raynet One Technology Catalog** with Podman and `podman compose`. A menu guides you through setup, updates, offline installations and catalog snapshots.
 
 ## Requirements
 
-- Linux with Docker Engine and the Docker Compose plugin: Ubuntu, Debian, RHEL 8 to 10, CentOS Stream, Rocky Linux, AlmaLinux, Oracle Linux or openSUSE. The older `docker-compose` 1.27 or newer also works. Podman (`podman-docker`) is not supported. Option 16 shows how to install Docker Engine on the server's distribution, see [RHEL, CentOS, Rocky and AlmaLinux](#rhel-centos-rocky-and-almalinux).
+- **Linux (x86_64), run as root:** Ubuntu 24.04 or newer, Debian 13 or newer, RHEL 8 to 10, CentOS Stream, Rocky Linux, AlmaLinux, Oracle Linux, Fedora or openSUSE. The Catalog runs with **rootful Podman** 4.9 or newer; the installer sets it up (see [Podman](#podman)).
+- **macOS 26 (Tahoe) or newer on Apple Silicon** (M1 or newer) with Homebrew, run as your normal user; see [macOS](#macos).
+- Not supported: Debian 12 (its Podman 4.3 has no `podman compose`), Ubuntu before 24.04, RHEL/CentOS 7, ARM Linux and Intel Macs. The Catalog images exist only for amd64.
 - bash 4.2 or newer and curl. Snapshot features also need `jq` or `python3`.
 - For OpenSearch: `vm.max_map_count` of at least 262144. Menu option 16 checks this.
 
@@ -22,7 +24,7 @@ RHEL, Rocky and AlmaLinux minimal installations have no `wget`; use curl there:
 curl -fsSL -o rn1-technology-catalog-installer.sh https://raw.githubusercontent.com/AKARABEL/rn1-technology-catalog-installer/main/rn1-technology-catalog-installer.sh && chmod +x rn1-technology-catalog-installer.sh && ./rn1-technology-catalog-installer.sh
 ```
 
-Then press **I** for the guided installation, or choose **7** to generate, validate and start in one go. The settings are at the top of `rn1-technology-catalog-installer.sh`; option **1** shows them on one screen to change and check them (**E** there opens them in `vi`).
+When Podman is missing, the installer says so first and offers to set it up. Then press **I** for the guided installation, or choose **7** to generate, validate and start in one go. The settings are at the top of `rn1-technology-catalog-installer.sh`; option **1** shows them on one screen to change and check them (**E** there opens them in `vi`).
 
 - Run the script as a file, as shown above. Piping it into bash (`wget -O- ... | bash`) does not work, because the menu needs the keyboard and the script stores its settings in its own file.
 - **Later updates:** use option **22** (or `./rn1-technology-catalog-installer.sh self-update`) instead of the `wget` line. It downloads the newest version, keeps all your settings and then opens the menu. It just ends with `--no-menu` (for scripts run in a terminal), and without a terminal: cron, pipes, redirected input or output, or a run in the background (`timeout`, `&`). The first update of an installer from before this feature still ends without the menu, because the old version decides that; start the script again. The previous version is kept as `rn1-technology-catalog-installer.sh.bak-<timestamp>`. Running the `wget` line again would overwrite your settings. If the line seems to do nothing, the download failed: `wget -nv` prints why (network, DNS, proxy).
@@ -31,7 +33,7 @@ Then press **I** for the guided installation, or choose **7** to generate, valid
 
 If the Catalog was installed earlier in another folder, for example with an older script in `/root`, the menu shows where that installation is. Option **23** then takes it over:
 
-- It finds the installation from the Docker Compose labels of its containers: project, folder, compose file and env file. If the containers carry no labels, it searches `/root`, `/home`, `/opt` and `/srv`, or uses the folder you name with `./rn1-technology-catalog-installer.sh adopt FOLDER`.
+- It finds the installation from the Compose labels of its containers: project, folder, compose file and env file. If the containers carry no labels, it searches `/root`, `/home`, `/opt` and `/srv`, or uses the folder you name with `./rn1-technology-catalog-installer.sh adopt FOLDER`.
 - It shows the version, the ports and which passwords were found; the passwords themselves are not displayed.
 - It copies `.env` (with the passwords) and `docker-compose.yml` into this folder, and writes the values into the settings of `rn1-technology-catalog-installer.sh`.
 - It sets `COMPOSE_PROJECT_NAME` to the existing project (for example `root`), so that the same containers and data volumes stay in use. A new folder name would otherwise start a second, empty stack.
@@ -48,7 +50,7 @@ Long tasks run as background jobs: start, pull, restart, stop, snapshot download
 - A cancelled job cleans up first:
   - a snapshot download removes its partial file;
   - an offline bundle removes its half-written folder or archive;
-  - an upgrade cancelled before `docker compose down` changes nothing, and after it goes back to the previous version.
+  - an upgrade cancelled before `podman compose down` changes nothing, and after it goes back to the previous version.
 - Holding X again while a job is still cleaning up stops it at once.
 - Jobs of the same kind (for example two jobs that change the stack) do not run at the same time.
 - From the command line: `./rn1-technology-catalog-installer.sh jobs [list | follow N | cancel N | log N]`.
@@ -67,8 +69,8 @@ Below the cards, the options are grouped by what you want to do. The numbers are
 
 | Group | Options |
 |---|---|
-| **SETUP** · install on this host | **7** install in one go: generate, validate and start · **16** check this server: Docker, Compose, kernel, ports, `vm.max_map_count`, time zone · **23** take over an existing installation on this host (its `.env`, `docker-compose.yml`, passwords and data) |
-| **CONFIGURE** · settings and files | **1** edit the settings: all settings of the script on one screen, grouped by name (see below) · **2** generate `.env` and `docker-compose.yml`; existing passwords are kept · **3**, **4** edit the generated files by hand (**2** writes them again) · **5** check the files (`docker compose config`). After a change of the settings, **2** writes the files and **6** applies them |
+| **SETUP** · install on this host | **7** install in one go: generate, validate and start · **16** check this server: Podman, podman compose, kernel, ports, `vm.max_map_count`, time zone · **23** take over an existing installation on this host (its `.env`, `docker-compose.yml`, passwords and data) |
+| **CONFIGURE** · settings and files | **1** edit the settings: all settings of the script on one screen, grouped by name (see below) · **2** generate `.env` and `docker-compose.yml`; existing passwords are kept · **3**, **4** edit the generated files by hand (**2** writes them again) · **5** check the files (`podman compose config`). After a change of the settings, **2** writes the files and **6** applies them |
 | **ACCESS** · addresses and logins | **14** user names and passwords · **15** URLs and the Nginx Proxy Manager steps |
 | **START & STOP** · the containers | **6** start or apply changes (`up -d`) · **12** restart · **13** stop; the data is kept |
 | **MONITOR** · is it running well? | **9** status and health · **10** logs · **J** background jobs: follow, cancel and read the log |
@@ -126,7 +128,7 @@ A setting added to the script later appears in its group by itself.
    - a copy of `rn1-technology-catalog-installer.sh`
 
    It can also create a `.tar.gz` and copy it with scp. Before any password is sent, it shows the SSH host key fingerprint for confirmation.
-2. On the target: unpack the archive, run `./import-images.sh` (it detects docker or podman and verifies the checksums), then run the installer it names (`./rn1-technology-catalog-installer.sh`, or `./catalog.sh` in bundles from older versions) and choose **7**.
+2. On the target: unpack the archive, run `sudo ./import-images.sh` as root (it verifies the checksums, loads the images into the Podman of root and installs the Docker Compose the bundle carries), then run the installer it names (`./rn1-technology-catalog-installer.sh`, or `./catalog.sh` in bundles from older versions) and choose **7**.
 
 The bundle contains no `.env`. The target generates its own passwords.
 
@@ -169,9 +171,9 @@ Option **21** compares the running Catalog with the newest version on Docker Hub
 
 1. takes a MongoDB backup (`mongodump`, stored in `backups/`; the password stays inside the container);
 2. pulls the new images while the old version still runs;
-3. runs `docker compose down` (data volumes are kept);
+3. runs `podman compose down` (data volumes are kept);
 4. sets `CATALOG_VERSION` and regenerates the files (the passwords are kept);
-5. runs `docker compose up -d`;
+5. runs `podman compose up -d`;
 6. runs a health check: every container must be running (and healthy where a healthcheck exists), and Catalog Web must answer. The script waits at most `HEALTH_TIMEOUT` seconds (default 600).
 
 Steps 1 to 6 run as one background job. If the health check fails, the script shows the logs and offers to go back to the previous version, together with the `mongorestore` command for the backup. If you were not watching, the menu shows a note and option 21 offers the way back. If you cancel the job, the script goes back by itself.
@@ -212,23 +214,30 @@ Until 2026-10-05 the installer was called `catalog.sh`. Such installations keep 
 - To use the new name, rename the file while no job runs (check with **J**): `mv catalog.sh rn1-technology-catalog-installer.sh`. The installer finds its settings and files by its own location, so nothing else changes. If you keep the old name, use `./catalog.sh` wherever this README writes `./rn1-technology-catalog-installer.sh`.
 - If you run the one-line install in the folder of an installation that `catalog.sh` (or the original generator script) set up, the new installer starts with its default settings. Whenever another installer in the folder has other settings and generating would change the existing `.env` or `docker-compose.yml`, the menu says so, option 2 asks first, and `generate`, `setup`, the guided upgrade and the patch updates refuse. Option **23** (or `./rn1-technology-catalog-installer.sh adopt ./catalog.sh`) shows the differences, copies the settings of the old file and renames it (not while jobs run). If the other file is no longer used, rename or remove it instead. Differences in `CHECK_FOR_UPDATES` and `INSTALLER_URL` do not count.
 
-## RHEL, CentOS, Rocky and AlmaLinux
+## Podman
 
-- **Docker Engine:** install Docker CE from Docker's repository; the `podman-docker` package of the distribution is not supported. Option 16 prints the commands for the server, on Rocky Linux 9 for example:
+The Catalog runs in rootful Podman. `podman compose` runs the official **Docker Compose** as its engine, so the generated `docker-compose.yml` and `.env` keep their names and format.
 
-  ```bash
-  sudo dnf -y install dnf-plugins-core
-  sudo dnf config-manager --add-repo https://download.docker.com/linux/centos/docker-ce.repo
-  sudo dnf -y install docker-ce docker-ce-cli containerd.io docker-compose-plugin
-  sudo systemctl enable --now docker
-  ```
-
-  RHEL itself uses `https://download.docker.com/linux/rhel/docker-ce.repo`. If dnf reports a conflict with `podman` or `runc`, remove them first. Details: [docs.docker.com/engine/install](https://docs.docker.com/engine/install/).
-- **Packages:** the hints of the script name the package manager of the server (`sudo dnf install jq`, `sudo yum install curl`, `sudo zypper install ...`).
-- **SELinux** can stay enforcing: the stack keeps its data in named Docker volumes and mounts no host folders.
-- **firewalld** does not filter the ports that Docker publishes. Restrict access in the network firewall or the `DOCKER-USER` chain.
+- **Setup:** when Podman is not ready, the menu and **I** say why and offer to set it up (option **16** says why); `./rn1-technology-catalog-installer.sh install-podman` does it without asking. On Linux it:
+  - installs Podman from the packages of the distribution (`apt-get install podman netavark aardvark-dns`, `dnf install ...`, `zypper install podman`);
+  - enables the API socket that `podman compose` needs (`systemctl enable --now podman.socket`) and the restart of the containers after a reboot (`systemctl enable podman-restart.service`; every service has `restart: always`);
+  - installs the newest Docker Compose release from github.com/docker/compose into `/usr/local/lib/docker/cli-plugins/docker-compose`, after checking its checksum. No version is fixed: every check takes the newest release, and a release that does not work with the installed Podman is not installed (the working one stays, and the installer says so).
+- **Root:** run the installer as root (or with sudo). Rootless Podman cannot publish the ports 80 and 443 of Nginx Proxy Manager, give OpenSearch its memory lock, or keep the containers after the SSH session ends.
+- **Firewall:** Podman forwards the published ports before ufw/firewalld see them. OpenSearch Dashboards has no login - restrict access in the network firewall.
+- **SELinux** can stay enforcing: the stack keeps its data in named volumes and mounts no host folders.
 - **vm.max_map_count** is 65530 by default; OpenSearch wants 262144 (option 16 shows the two commands).
-- **CentOS 7 and RHEL 7** are end of life. The tests run there to keep bash 4.2 working, but use version 8 or newer for new servers.
+- **Offline servers:** Podman itself comes from the distribution's package mirror. The offline bundle carries the newest Docker Compose of the day it was made; `import-images.sh` enables the API socket and the restart service and installs that Docker Compose, unless it does not work with the installed Podman (then the installed one stays).
+
+## macOS
+
+On a Mac with Apple Silicon the installer runs as your normal user and uses a Podman machine (a Linux VM):
+
+- It needs [Homebrew](https://brew.sh) and Homebrew's bash: macOS ships bash 3.2, so install it first (`brew install bash coreutils gnu-sed grep findutils`). The installer starts itself in Homebrew's bash, uses the GNU tools and installs what is missing of `podman coreutils gnu-sed grep findutils` with Homebrew after asking.
+- It creates a rootful Podman machine with Apple's hypervisor and Rosetta (the Catalog images are amd64), up to 6 CPUs and 8 or 12 GB of memory, and sets `vm.max_map_count` in it. Catalog Web and the workers get `platform: linux/amd64`. An existing machine is used when it runs with Apple's hypervisor; the installer switches it to rootful and turns Rosetta on (the machine restarts).
+- Rosetta works with the Linux kernel of current Podman machines only from macOS 26 (Tahoe); older macOS versions are refused.
+- The Podman machine does not start by itself after a restart of the Mac; a LaunchAgent (`~/Library/LaunchAgents/de.raynet.rn1-podman-machine.plist`) starts it when you log in, and the containers come back with it.
+- The data lives inside the Podman machine: `podman machine rm` or `podman machine reset` deletes it.
+- The MongoDB kernel check uses the kernel of the Podman machine.
 
 ## Known issues
 
@@ -249,4 +258,4 @@ bash tests/run_wizard_tests.sh "$PWD/rn1-technology-catalog-installer.sh"
 bash tests/run_distro_tests.sh "$PWD/rn1-technology-catalog-installer.sh"
 ```
 
-Docker, ssh, scp and the Raynet APIs are replaced by fakes. The Updates tests query Docker Hub and GHCR, so they need internet access. The jobs tests close the menu's session the way a lost SSH connection does, cancel jobs, and hold X in the full screen menu; they need Linux (`setsid` and `script` from util-linux). The time zone tests need tzdata. The distribution tests check the package and Docker hints for the machine they run on. GitHub Actions runs all ten suites on every push: on Ubuntu, and with `tests/run_in_container.sh` as a normal user in RHEL 8, 9 and 10 (UBI), CentOS 7 (bash 4.2), CentOS Stream 9, Rocky Linux 9, AlmaLinux 9, Debian 12 and openSUSE Leap 15.6.
+Podman, ssh, scp and the Raynet APIs are replaced by fakes. The Updates tests query Docker Hub and GHCR, so they need internet access. The jobs tests close the menu's session the way a lost SSH connection does, cancel jobs, and hold X in the full screen menu; they need Linux (`setsid` and `script` from util-linux). The time zone tests need tzdata. The distribution tests check the Podman setup for the machine they run on and the macOS flows (fake Homebrew and Podman machine). GitHub Actions runs all ten suites on every push: on Ubuntu, and with `tests/run_in_container.sh` as a normal user in RHEL 8, 9 and 10 (UBI), CentOS 7 (bash 4.2), CentOS Stream 9, Rocky Linux 9, AlmaLinux 9, Debian 12 and openSUSE Leap 15.6. It also starts the whole Catalog on real Podman (Ubuntu 24.04 and 26.04: `install-podman`, `setup`, `health`, `down`/`up`) and runs the macOS flows on an Apple Silicon Mac.

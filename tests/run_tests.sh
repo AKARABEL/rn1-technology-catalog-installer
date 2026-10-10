@@ -7,25 +7,84 @@ rm -rf "$T"; mkdir -p "$T/bin"
 PASS=0; FAIL=0
 check() { if eval "$2"; then PASS=$((PASS+1)); echo "PASS: $1"; else FAIL=$((FAIL+1)); echo "FAIL: $1"; fi; }
 
-cat > "$T/bin/docker" <<'EOF'
+# Fake rootful Podman with no containers. SHIM_VOLUMES: names of volumes that carry the label
+# com.docker.compose.project=<the part before the first _>, as Compose names them.
+# "podman compose" runs the provider the installer exported, like the real one does.
+# Calls this fake does not know are logged as UNHANDLED (checked at the end).
+cat > "$T/bin/podman" <<'EOF'
 #!/usr/bin/env bash
-echo "docker $*" >> "$SHIM_LOG"
+echo "podman $*" >> "$SHIM_LOG"
 case "$*" in
-  "compose version") echo "Docker Compose version v2.29.0"; exit 0 ;;
+  "--version") echo "podman version ${SHIM_PODMAN_VERSION:-5.7.0}"; exit 0 ;;
   "info") exit 0 ;;
-  "--version") echo "Docker version 27.0.0"; exit 0 ;;
-  volume\ ls*) printf '%s' "${SHIM_VOLUMES:-}"; exit 0 ;;
+  "info --format {{.Host.Security.Rootless}}") echo false; exit 0 ;;
+  "info --format {{.Host.Kernel}}") echo "${SHIM_KERNEL:-6.8.0-generic}"; exit 0 ;;
+  "ps -aq --filter label=com.docker.compose.project="*|"ps -aq --filter label=com.docker.compose.service="*) exit 0 ;;
+  "volume ls -q --filter label=com.docker.compose.project="*)
+    a="$*"; p="${a##*=}"
+    printf '%s' "${SHIM_VOLUMES:-}" | grep "^${p}_" || true
+    exit 0 ;;
+  "network ls -q --filter label=com.docker.compose.project="*) exit 0 ;;
+  "volume exists "*|"image exists "*) exit 1 ;;
 esac
-if [[ "$*" == compose* ]]; then
-  case "$*" in
-    *"config --services"*) printf 'opensearch\nmongo\ncatalog-web\n'; exit 0 ;;
-    *"ps --services"*) printf 'mongo\ncatalog-web\n'; exit 0 ;;
-    *) exit 0 ;;
-  esac
+if [ "${1:-}" = compose ]; then
+  shift
+  if [ -z "${PODMAN_COMPOSE_PROVIDER:-}" ] || [ ! -x "$PODMAN_COMPOSE_PROVIDER" ]; then
+    echo "Error: looking up compose provider failed" >&2
+    echo "UNHANDLED podman compose without a provider: $*" | tee -a "$SHIM_UNHANDLED" >> "$SHIM_LOG"
+    exit 125
+  fi
+  echo "ENV provider=$PODMAN_COMPOSE_PROVIDER DOCKER_HOST=${DOCKER_HOST-unset} warn=${PODMAN_COMPOSE_WARNING_LOGS-unset}" >> "$SHIM_LOG"
+  exec "$PODMAN_COMPOSE_PROVIDER" "$@"
 fi
+echo "UNHANDLED podman $*" | tee -a "$SHIM_UNHANDLED" >> "$SHIM_LOG"
+echo "Error: fake podman does not know: $*" >&2
+exit 125
+EOF
+chmod +x "$T/bin/podman"
+# Fake Docker Compose (the provider behind "podman compose"): RN1_COMPOSE_PROVIDER points here
+cat > "$T/bin/docker-compose" <<'EOF'
+#!/usr/bin/env bash
+case "$*" in
+  "version") echo "Docker Compose version v5.6.0"; exit 0 ;;
+  "version --short") echo "5.6.0"; exit 0 ;;
+esac
+ef=""; cf=""; all="$*"
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -p) shift 2 ;;
+    --env-file) ef="${2:-}"; shift 2 ;;
+    -f) cf="${2:-}"; shift 2 ;;
+    *) break ;;
+  esac
+done
+if [ -z "$ef" ] || [ -z "$cf" ]; then
+  echo "UNHANDLED docker-compose without --env-file and -f: $all" | tee -a "$SHIM_UNHANDLED" >> "$SHIM_LOG"; exit 1
+fi
+if [ ! -f "$ef" ] || [ ! -f "$cf" ]; then
+  echo "open $ef / $cf: no such file or directory" >&2; exit 1
+fi
+case "$*" in
+  "config --services") printf 'opensearch\nmongo\ncatalog-web\n' ;;
+  "ps --services"*) printf 'mongo\ncatalog-web\n' ;;
+  "config --quiet"|"config"|"config --volumes"|"config --images"|"up -d --remove-orphans"|"down --remove-orphans"|"down -v --remove-orphans"|"ps"|"ps -q "*|"pull"|"pull "*|"logs "*|"restart -t 30") ;;
+  *) echo "UNHANDLED docker-compose $all" | tee -a "$SHIM_UNHANDLED" >> "$SHIM_LOG"; echo "unknown compose call: $*" >&2; exit 1 ;;
+esac
 exit 0
 EOF
-chmod +x "$T/bin/docker"
+chmod +x "$T/bin/docker-compose"
+# engine_socket_ok asks systemd for the API socket; check asks for podman-restart.service
+cat > "$T/bin/systemctl" <<'EOF'
+#!/usr/bin/env bash
+echo "systemctl $*" >> "$SHIM_LOG"
+case "$*" in
+  "is-active --quiet podman.socket") exit 0 ;;
+  "is-enabled podman-restart.service") echo enabled; exit 0 ;;
+esac
+echo "UNHANDLED systemctl $*" | tee -a "$SHIM_UNHANDLED" >> "$SHIM_LOG"
+exit 1
+EOF
+chmod +x "$T/bin/systemctl"
 cat > "$T/bin/curl" <<'EOF'
 #!/usr/bin/env bash
 url="${@: -1}"
@@ -54,20 +113,31 @@ printf '#!/usr/bin/env bash
 if [ "${1:-}" = "-r" ]; then echo "${SHIM_KERNEL:-6.8.0-generic}"; else exec "%s" "$@"; fi
 ' "$REAL_UNAME" > "$T/bin/uname"
 chmod +x "$T/bin/uname"
-export PATH="$T/bin:$PATH" SHIM_LOG="$T/docker.log" HUB_DIR="$SP/hub"
+export PATH="$T/bin:$PATH" SHIM_LOG="$T/podman.log" HUB_DIR="$SP/hub" RN1_COMPOSE_PROVIDER="$T/bin/docker-compose"
+# every call the fakes did not know, over all runs (the tests empty $SHIM_LOG now and then)
+export SHIM_UNHANDLED="$T/unhandled.log"; : > "$SHIM_UNHANDLED"
 : > "$SHIM_LOG"
 mask() { sed -E 's/^((MONGO_INITDB_ROOT|MINIO_ROOT)_PASSWORD|RABBITMQ_DEFAULT_PASS)=.*/\1=X/' "$1"; }
 newdir() { rm -rf "$T/$1"; mkdir -p "$T/$1"; cp "$NEW" "$T/$1/gen.sh"; echo "$T/$1"; }
+# With Podman every service has "restart: always" (podman-restart.service starts only those again after
+# a reboot): mongo and the two workers had unless-stopped, opensearch and opensearch-dashboards had none
+restart_always() {
+  awk '$0 == "    restart: unless-stopped" { print "    restart: always"; next }
+       { print }
+       $0 == "    container_name: opensearch" || $0 == "    container_name: opensearch-dashboards" { print "    restart: always" }
+       $0 == "      MINIO_ROOT_PASSWORD: \"${MINIO_ROOT_PASSWORD}\"" { print "      HOME: /root" }' "$1"
+}
 
-# 1. Byte-identical output vs original (NPM true / false)
+# 1. Byte-identical output vs original (NPM true / false), apart from the restart policy
 for npm in true false; do
   D="$(newdir "id_$npm")"; O="$T/orig_$npm"; rm -rf "$O"; mkdir -p "$O"
   sed -i "s/^INSTALL_NGINX_PROXY_MANAGER=\"true\"/INSTALL_NGINX_PROXY_MANAGER=\"$npm\"/" "$D/gen.sh"
   sed "s/^INSTALL_NGINX_PROXY_MANAGER=\"true\"/INSTALL_NGINX_PROXY_MANAGER=\"$npm\"/" "$SP/original.sh" | sed 's|^MINIO_TAG="latest"|MINIO_TAG="RELEASE.2025-10-15T17-29-55Z"|; s|image: minio/minio:|image: ghcr.io/golithus/minio:|' > "$O/gen.sh"
   (cd "$O" && bash gen.sh >/dev/null)
+  restart_always "$O/docker-compose.yml" > "$O/podman-compose.yml"
   bash "$D/gen.sh" generate </dev/null >/dev/null 2>&1
   check "env identical NPM=$npm" 'diff <(mask "$O/.env") <(mask "$D/.env") >/dev/null'
-  check "compose identical NPM=$npm" 'cmp -s "$O/docker-compose.yml" "$D/docker-compose.yml"'
+  check "compose identical NPM=$npm (3 restart lines changed, 2 added, HOME for MinIO)" '[ "$(diff "$O/docker-compose.yml" "$O/podman-compose.yml" | grep -c "^[<>]")" -eq 9 ] && cmp -s "$O/podman-compose.yml" "$D/docker-compose.yml"'
 done
 
 # 2. keep / new / unknown flag
@@ -90,17 +160,18 @@ check "missing .env reuses newest backup" 'grep -q "reusing the passwords from t
 
 # 4. .env missing, no backup, volumes exist -> CLI refuses, --new-passwords proceeds
 D="$(newdir vols)"
-out="$(SHIM_VOLUMES=$'vols_db_data\nvols_rmq_data\n' bash "$D/gen.sh" generate </dev/null 2>&1)"; rc=$?
+out="$(SHIM_VOLUMES=$'vols_db_data\nother_db_data\nvols_rmq_data\n' bash "$D/gen.sh" generate </dev/null 2>&1)"; rc=$?
 check "volumes exist, no .env -> rc 1" '[ "$rc" -eq 1 ] && [ ! -f "$D/.env" ]'
-check "volume rm hint lists names on one line" 'grep -q "docker volume rm vols_db_data vols_rmq_data" <<< "$out"'
+check "volume rm hint lists names on one line (only this project)" 'grep -q "podman volume rm vols_db_data vols_rmq_data$" <<< "$out"'
 SHIM_VOLUMES=$'vols_db_data\n' bash "$D/gen.sh" generate --new-passwords </dev/null >/dev/null 2>&1; rc=$?
 check "--new-passwords proceeds with volumes" '[ "$rc" -eq 0 ] && [ -f "$D/.env" ]'
 
 # 5. compose argv: up / down use --remove-orphans and pinned files
 D="$(newdir argv)"; bash "$D/gen.sh" generate </dev/null >/dev/null 2>&1
-: > "$SHIM_LOG"; bash "$D/gen.sh" up </dev/null >/dev/null 2>&1; rc=$?
+: > "$SHIM_LOG"; DOCKER_HOST=unix:///var/run/docker.sock bash "$D/gen.sh" up </dev/null >/dev/null 2>&1; rc=$?
 check "CLI up rc 0" '[ "$rc" -eq 0 ]'
-check "up uses --env-file -f and --remove-orphans" 'grep -q "^docker compose --env-file .env -f docker-compose.yml up -d --remove-orphans$" "$SHIM_LOG"'
+check "up uses --env-file -f and --remove-orphans" 'grep -q "^podman compose --env-file .env -f docker-compose.yml up -d --remove-orphans$" "$SHIM_LOG"'
+check "podman compose gets the installer's provider, no DOCKER_HOST, no banner" 'grep -q "^ENV " "$SHIM_LOG" && [ -z "$(grep "^ENV " "$SHIM_LOG" | grep -vxF "ENV provider=$T/bin/docker-compose DOCKER_HOST=unset warn=false")" ]'
 : > "$SHIM_LOG"; bash "$D/gen.sh" down </dev/null >/dev/null 2>&1
 check "down uses --remove-orphans" 'grep -q "down --remove-orphans$" "$SHIM_LOG"'
 bash "$D/gen.sh" logs nosuch </dev/null >/dev/null 2>&1; rc=$?
@@ -283,23 +354,23 @@ check "check-settings ok" 'bash "$D/gen.sh" check-settings >/dev/null 2>&1'
 sed -i 's/^MONGO_PORT_HOST=.*/MONGO_PORT_HOST="8080"/' "$D/gen.sh"
 check "duplicate port rejected" '! bash "$D/gen.sh" check-settings >/dev/null 2>&1'
 
-# 12. old docker-compose v1 rejected
-cat > "$T/bin2-docker" <<'EOF'
-EOF
+# 12. Podman without "podman compose" (4.3, Debian 12), an old docker-compose v1 or no provider: rejected
+D="$(newdir oldcompose)"; bash "$D/gen.sh" generate </dev/null >/dev/null 2>&1
+: > "$SHIM_LOG"
+out="$(SHIM_PODMAN_VERSION=4.3.1 bash "$D/gen.sh" validate </dev/null 2>&1)"; rc=$?
+check "podman 4.3.1 rejected" '[ "$rc" -ne 0 ] && grep -q "Podman 4.3.1 is too old" <<< "$out" && ! grep -q "^podman compose" "$SHIM_LOG"'
 mkdir -p "$T/bin_old"
-cat > "$T/bin_old/docker" <<'EOF'
-#!/usr/bin/env bash
-case "$*" in "info") exit 0 ;; "compose version") exit 1 ;; *) exit 0 ;; esac
-EOF
 cat > "$T/bin_old/docker-compose" <<'EOF'
 #!/usr/bin/env bash
-case "$*" in "version --short") echo "1.25.0" ;; esac
+case "$*" in "version") echo "docker-compose version 1.25.0, build 0a186604" ;; "version --short") echo "1.25.0" ;; esac
 exit 0
 EOF
 chmod +x "$T/bin_old/"*
-D="$(newdir oldcompose)"; bash "$D/gen.sh" generate </dev/null >/dev/null 2>&1
-out="$(PATH="$T/bin_old:$PATH" bash "$D/gen.sh" validate </dev/null 2>&1)"; rc=$?
-check "docker-compose 1.25 rejected" '[ "$rc" -ne 0 ] && grep -q "too old" <<< "$out"'
+: > "$SHIM_LOG"
+out="$(RN1_COMPOSE_PROVIDER="$T/bin_old/docker-compose" bash "$D/gen.sh" validate </dev/null 2>&1)"; rc=$?
+check "docker-compose 1.25 as provider rejected" '[ "$rc" -ne 0 ] && grep -q "bin_old/docker-compose is not Docker Compose" <<< "$out" && ! grep -q "^podman compose" "$SHIM_LOG"'
+out="$(RN1_COMPOSE_PROVIDER="$T/bin_old/none" bash "$D/gen.sh" validate </dev/null 2>&1)"; rc=$?
+check "missing provider rejected with the install hint" '[ "$rc" -ne 0 ] && grep -q "is missing (.*bin_old/none) - .*install-podman" <<< "$out"'
 
 # 13. Catalog versions from Docker Hub
 D="$(newdir ver)"
@@ -383,6 +454,8 @@ out="$(printf '0\n' | COLUMNS=100 bash "$D/gen.sh" menu 2>&1)"
 check "plain menu: group headings say what they are for, options have a description" 'grep -q "^ CONFIGURE . settings and files" <<< "$out" && grep -Eq "^   13\) . Stop \(data is kept\) +containers go, data stays" <<< "$out"'
 out="$(printf '0\n' | COLUMNS=60 bash "$D/gen.sh" menu 2>&1)"
 check "plain menu on a narrow screen: no description" 'grep -Eq "^   13\) . Stop \(data is kept\)$" <<< "$out"'
+
+check "no podman, compose or systemctl call the fakes do not know" '[ ! -s "$SHIM_UNHANDLED" ] || { sort -u "$SHIM_UNHANDLED"; false; }'
 
 echo "== $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]
