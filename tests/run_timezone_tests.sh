@@ -17,6 +17,12 @@ printf '%s\n' "${SHIM_TZ:-Europe/Berlin}"
 EOF
 printf '#!/usr/bin/env bash\nexit 0\n' > "$T/bin/docker"
 chmod +x "$T/bin/"*
+# the kernel of the test machine must not change the generated files (MongoDB workaround on 6.19 to 7.0.x)
+REAL_UNAME="$(command -v uname)"
+printf '#!/usr/bin/env bash
+if [ "${1:-}" = "-r" ]; then echo "${SHIM_KERNEL:-6.8.0-generic}"; else exec "%s" "$@"; fi
+' "$REAL_UNAME" > "$T/bin/uname"
+chmod +x "$T/bin/uname"
 export PATH="$T/bin:$PATH"
 
 N="rn1-technology-catalog-installer.sh"

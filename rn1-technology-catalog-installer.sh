@@ -514,15 +514,40 @@ hub_tags() {
   done
 }
 
-# True when the configured MongoDB (8 or newer) refuses to start on the running
-# kernel: MongoDB 8 stops on kernels 6.19 to 7.0.13 (SERVER-121912).
-mongo_kernel_problem() {
-  local tag
-  tag="$(setting MONGO_TAG)"
+# True when the configured MongoDB (8 or newer) needs GLIBC_TUNABLES=glibc.pthread.rseq=1 on this
+# kernel. The kernels 6.19 to 7.0.13 broke the rseq behaviour that TCMalloc's per-CPU caches rely on,
+# and the released mongod refuses to start there while those caches are on (SERVER-121912). Ubuntu's
+# 7.0.0-NN always counts as 7.0.0, even with the kernel fix. When glibc registers rseq, TCMalloc uses
+# per-thread caches instead: the broken path is not used and mongod starts (some performance cost).
+# mongo_rseq_workaround [MONGO_TAG] (default: the one in use)
+mongo_rseq_workaround() {
+  local tag="${1-$(setting MONGO_TAG)}"
+  tag="${tag//[\"\']/}"
   if [[ "$tag" =~ ^([0-9]+) ]] && [ "${BASH_REMATCH[1]}" -lt 8 ]; then
     return 1
   fi
   kernel_blocks_mongo8
+}
+
+# True when MongoDB would not start with the generated files: they lack the workaround it needs here
+# (generated before this version, or on another machine)
+mongo_kernel_problem() {
+  mongo_rseq_workaround && [ -f "$COMPOSE_FILE" ] && ! grep -q '^      GLIBC_TUNABLES: ' "$COMPOSE_FILE"
+}
+
+# True when the files still have the MongoDB workaround although this kernel does not need it any more
+# (generated on an older kernel): they work, but MongoDB runs without its per-CPU caches
+mongo_workaround_unneeded() {
+  ! mongo_rseq_workaround && [ -f "$COMPOSE_FILE" ] && grep -q '^      GLIBC_TUNABLES: ' "$COMPOSE_FILE"
+}
+
+# The upstream kernel version of an Ubuntu kernel (Ubuntu 7.0.0-38.38-generic 7.0.14 -> 7.0.14)
+kernel_upstream_version() {
+  local sig=""
+  if [ -r /proc/version_signature ]; then
+    sig="$(cat /proc/version_signature 2>/dev/null)" || sig=""
+  fi
+  printf '%s' "${sig##* }"
 }
 
 kernel_blocks_mongo8() {
@@ -1249,10 +1274,6 @@ show_updates() {
     if [ -n "$versions" ]; then
       newest="$(version_core "${versions%%$'\n'*}")"
     fi
-    if [ "$key" = "mongo" ] && [ -n "$versions" ] && [[ "$(version_major "${versions%%$'\n'*}")" =~ ^[0-9]+$ ]] \
-      && [ "$(version_major "${versions%%$'\n'*}")" -ge 8 ] && kernel_blocks_mongo8; then
-      ST_TEXT="$ST_TEXT - 8.0+ may fail on this kernel"
-    fi
     if [ "$key" = "npm" ] && [ "$INSTALL_NGINX_PROXY_MANAGER" != "true" ]; then
       ST_TEXT="$ST_TEXT (disabled)"
     fi
@@ -1324,7 +1345,7 @@ pick_component() {
         marker="  $C_MAG$UI_MAJOR major update$C_RST"
       fi
       if [ "$key" = "mongo" ] && [ "$(version_major "$v")" -ge 8 ] && kernel_blocks_mongo8; then
-        marker="$marker  $C_RED$UI_NO may fail on this kernel$C_RST"
+        marker="$marker  ${C_DIM}with the kernel workaround$C_RST"
       fi
       printf '   %s  %s%s\n' "$C_BLD$i$C_RST" "$(ui_pad "$(version_core "$v")" 30)" "$marker"
     done <<< "$list"
@@ -1375,12 +1396,8 @@ pick_component() {
     fi
   fi
   if [ "$key" = "mongo" ] && [[ "$sel_major" =~ ^[0-9]+$ ]] && [ "$sel_major" -ge 8 ] && kernel_blocks_mongo8; then
-    warn "MongoDB $sel_major may not start on this machine's kernel ($(uname -r), SERVER-121912)."
-    warn "Only choose it for a bundle that is installed on a machine with another kernel."
-    if ! confirm "Select it anyway?" n; then
-      info "Cancelled - nothing was changed."
-      return 0
-    fi
+    info "MongoDB $sel_major on this kernel ($(uname -r)) starts with GLIBC_TUNABLES=glibc.pthread.rseq=1 (SERVER-121912);"
+    info "the generated files get it by themselves."
   fi
   for setting in $C_SETTINGS; do
     set_setting "$setting" "$selected"
@@ -3452,7 +3469,7 @@ offer_patch_updates() {
     fi
   done
   if [ "$mongo_running" != "" ] && [ "${mongo_running%%.*}" -lt 8 ] 2>/dev/null; then
-    info "MongoDB ${mongo_running%%.*}.x runs here. MongoDB 8.0 is a major upgrade (Updates, option 8)$(if kernel_blocks_mongo8; then printf ' and does not start on this kernel'; fi)."
+    info "MongoDB ${mongo_running%%.*}.x runs here. MongoDB 8.0 is a major upgrade (Updates, option 8)."
   fi
   if [ "${#keys[@]}" -eq 0 ]; then
     ok "MongoDB, OpenSearch, RabbitMQ, MinIO and Nginx Proxy Manager have the newest patch versions of their series."
@@ -5671,6 +5688,9 @@ ASPNETCORE_URLS=${ASPNETCORE_URLS}
 ASPNETCORE_HTTP_PORTS=${ASPNETCORE_HTTP_PORTS}
 LOG_LEVEL_DEFAULT=${LOG_LEVEL_DEFAULT}
 EOF
+  if mongo_rseq_workaround "$MONGO_TAG"; then
+    printf '\n# MongoDB 8+ on Linux 6.19 to 7.0.x (SERVER-121912): glibc registers rseq, TCMalloc uses per-thread caches\nMONGO_GLIBC_TUNABLES=glibc.pthread.rseq=1\n' >> "$ENV_FILE"
+  fi
   if [ -n "$COMPOSE_PROJECT_NAME" ]; then
     printf '\nCOMPOSE_PROJECT_NAME=%s\n' "$COMPOSE_PROJECT_NAME" >> "$ENV_FILE"
   fi
@@ -5746,6 +5766,11 @@ EOF
       MONGO_INITDB_ROOT_USERNAME: "${MONGO_INITDB_ROOT_USERNAME}"
       MONGO_INITDB_ROOT_PASSWORD: "${MONGO_INITDB_ROOT_PASSWORD}"
       MONGO_INITDB_DATABASE: "${MONGO_INITDB_DATABASE}"
+EOF
+    if mongo_rseq_workaround "$MONGO_TAG"; then
+      echo '      GLIBC_TUNABLES: "${MONGO_GLIBC_TUNABLES:-glibc.pthread.rseq=1}"'
+    fi
+    cat <<'EOF'
 
   minio:
     image: ghcr.io/golithus/minio:${MINIO_TAG}
@@ -6201,8 +6226,11 @@ do_up() {
   require_files || return 1
   require_docker || return 1
   if mongo_kernel_problem; then
-    warn "MongoDB $(setting MONGO_TAG) cannot start on Linux kernel $(uname -r) (kernels 6.19 to 7.0.13, SERVER-121912)."
-    warn "Set MONGO_TAG=\"7.0\" (menu option 1), regenerate (option 2), then start again."
+    warn "MongoDB $(setting MONGO_TAG) refuses to start on Linux kernel $(uname -r) without a workaround (SERVER-121912)."
+    warn "Regenerate the files ($(hint 2 generate)): MongoDB then starts with GLIBC_TUNABLES=glibc.pthread.rseq=1."
+  elif mongo_workaround_unneeded; then
+    info "This kernel ($(uname -r)) no longer needs the MongoDB workaround that the files have - that is why they differ."
+    info "They work as they are; regenerating ($(hint 2 generate)) gives MongoDB its faster per-CPU caches back."
   fi
   if settings_stale; then
     warn "$ENV_FILE / $COMPOSE_FILE do not match the settings at the top of $SCRIPT_NAME"
@@ -6368,13 +6396,18 @@ do_check() {
   fi
 
   if mongo_kernel_problem; then
-    err "MongoDB $(setting MONGO_TAG) cannot start on Linux kernel $(uname -r) (kernels 6.19 to 7.0.13, SERVER-121912)."
-    if [ -z "$(project_volumes)" ]; then
-      echo "      Set MONGO_TAG=\"7.0\" at the top of $SCRIPT_NAME (menu option 1), or use a kernel 7.0.14 or newer."
-    else
-      echo "      The data of this installation needs MongoDB $(setting MONGO_TAG): use a kernel 7.0.14 or newer."
-    fi
-    problems=$((problems + 1))
+    warn "MongoDB $(setting MONGO_TAG) refuses to start on Linux kernel $(uname -r) (SERVER-121912): the files lack the workaround."
+    echo "      Regenerate them (option 2, or I - repair): MongoDB then starts with GLIBC_TUNABLES=glibc.pthread.rseq=1."
+  elif mongo_rseq_workaround; then
+    ok "MongoDB $(setting MONGO_TAG) on kernel $(uname -r): starts with GLIBC_TUNABLES=glibc.pthread.rseq=1 (SERVER-121912)."
+    echo "      TCMalloc then uses per-thread instead of per-CPU caches: some performance cost."
+  fi
+  local upstream
+  upstream="$(kernel_upstream_version)"
+  if kernel_blocks_mongo8 && [[ "$upstream" =~ ^7\.0\.[0-9]+$ ]] && version_gt "7.0.14" "$upstream"; then
+    warn "This Ubuntu kernel is based on Linux $upstream and lacks the full rseq fix (7.0.14) - update it:"
+    echo "      sudo apt update && sudo apt full-upgrade, then reboot (until /proc/version_signature ends in"
+    echo "      7.0.14 or newer; for linux-generic that is 7.0.0-31 or newer)"
   fi
 
   if [ -r /proc/sys/vm/max_map_count ]; then
@@ -7515,6 +7548,10 @@ show_menu() {
   sib="$(conflicting_sibling)"
   if [ -n "$sib" ]; then
     printf '%s\n' "${C_YLW}$(basename -- "$sib") in this folder has other settings - option 23 takes them over (or rename it if it is no longer used).${C_RST}"
+  elif mongo_kernel_problem; then
+    printf '%s\n' "${C_YLW}MongoDB needs the kernel workaround (SERVER-121912), and the files lack it - option 2 (or I - repair) writes them again.${C_RST}"
+  elif mongo_workaround_unneeded; then
+    printf '%s\n' "${C_YLW}This kernel no longer needs the MongoDB workaround in the files - option 2 writes them again (faster MongoDB).${C_RST}"
   elif settings_stale; then
     printf '%s\n' "${C_YLW}The generated files do not match the settings above (changed settings or manual edits) - option 2 regenerates them.${C_RST}"
   fi
@@ -7947,21 +7984,10 @@ install_wizard() {
   fi
 
   if [ "$step" -le 1 ]; then
-    # 1. Check (MongoDB 8 cannot run on some kernels: a new installation takes 7.0 there)
-    if mongo_kernel_problem; then
-      warn "MongoDB $MONGO_TAG does not start on this Linux kernel ($(uname -r), SERVER-121912)."
-      if [ "$fresh" = "yes" ]; then
-        ans=0
-        wiz_yes_no "Use MongoDB 7.0 instead?" y || ans=$?
-        case "$ans" in
-          0) wiz_set MONGO_TAG "7.0" ;;
-          1) ;;
-          *) wiz_stop "I"; return 0 ;;
-        esac
-      else
-        echo "  The data of this installation needs MongoDB $MONGO_TAG: use a kernel 7.0.14 or newer, or move the"
-        echo "  data with a backup. A switch to 7.0 cannot read it."
-      fi
+    # 1. Check (MongoDB 8 on the kernels 6.19 to 7.0.x needs a workaround, which the files get)
+    if mongo_rseq_workaround "$MONGO_TAG"; then
+      info "MongoDB $MONGO_TAG on this kernel ($(uname -r)) starts with GLIBC_TUNABLES=glibc.pthread.rseq=1 (SERVER-121912)."
+      echo "  The files get it by themselves. TCMalloc then uses per-thread caches: some performance cost."
       echo
     fi
     echo "  Docker, Docker Compose, kernel, ports, vm.max_map_count and the time zone:"
@@ -8203,6 +8229,10 @@ update_wizard() {
   fi
   if [ -z "$after" ]; then
     warn "The stack is not running - option 6 starts it."
+  fi
+  if mongo_kernel_problem; then
+    warn "MongoDB refuses to start on this kernel ($(uname -r), SERVER-121912): the files lack the workaround."
+    echo "  I (repair) writes them again with GLIBC_TUNABLES=glibc.pthread.rseq=1 and starts the stack."
   fi
   echo
   echo "  Major versions of MongoDB, OpenSearch or RabbitMQ: option 8 (versions, offline bundle)."
@@ -9260,6 +9290,10 @@ tui_draw() {
   sib="$(conflicting_sibling)"
   if [ -n "$sib" ]; then
     notes+=("$C_YLW$UI_ARROW $(basename -- "$sib") in this folder has other settings - option 23 takes them over$C_RST")
+  elif mongo_kernel_problem; then
+    notes+=("$C_YLW$UI_ARROW MongoDB needs the kernel workaround, the files lack it - option 2 or I (repair) adds it$C_RST")
+  elif mongo_workaround_unneeded; then
+    notes+=("$C_YLW$UI_ARROW This kernel no longer needs the MongoDB workaround - option 2 writes the files again$C_RST")
   elif settings_stale; then
     notes+=("$C_YLW$UI_ARROW The generated files differ from the settings - option 2 regenerates them$C_RST")
   fi

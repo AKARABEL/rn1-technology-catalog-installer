@@ -201,13 +201,30 @@ if ! touch "$D/probe" 2>/dev/null; then
 fi
 chmod 755 "$D"
 
-# 8. MongoDB 8 on a kernel that cannot run it: 7.0 offered before the check (new installation only)
+# 8. MongoDB 8 on a kernel 6.19 to 7.0.x: no switch to 7.0 any more, the files get the rseq workaround
 fresh
-out="$(printf 'i\ny\ny\ny\n\nn\n\n0\n' | SHIM_KERNEL=7.0.0-15-generic bash "$I" menu 2>&1)"
-check "install: MongoDB 7.0 offered on kernel 7.0.0, check passes" 'grep -q "does not start on this Linux kernel" <<< "$out" && grep -q "^MONGO_TAG=\"7.0\"$" "$I" && grep -q "All required checks passed" <<< "$out"'
+out="$(printf 'i\nn\n\n0\n' | SHIM_KERNEL=7.0.0-15-generic bash "$I" menu 2>&1)"
+check "install: MongoDB 8 kept on kernel 7.0.0, the workaround named, the check passes" 'grep -q "starts with GLIBC_TUNABLES=glibc.pthread.rseq=1" <<< "$out" && grep -q "^MONGO_TAG=\"8\"$" "$I" && ! grep -q "Use MongoDB 7.0 instead" <<< "$out" && grep -q "All required checks passed" <<< "$out" && ! grep -q "lack the workaround" <<< "$out"'
+GLIBC_LINE='      GLIBC_TUNABLES: "${MONGO_GLIBC_TUNABLES:-glibc.pthread.rseq=1}"'
+(cd "$D" && SHIM_KERNEL=7.0.0-15-generic bash "$I" generate </dev/null >/dev/null 2>&1)
+check "generate on kernel 7.0.0: GLIBC_TUNABLES for mongo in compose and .env" 'grep -qxF "$GLIBC_LINE" "$D/docker-compose.yml" && grep -qx "MONGO_GLIBC_TUNABLES=glibc.pthread.rseq=1" "$D/.env" && [ "$(sed -n "/^  mongo:/,/^  minio:/p" "$D/docker-compose.yml" | grep -c GLIBC_TUNABLES)" -eq 1 ]'
+out="$(cd "$D" && SHIM_KERNEL=7.0.0-15-generic bash "$I" check </dev/null 2>&1)"
+check "check on kernel 7.0.0 with the workaround: no MongoDB problem" '! grep -q "refuses to start" <<< "$out" && grep -q "starts with GLIBC_TUNABLES=glibc.pthread.rseq=1" <<< "$out"'
+sed -i '0,/^MONGO_TAG=/s/^MONGO_TAG=.*/MONGO_TAG="7.0"/' "$I"
+(cd "$D" && SHIM_KERNEL=7.0.0-15-generic bash "$I" generate </dev/null >/dev/null 2>&1); rc=$?
+check "MongoDB 7.0 on kernel 7.0.0: the workaround goes away (not needed)" '[ "$rc" -eq 0 ] && grep -qx "MONGO_TAG=7.0" "$D/.env" && ! grep -q MONGO_GLIBC_TUNABLES "$D/.env" && ! grep -q GLIBC_TUNABLES "$D/docker-compose.yml"'
+sed -i '0,/^MONGO_TAG=/s/^MONGO_TAG=.*/MONGO_TAG="8"/' "$I"
+(cd "$D" && SHIM_KERNEL=7.0.0-15-generic bash "$I" generate </dev/null >/dev/null 2>&1)
+out="$(cd "$D" && printf '0
+' | SHIM_KERNEL=7.0.14-200.fc44.x86_64 bash "$I" menu 2>&1)"
+check "kernel 7.0.14 with files from 7.0.0: the menu names the kernel, not hand edits" 'grep -q "This kernel no longer needs the MongoDB workaround" <<< "$out" && ! grep -q "changed settings or manual edits" <<< "$out"'
+(cd "$D" && bash "$I" generate </dev/null >/dev/null 2>&1)
+check "generate on kernel 6.8: no workaround (files as before)" '! grep -q GLIBC_TUNABLES "$D/docker-compose.yml" && ! grep -q MONGO_GLIBC_TUNABLES "$D/.env"'
+out="$(cd "$D" && SHIM_KERNEL=7.0.0-15-generic bash "$I" check </dev/null 2>&1)"
+check "files from another kernel: check says regenerate (a warning, not a failed check)" 'grep -q "the files lack the workaround" <<< "$out" && grep -q "Regenerate them (option 2" <<< "$out" && ! grep -q "ERROR MongoDB" <<< "$out"'
 installed
-out="$(printf 'i\n1\nn\n\n0\n' | SHIM_KERNEL=7.0.0-15-generic bash "$I" menu 2>&1)"
-check "repair: no switch of existing MongoDB 8 data to 7.0" 'grep -q "A switch to 7.0 cannot read it" <<< "$out" && ! grep -q "^MONGO_TAG=\"7.0\"$" "$I" && ! grep -q "Set MONGO_TAG=\"7.0\"" <<< "$out"'
+out="$(printf 'i\n1\n\ny\ny\n\ny\ny\nn\n\n0\n' | SHIM_KERNEL=7.0.0-15-generic bash "$I" menu 2>&1)"
+check "repair on kernel 7.0.0 with old files: not stopped by the check, the files get the workaround" '! grep -q "Some checks failed" <<< "$out" && grep -qxF "$GLIBC_LINE" "$D/docker-compose.yml" || { grep -E "WARN|ERROR|Stopped|Step" <<< "$out" | head -20; false; }'
 
 # 9. Another folder's installation with the same project name is not taken for this one
 fresh
