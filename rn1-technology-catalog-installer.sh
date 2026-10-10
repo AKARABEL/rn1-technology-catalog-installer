@@ -3159,7 +3159,7 @@ import_snapshot_menu() {
     return 0
   fi
   echo
-  ui_box "$(ui_width)" "Import into the local catalog $UI_SEP $(local_url)" "Snapshots in $WORK_DIR/snapshots, newest first. A chain is imported file by file, in order."
+  ui_box "$(ui_width)" "Import into the local catalog $UI_SEP $(local_url)" "Snapshots in $WORK_DIR/snapshots, newest first. A chain is imported file by file: full import, then delta."
   i=0
   for f in ${chains[@]+"${chains[@]}"}; do
     i=$((i + 1))
@@ -9038,7 +9038,7 @@ $(help_item J view "Background jobs" "Long tasks run as jobs: they continue when
 ${c}CATALOG DATA $UI_SEP snapshots or a daily self-sync$r
 $(help_item 17 run "Download snapshot" "Catalog data from $CATALOG_CLOUD_URL (needs an API key): the full" "snapshot + all changes up to today, the changes since a date, or one file.")
 $(help_item 18 edit "API keys" "Shows, changes, tests and deletes the keys for the online and the" "local Catalog. Keys are tested before they are saved.")
-$(help_item 19 run "Import snapshot" "Uploads downloaded snapshots into the local Catalog; a chain file by" "file, in order. Catalog 25.x accepts at most 10 GB per file.")
+$(help_item 19 run "Import snapshot" "Uploads downloaded snapshots into the local Catalog, file by file: full" "import, then delta. Catalog 25.x accepts at most 10 GB per file.")
 $(help_item 20 run "Daily self-sync" "Lets the local Catalog synchronize itself every day (servers with" "internet access).")
 
 ${c}UPDATE $UI_SEP newer versions$r
@@ -9146,7 +9146,7 @@ menu_items() {
 2|-||CATALOG DATA|snapshots, sync|fill the Catalog: snapshots or a sync
 2|17|run|Download snapshot|from Raynet, needs a key|Downloads catalog data (needs an API key)
 2|18|edit|API keys|online + local: show, test|Shows, changes and tests the API keys
-2|19|run|Import snapshot|into this Catalog, in order|Imports downloaded snapshots, in order
+2|19|run|Import snapshot|full import, then delta|Imports the full snapshot, then the deltas
 2|20|run|Daily self-sync|Catalog fetches changes daily|The Catalog synchronizes itself daily
 3|-||UPDATE|newer versions|newer Catalog, components, installer
 3|8|run|Versions, offline bundle|pick versions, download only|Newest versions, picker, offline bundle
