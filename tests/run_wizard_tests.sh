@@ -316,5 +316,42 @@ mkdir -p "$D/RN1-Technology-Catalog-26.3-20261001"
 out="$(printf 'r\ny\n0\n\n0\n' | bash "$I" menu 2>&1)"
 check "remove: leftover offline bundle offered" '! grep -q "There is nothing to remove" <<< "$out" && grep -q "Offline bundles (" <<< "$out" && ! grep -q "(passwords)" <<< "$out"'
 
+# 20. Containers of this folder but no .env: "incomplete", not "installed", and repair names the passwords
+installed
+rm -f "$D/.env"
+out="$(printf '0\n' | bash "$I" menu 2>&1)"
+check "menu: containers without .env shown as incomplete" 'grep -Eq "I\) INSTALL +! Incomplete: 3 containers, but no .env" <<< "$out" && grep -q "Stack  : 3 containers exist" <<< "$out" && ! grep -q "Installed" <<< "$out"'
+out="$(printf 'i\n0\n\n0\n' | bash "$I" menu 2>&1)"
+check "install: repair warns that .env and its passwords are missing" 'grep -q ".env is missing and has no backup" <<< "$out" && grep -q "new passwords would not open the existing data" <<< "$out"'
+installed; cp "$D/.env" "$D/.env.bak-20261001-120000"; rm -f "$D/.env"
+out="$(printf 'i\n0\n\n0\n' | bash "$I" menu 2>&1)"
+check "install: repair takes the passwords from the newest .env backup" 'grep -q "a repair takes the passwords from its newest backup .*\.env\.bak-20261001-120000" <<< "$out"'
+
+# 21. Full screen: the lines above the prompt say what the typed number does
+if command -v script >/dev/null 2>&1 && [ "$(uname -s)" = "Linux" ]; then
+  fresh
+  tui_type() { # KEYS [COLUMNS]
+    local log="$T/tui.log" i
+    : > "$log"
+    { for i in $(seq 1 120); do grep -q "Select:" "$log" 2>/dev/null && break; sleep 0.5; done
+      printf '%s' "$1"; sleep 2; printf q; sleep 2
+    } | TERM=xterm LANG=C.UTF-8 timeout 90 script -qfec "stty cols ${2:-120} rows 40; bash $I menu" /dev/null > "$log" 2>&1
+    sed 's/\x1b[[(][0-9;?]*[A-Za-z]//g; s/\x1b[78]//g' "$log" | tr -d '\r'
+  }
+  out="$(tui_type "")"
+  check "full screen: asks for a number and says it will explain it" 'grep -q "Type a number - what it does shows here" <<< "$out"'
+  out="$(tui_type 13)"
+  check "full screen: typing 13 says what it does" 'grep -q "13 . Stop (data is kept)" <<< "$out" && grep -q "docker compose down - data volumes stay" <<< "$out"'
+  out="$(tui_type 99)"
+  check "full screen: typing 99 warns" 'grep -q "Reset: delete all data - asks for DELETE" <<< "$out" && grep -q "Removes ALL containers AND data volumes" <<< "$out"'
+  out="$(tui_type 24)"
+  check "full screen: an unknown number is named" 'grep -q "No option 24" <<< "$out"'
+  installed; rm -f "$D/.env"
+  out="$(tui_type "" 132)"
+  check "full screen, 132 columns: the cards fit (no cut texts) and name what is missing" 'grep -q "Incomplete: no .env" <<< "$out" && grep -q "put the old .env back first" <<< "$out" && grep -q "you choose: data, images, files" <<< "$out" && ! grep -q "~ " <<< "$(grep -E "Incomplete|choose|old .env" <<< "$out")"'
+else
+  echo "SKIP: script (util-linux) missing - no full screen test of the typing hints"
+fi
+
 echo "== $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]

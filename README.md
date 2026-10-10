@@ -63,26 +63,20 @@ Three cards at the top lead through the usual tasks step by step:
 | **U** | **Update** | Updates this installer first. If there is a new version, the menu restarts and continues with the next step. Then the guided upgrade of the Catalog (backup, new version, health check) and the patch updates of the other components. |
 | **R** | **Remove** | Shows what is installed. You choose what goes: data volumes, images, `.env` and `docker-compose.yml`, job logs and keys are selected; snapshots, backups, offline bundles and the installer itself only if you select them. Containers and networks always go. Type `DELETE` to confirm. R removes only what clearly belongs to this folder: nothing of another installation or app with the same project name, only the files the installer wrote in `snapshots/` and `backups/`, and never `.env` while data that needs its passwords stays. |
 
-The full list below the cards has every single step:
+Below the cards, the options are grouped by what you want to do. The numbers are the same as in earlier versions; inside a group they go up. On a screen of 190 columns or more every option has a short description, and while you type a number the two lines above the prompt say what it will do (99 adds that it asks for `DELETE`).
 
-| Option | Purpose |
+| Group | Options |
 |---|---|
-| 1 | **Settings**: all settings of the script on one screen, grouped by name (see below) |
-| 2 | Generate `.env` and `docker-compose.yml`; existing passwords are kept |
-| 3, 4 | Review or edit the generated files |
-| 5, 6 | Validate (`docker compose config`), start or apply changes (`up -d`) |
-| 7 | Full setup: generate, validate and start |
-| 8 | **Updates**: newest versions of all components on Docker Hub and GHCR, version picker, pinning of floating tags, **Download only** (offline bundle) |
-| 9 to 16 | Status, logs, pull, restart, stop, credentials, URLs and Nginx Proxy Manager steps, prerequisites check |
-| 17 | Download catalog snapshots from rayventorycatalog.raynet.de: the full snapshot and all changes up to today (default), the changes since a date, or the latest daily or full snapshot |
-| 18 | API keys for the online and the local catalog: show, change, test, delete |
-| 19 | Import downloaded snapshots into the local catalog; a downloaded chain is imported file by file, in order |
-| 20 | Let the local catalog synchronize itself daily (servers with internet access) |
-| 21 | **Guided upgrade**: Catalog to the newest version, health check, patch updates of the other components |
-| 22 | Update this installer from GitHub; your settings are kept |
-| 23 | Take over an existing installation on this host (its `.env`, `docker-compose.yml`, passwords and data) |
-| 99 | Remove containers **and all data volumes** (you must type `DELETE`) |
-| J | Jobs: follow, cancel and read the log of running and finished tasks |
+| **SETUP** · install on this host | **7** install in one go: generate, validate and start · **16** check this server: Docker, Compose, kernel, ports, `vm.max_map_count`, time zone · **23** take over an existing installation on this host (its `.env`, `docker-compose.yml`, passwords and data) |
+| **CONFIGURE** · settings and files | **1** edit the settings: all settings of the script on one screen, grouped by name (see below) · **2** generate `.env` and `docker-compose.yml`; existing passwords are kept · **3**, **4** edit the generated files by hand (**2** writes them again) · **5** check the files (`docker compose config`). After a change of the settings, **2** writes the files and **6** applies them |
+| **ACCESS** · addresses and logins | **14** user names and passwords · **15** URLs and the Nginx Proxy Manager steps |
+| **START & STOP** · the containers | **6** start or apply changes (`up -d`) · **12** restart · **13** stop; the data is kept |
+| **MONITOR** · is it running well? | **9** status and health · **10** logs · **J** background jobs: follow, cancel and read the log |
+| **CATALOG DATA** · snapshots, sync | **17** download catalog snapshots from rayventorycatalog.raynet.de: the full snapshot and all changes up to today (default), the changes since a date, or the latest daily or full snapshot · **18** API keys for the online and the local catalog: show, change, test, delete · **19** import downloaded snapshots into the local catalog; a chain file by file, in order · **20** let the local catalog synchronize itself daily (servers with internet access) |
+| **UPDATE** · newer versions | **8** newest versions of all components on Docker Hub and GHCR, version picker, pinning of floating tags, **Download only** (offline bundle) · **11** pull the images named in `docker-compose.yml` · **21** upgrade the Catalog: backup, newest version, health check, patch updates of the other components · **22** update this installer from GitHub; your settings are kept |
+| **REMOVE** · cannot be undone | **99** remove the containers **and all data volumes** (you must type `DELETE`); **R** removes step by step and lets you choose |
+
+The **I** card says **Incomplete** when containers of this folder exist but `.env` or `docker-compose.yml` is missing. Its repair takes the passwords from the newest `.env` backup; without one it warns first, because new passwords would not open the existing MongoDB and RabbitMQ data.
 
 ## Settings screen
 

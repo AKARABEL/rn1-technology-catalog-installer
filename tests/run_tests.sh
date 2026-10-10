@@ -358,5 +358,25 @@ sed -i 's/^SYNC_MAX_UPLOAD=.*/SYNC_MAX_UPLOAD="lots"/' "$D/gen.sh"
 out="$(bash "$D/gen.sh" generate </dev/null 2>&1)"; rc=$?
 check "invalid SYNC_MAX_UPLOAD refused" '[ "$rc" -ne 0 ] && grep -q "SYNC_MAX_UPLOAD must be a size" <<< "$out"'
 
+# The menu: every option once, grouped by what it is for, numbers rising in a group, texts that fit
+D="$(newdir menu_table)"
+tab="$(bash "$D/gen.sh" __menu_items 2>&1)"
+want="$(sed -n '/^menu_dispatch() {/,/^}/p' "$NEW" | grep -oE '^ +[0-9]+\)' | tr -dc '0-9\n' | sort -n | tr '\n' ' ')"
+have="$(awk -F'|' '$2 ~ /^[0-9]+$/ { print $2 }' <<< "$tab" | sort -n | tr '\n' ' ')"
+check "menu: every numbered option of the dispatcher once" '[ -n "$want" ] && [ "$want" = "$have" ] && [ "$(awk -F"|" "\$2 == \"J\" || \$2 == \"H\"" <<< "$tab" | wc -l)" -eq 2 ]'
+group() { awk -F'|' -v g="$1" '$2 == "-" { cur = $4; next } $2 != "" && cur == g { printf "%s ", $2 }' <<< "$tab"; }
+check "menu: SETUP holds only setup (7 16 23)" '[ "$(group SETUP)" = "7 16 23 " ]'
+check "menu: settings and file editing in CONFIGURE (1-5), start and stop apart" '[ "$(group CONFIGURE)" = "1 2 3 4 5 " ] && [ "$(group "START & STOP")" = "6 12 13 " ]'
+check "menu: numbers rise inside every group" '[ -z "$(awk -F"|" "\$2 == \"-\" { last = 0; next } \$2 ~ /^[0-9]+\$/ { if (\$2 + 0 < last) print \$2; last = \$2 + 0 }" <<< "$tab")" ]'
+long="$(awk -F'|' '
+  $2 == "-" && (length($4) + 3 + length($5) > 31 || length($4) + 3 + length($6) > 60) { print "heading " $4 }
+  $2 != "-" && $2 != "" && (length($4) > 26 || length($5) > 30 || length($6) > 46) { print "option " $2 }
+  $3 == "del" && length($2) + 3 + length($4) + 18 > 48 { print "delete line " $2 }' <<< "$tab")"
+check "menu: labels, descriptions and the typing hints fit (100 and 190 columns)" '[ -z "$long" ] || { echo "$long"; false; }'
+out="$(printf '0\n' | COLUMNS=100 bash "$D/gen.sh" menu 2>&1)"
+check "plain menu: group headings say what they are for, options have a description" 'grep -q "^ CONFIGURE . settings and files" <<< "$out" && grep -Eq "^   13\) . Stop \(data is kept\) +containers go, data stays" <<< "$out"'
+out="$(printf '0\n' | COLUMNS=60 bash "$D/gen.sh" menu 2>&1)"
+check "plain menu on a narrow screen: no description" 'grep -Eq "^   13\) . Stop \(data is kept\)$" <<< "$out"'
+
 echo "== $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]

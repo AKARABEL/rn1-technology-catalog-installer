@@ -6178,7 +6178,7 @@ edit_generated() {
   if [ "$file" = "$ENV_FILE" ]; then
     chmod 600 "$ENV_FILE"
   fi
-  info "If you changed something, apply it with option 5 (validate) and 6 (start / apply)."
+  info "If you changed something, apply it with option 5 (check the files) and 6 (start / apply changes)."
 }
 
 do_validate() {
@@ -7474,9 +7474,16 @@ file_state() {
 }
 
 stack_state() {
-  local running
+  local running n=0
   if [ ! -f "$ENV_FILE" ] || [ ! -f "$COMPOSE_FILE" ]; then
-    printf 'not generated yet'
+    if command -v docker >/dev/null 2>&1; then
+      n="$(count_lines "$(here_containers 2>/dev/null)")"
+    fi
+    case "$n" in
+      0) printf 'not generated yet' ;;
+      1) printf '1 container exists' ;;
+      *) printf '%s containers exist' "$n" ;;
+    esac
     return 0
   fi
   if ! command -v docker >/dev/null 2>&1 || ! detect_compose; then
@@ -7491,12 +7498,14 @@ stack_state() {
 }
 
 show_menu() {
-  local found tz_note sib
+  local found tz_note sib state
   reload_settings
+  menu_scan
+  state="$(stack_state)"
   printf '%s\n' "${C_BLD}Raynet One Technology Catalog - Installation Portal${C_RST}   ($(version_label))"
   printf 'Folder : %s\n' "$WORK_DIR"
   printf 'Files  : %s %s   %s %s\n' "$ENV_FILE" "$(file_state "$ENV_FILE")" "$COMPOSE_FILE" "$(file_state "$COMPOSE_FILE")"
-  printf 'Stack  : %s\n' "$(stack_state)"
+  printf 'Stack  : %s\n' "$state"
   if [ ! -f "$ENV_FILE" ]; then
     found="$(first_installation_dir)"
     if [ -n "$found" ]; then
@@ -7512,24 +7521,35 @@ show_menu() {
   if tz_note="$(tz_menu_note)" && [ -n "$tz_note" ]; then
     printf '%s\n' "${C_YLW}$tz_note${C_RST}"
   fi
-  local col key kind label prev="" installed="no" state title color l1 l2
-  state="$(stack_state)"
-  if wiz_installed; then
-    installed="yes"
+  local col key kind label desc what installed title color l1 l2 wide="no" text
+  installed="$(install_state)"
+  if [ "$(ui_cols)" -ge 70 ]; then
+    wide="yes"
   fi
   printf '\n %s\n' "${C_CYN}START HERE$C_RST"
   for key in I U R; do
     IFS='|' read -r title color l1 l2 <<< "$(wiz_card "$key" "$installed" "$state" 40)"
+    if [ "$installed" = "incomplete" ] && [ "$key" != "R" ]; then
+      l1="$l1 $UI_SEP $l2"
+    fi
     printf '  %s) %s  %s\n' "$(printf '%3s' "$key")" "$color$(ui_pad "$title" 8)$C_RST" "$l1"
   done
-  while IFS='|' read -r col key kind label; do
+  while IFS='|' read -r col key kind label desc what; do
     if [ "$key" = "-" ]; then
-      printf '\n %s\n' "$C_CYN$label$C_RST"
+      printf '\n %s\n' "$C_CYN$label$C_RST$C_DIM $UI_SEP $desc$C_RST"
     elif [ -n "$key" ]; then
-      printf '  %s) %s %s\n' "$(printf '%3s' "$key")" "$(menu_icon "$kind")" "$(if [ "$kind" = "del" ]; then printf '%s' "$C_RED$label$C_RST"; else printf '%s' "$label"; fi)"
+      text="$label"
+      if [ "$kind" = "del" ]; then
+        text="$C_RED$label$C_RST"
+      fi
+      if [ "$wide" = "yes" ]; then
+        text="$(ui_pad "$text" 25) $C_DIM$desc$C_RST"
+      fi
+      printf '  %s) %s %s\n' "$(printf '%3s' "$key")" "$(menu_icon "$kind")" "$text"
     fi
   done < <(menu_items)
   printf '\n    0) Exit\n\n  %s\n\n' "$(menu_legend)"
+  menu_scan_done
 }
 
 menu_up() {
@@ -7693,11 +7713,46 @@ wiz_job_since() {
 
 # True when this folder has an installation: its generated files, or containers of this installation
 # (volumes alone may belong to another folder with the same name).
+# The containers of this installation, listed once per menu draw (menu_scan): the cards and the stack
+# line need them, and every listing asks Docker several times. here_containers uses that list during the
+# draw and asks Docker again at any other time.
+MENU_HERE=""
+MENU_HERE_AT=-10
+menu_scan() {
+  MENU_HERE=""
+  if command -v docker >/dev/null 2>&1 && { [ ! -f "$ENV_FILE" ] || [ ! -f "$COMPOSE_FILE" ]; }; then
+    MENU_HERE="$(remove_containers 2>/dev/null)" || MENU_HERE=""
+  fi
+  MENU_HERE_AT="$SECONDS"
+}
+menu_scan_done() {
+  MENU_HERE_AT=-10
+}
+here_containers() {
+  if [ $((SECONDS - MENU_HERE_AT)) -le 2 ]; then
+    printf '%s' "$MENU_HERE"
+  else
+    remove_containers
+  fi
+}
+
+# install_state -> yes (.env and docker-compose.yml are here), incomplete (containers of this folder
+# or .env, but not both files) or no
+install_state() {
+  if [ -f "$ENV_FILE" ] && [ -f "$COMPOSE_FILE" ]; then
+    printf 'yes'
+  elif wiz_installed; then
+    printf 'incomplete'
+  else
+    printf 'no'
+  fi
+}
+
 wiz_installed() {
   if [ -f "$ENV_FILE" ]; then
     return 0
   fi
-  command -v docker >/dev/null 2>&1 && [ -n "$(remove_containers)" ]
+  command -v docker >/dev/null 2>&1 && [ -n "$(here_containers)" ]
 }
 
 # Names of the running jobs ("#3 Upgrade to ..."), one per line; empty when none runs.
@@ -7842,8 +7897,20 @@ install_wizard() {
     fresh="no"
     installed="$(wiz_installed_version)"
     warn "This folder already has an installation (Catalog ${installed:-$CATALOG_VERSION}, stack: $(stack_state))."
+    local repair="Repair: check it, write the files again and start it (passwords, data and version are kept)"
+    if [ ! -f "$ENV_FILE" ]; then
+      found="$(newest_env_backup)"
+      if [ -n "$found" ]; then
+        echo "  $ENV_FILE is missing: a repair takes the passwords from its newest backup $found."
+        repair="Repair: check it, write the files again with the passwords of that backup, and start it"
+      else
+        warn "$ENV_FILE is missing and has no backup. It holds the passwords of MongoDB and RabbitMQ:"
+        echo "  new passwords would not open the existing data. Put the old $ENV_FILE back first if you have it."
+        repair="Repair: check it and write the files again - needs the old $ENV_FILE first (see above)"
+      fi
+    fi
     echo
-    printf '   %s  %s\n' "${C_BLD}1$C_RST" "Repair: check it, write the files again and start it (passwords, data and version are kept)"
+    printf '   %s  %s\n' "${C_BLD}1$C_RST" "$repair"
     printf '   %s  %s\n' "${C_BLD}2$C_RST" "Continue with the catalog data (step 5)"
     printf '   %s  %s\n' "${C_BLD}3$C_RST" "Update it instead (U)"
     printf '   %s  %s\n' "${C_BLD}4$C_RST" "Remove it first (R), then install from scratch"
@@ -8138,7 +8205,7 @@ update_wizard() {
     warn "The stack is not running - option 6 starts it."
   fi
   echo
-  echo "  Major versions of MongoDB, OpenSearch or RabbitMQ: option 8 (Updates)."
+  echo "  Major versions of MongoDB, OpenSearch or RabbitMQ: option 8 (versions, offline bundle)."
   echo "  Catalog data: the daily self-sync (option 20) keeps it current; offline servers import"
   echo "  the changes since their last snapshot with options 17 and 19."
 }
@@ -8748,48 +8815,107 @@ remove_wizard() {
   echo "  I installs it again; the settings at the top of $SCRIPT_NAME were kept."
 }
 
+# ui_fit WIDTH TEXT... -> the first TEXT that fits into WIDTH columns (the last one otherwise)
+ui_fit() {
+  local width="$1" text=""
+  shift
+  for text in "$@"; do
+    if [ "$(ui_len "$text")" -le "$width" ]; then
+      break
+    fi
+  done
+  printf '%s' "$text"
+}
+
 # wiz_card KEY INSTALLED STACK-STATE WIDTH [VERSION] -> TITLE|COLOR|LINE1|LINE2 of a card at the top
+# (INSTALLED: yes, incomplete or no - see install_state)
 # of the menu; short texts when the card has less than 34 characters of room. VERSION: the installed one.
 wiz_card() {
-  local installed="$2" state="$3" short="no" target running current="${5:-$CATALOG_VERSION}"
-  if [ "$4" -lt 34 ]; then
-    short="yes"
-  fi
-  case "$state" in
-    [0-9]*" service(s) running") running="${state%% service(s) running} running" ;;
-    "not generated yet") running="files missing" ;;
-    unknown*) running="Docker not reachable" ;;
-    *) running="no Docker" ;;
-  esac
+  local installed="$2" state="$3" width="$4" target current="${5:-$CATALOG_VERSION}" l1 l2 n=0 missing things
   case "$1" in
     I)
-      if [ "$installed" = "yes" ] && [ "$short" = "yes" ]; then
-        printf '%s|%s|%s|%s' "INSTALL" "$C_GRN" "$C_GRN$UI_OK$C_RST Installed $UI_SEP $running" "${C_DIM}repair: check, start again$C_RST"
+      if [ "$installed" = "incomplete" ]; then
+        if [ ! -f "$ENV_FILE" ] && [ ! -f "$COMPOSE_FILE" ]; then
+          missing="no files"
+        elif [ ! -f "$ENV_FILE" ]; then
+          missing="no .env"
+        else
+          missing="no compose file"
+        fi
+        case "$state" in
+          [0-9]*" container"*) n="${state%% *}" ;;
+        esac
+        things="$n containers"
+        if [ "$n" -eq 1 ]; then
+          things="1 container"
+        fi
+        if [ "$n" -gt 0 ]; then
+          l1="$(ui_fit "$width" "$C_YLW!$C_RST Incomplete: $things, but $missing" "$C_YLW!$C_RST Incomplete: $missing")"
+        else
+          l1="$C_YLW!$C_RST Incomplete: $missing"
+        fi
+        if [ ! -f "$ENV_FILE" ] && [ -z "$(newest_env_backup)" ]; then
+          # a repair would need new passwords, which do not open the existing data
+          l2="$(ui_fit "$width" "put the old .env back first, then repair" "put the old .env back first" "put the old .env back")"
+        elif [ "$n" -gt 0 ]; then
+          l2="$(ui_fit "$width" "repair: check, write the files again, start" "$things $UI_SEP repair: files, start" "$things $UI_SEP repair")"
+        else
+          l2="$(ui_fit "$width" "repair: check, write the files again, start" "repair: write the files")"
+        fi
+        printf '%s|%s|%s|%s' "INSTALL" "$C_GRN" "$l1" "$C_DIM$l2$C_RST"
       elif [ "$installed" = "yes" ]; then
-        printf '%s|%s|%s|%s' "INSTALL" "$C_GRN" "$C_GRN$UI_OK$C_RST Installed $UI_SEP $state" "${C_DIM}repair: check, files, start again$C_RST"
-      elif [ "$short" = "yes" ]; then
-        printf '%s|%s|%s|%s' "INSTALL" "$C_GRN" "$C_GRN$UI_RUN$C_RST New installation" "${C_DIM}check $UI_SEP settings $UI_SEP start$C_RST"
+        case "$state" in
+          "0 service(s) running")
+            l1="stopped"
+            l2="6 starts it $UI_SEP or repair"
+            ;;
+          [0-9]*" service(s) running")
+            l1="${state%% *} running"
+            l2="$(ui_fit "$width" "repair: check, files, start again" "repair: check, start again")"
+            ;;
+          unknown*)
+            l1="Docker not reachable"
+            l2="16 checks the server"
+            ;;
+          *)
+            l1="no Docker"
+            l2="16 checks the server"
+            ;;
+        esac
+        printf '%s|%s|%s|%s' "INSTALL" "$C_GRN" "$C_GRN$UI_OK$C_RST Installed $UI_SEP $l1" "$C_DIM$l2$C_RST"
       else
-        printf '%s|%s|%s|%s' "INSTALL" "$C_GRN" "$C_GRN$UI_RUN$C_RST New installation, step by step" "${C_DIM}check $UI_SEP settings $UI_SEP start $UI_SEP data$C_RST"
+        l1="$(ui_fit "$width" "$C_GRN$UI_RUN$C_RST New installation, step by step" "$C_GRN$UI_RUN$C_RST New installation")"
+        l2="$(ui_fit "$width" "check $UI_SEP settings $UI_SEP start $UI_SEP data" "check $UI_SEP settings $UI_SEP start")"
+        printf '%s|%s|%s|%s' "INSTALL" "$C_GRN" "$l1" "$C_DIM$l2$C_RST"
       fi
       ;;
     U)
       target="${HUB_STABLE:-$LATEST_VERSION}"
-      if [ "$installed" != "yes" ]; then
+      if [ "$installed" = "no" ]; then
         printf '%s|%s|%s|%s' "UPDATE" "$C_YLW" "${C_DIM}Nothing installed yet$C_RST" "${C_DIM}install first (I)$C_RST"
-      elif [ "$HUB_STATUS" = "ok" ] && [ -n "$target" ] && is_version "$current" && version_gt "$target" "$current"; then
-        printf '%s|%s|%s|%s' "UPDATE" "$C_YLW" "$C_YLW$UI_UP $target$C_RST available" "${C_DIM}backup $UI_SEP upgrade $UI_SEP patches$C_RST"
-      elif [ "$HUB_STATUS" = "ok" ]; then
-        printf '%s|%s|%s|%s' "UPDATE" "$C_YLW" "$C_GRN$UI_OK$C_RST Catalog up to date" "${C_DIM}installer and patches$C_RST"
-      else
-        printf '%s|%s|%s|%s' "UPDATE" "$C_YLW" "$UI_UP Installer and Catalog" "${C_DIM}backup $UI_SEP upgrade $UI_SEP checks$C_RST"
+        return 0
       fi
+      if [ "$HUB_STATUS" = "ok" ] && [ -n "$target" ] && is_version "$current" && version_gt "$target" "$current"; then
+        l1="$C_YLW$UI_UP $target$C_RST available"
+        l2="backup $UI_SEP upgrade $UI_SEP patches"
+      elif [ "$HUB_STATUS" = "ok" ]; then
+        l1="$C_GRN$UI_OK$C_RST Catalog up to date"
+        l2="installer and patches"
+      else
+        l1="$UI_UP Installer and Catalog"
+        l2="backup $UI_SEP upgrade $UI_SEP checks"
+      fi
+      if [ "$installed" = "incomplete" ]; then
+        l2="repair first (I), then U"
+      fi
+      printf '%s|%s|%s|%s' "UPDATE" "$C_YLW" "$l1" "$C_DIM$l2$C_RST"
       ;;
     R)
-      if [ "$installed" = "yes" ]; then
-        printf '%s|%s|%s|%s' "REMOVE" "$C_RED" "$C_RED$UI_DEL$C_RST Remove completely" "${C_DIM}containers $UI_SEP data $UI_SEP files$C_RST"
-      else
+      if [ "$installed" = "no" ]; then
         printf '%s|%s|%s|%s' "REMOVE" "$C_RED" "${C_DIM}Nothing installed$C_RST" "${C_DIM}leftover files only$C_RST"
+      else
+        l2="$(ui_fit "$width" "you choose: data $UI_SEP images $UI_SEP files $UI_SEP backups" "you choose: data, images, files" "you choose what goes")"
+        printf '%s|%s|%s|%s' "REMOVE" "$C_RED" "$C_RED$UI_DEL$C_RST Remove from this server" "$C_DIM$l2$C_RST"
       fi
       ;;
   esac
@@ -8798,13 +8924,13 @@ wiz_card() {
 # tui_cards COLS STACK-STATE [HEIGHT] -> the three cards (4 lines, or a 1-line strip), aligned with
 # the columns of the menu below them
 tui_cards() {
-  local cols="$1" state="$2" height="${3:-4}" col_w w key title color l1 l2 spec r line inner installed="no" i current=""
-  local -a top=() mid1=() mid2=() bot=() strip=()
+  local cols="$1" state="$2" height="${3:-4}" col_w w key title color l1 l2 spec r line inner installed i current=""
+  local -a top=() mid1=() mid2=() bot=() strip=() bare=()
   col_w=$(((cols - 4) / 3))
   w=$((col_w - 2))
   inner=$((w - 2))
-  if wiz_installed; then
-    installed="yes"
+  installed="$(install_state)"
+  if [ "$installed" != "no" ]; then
     current="$(env_value CATALOG_IMAGE)"
     current="${current##*:}"
   fi
@@ -8815,10 +8941,18 @@ tui_cards() {
     mid1+=("$C_DIM$UI_V$C_RST $(ui_pad "$l1" $((inner - 2))) $C_DIM$UI_V$C_RST")
     mid2+=("$C_DIM$UI_V$C_RST $(ui_pad "$l2" $((inner - 2))) $C_DIM$UI_V$C_RST")
     bot+=("$C_DIM$UI_BL$(ui_repeat "$UI_H" "$inner")$UI_BR$C_RST")
-    strip+=("$(ui_pad "$C_BLD$key$C_RST $color$title$C_RST  $l1" "$w")")
+    # one line per card on short terminals; all without the title when one state does not fit
+    strip+=("$C_BLD$key$C_RST $color$title$C_RST  $l1")
+    bare+=("$C_BLD$key$C_RST $l1")
   done
   if [ "$height" -lt 4 ]; then
-    printf '  %s  %s  %s\n' "${strip[0]}" "${strip[1]}" "${strip[2]}"
+    for ((i = 0; i < 3; i++)); do
+      if [ "$(ui_len "${strip[i]}")" -gt "$w" ]; then
+        strip=("${bare[@]}")
+        break
+      fi
+    done
+    printf '  %s  %s  %s\n' "$(ui_pad "${strip[0]}" "$w")" "$(ui_pad "${strip[1]}" "$w")" "$(ui_pad "${strip[2]}" "$w")"
     return 0
   fi
   for r in top mid1 mid2 bot; do
@@ -8875,43 +9009,50 @@ $(help_item I run "Install" "A new installation, step by step: checks, the main 
 $(help_item U run "Update" "This installer first, then the Catalog: backup, new version, health" "check, patch updates of MongoDB, OpenSearch, RabbitMQ and the others.")
 $(help_item R del "Remove" "Removes the Catalog from this server: you choose data, images, files," "snapshots, backups, the installer; then type DELETE.")
 
-${c}SETUP$r
-$(help_item 7 run "Full setup" "Generates .env and docker-compose.yml, validates them and starts the stack" "in one go, without questions (I is the guided way).")
-$(help_item 1 edit "Settings" "All settings on one screen, grouped by name (CATALOG_*, MINIO_*," "*_TAG ...); checked before they are saved. E opens them in $(editor_short).")
-$(help_item 2 run "Generate" "Writes .env and docker-compose.yml from the settings. Passwords are kept;" "asks to align TZ with the server's time zone.")
-$(help_item 3 edit ".env file" "Shows or edits the generated .env (passwords included).")
-$(help_item 4 edit "docker-compose.yml" "Shows or edits the generated compose file.")
-$(help_item 5 view "Validate" "Lets Docker Compose check the files (docker compose config).")
-$(help_item 6 run "Start / apply changes" "docker compose up -d: starts the stack or applies changed files.")
+${c}SETUP $UI_SEP install on this host$r
+$(help_item 7 run "Install in one go" "Generates .env and docker-compose.yml, validates them and starts the stack" "in one go; asks only about existing passwords and the time zone (I guides).")
+$(help_item 16 view "Check this server" "Docker, Compose, kernel, ports, vm.max_map_count, time zone.")
+$(help_item 23 run "Take over installation" "Takes the settings of an existing installation (another folder," "or an older installer in this folder); its passwords and data stay.")
 
-${c}ACCESS$r
-$(help_item 14 view "Credentials" "User names and passwords of MongoDB, MinIO and RabbitMQ from .env.")
+${c}CONFIGURE $UI_SEP edit settings, 2 writes the files, 6 applies them$r
+$(help_item 1 edit "Edit settings" "All settings on one screen, grouped by name (CATALOG_*, MINIO_*," "*_TAG ...); checked before they are saved. E opens them in $(editor_short).")
+$(help_item 2 run "Generate .env + compose" "Writes .env and docker-compose.yml from the settings. Passwords are kept;" "asks to align TZ with the server's time zone.")
+$(help_item 3 edit "Edit .env" "Shows or edits the generated .env (passwords included). 2 writes it" "again from the settings, so lasting changes belong into the settings (1).")
+$(help_item 4 edit "Edit docker-compose.yml" "Shows or edits the generated compose file (2 writes it again).")
+$(help_item 5 view "Check the files" "Lets Docker Compose check both files (docker compose config); starts nothing.")
+
+${c}ACCESS $UI_SEP addresses and logins$r
+$(help_item 14 view "User names + passwords" "User names and passwords of MongoDB, MinIO and RabbitMQ from .env.")
 $(help_item 15 view "URLs and proxy setup" "Where Catalog Web and the other services answer, and the steps for" "Nginx Proxy Manager (TLS certificate, proxy host).")
 
-${c}RUN & MONITOR$r
-$(help_item 9 view "Status" "docker compose ps: which containers run and their health.")
-$(help_item 10 view "Logs" "Follow the logs of all or one service.")
-$(help_item 11 run "Pull images" "Downloads the images of the configured versions.")
-$(help_item 12 run "Restart the stack" "Restarts all containers.")
-$(help_item 13 run "Stop the stack" "docker compose down; the data volumes are kept.")
-$(help_item J view "Jobs" "Long tasks run as jobs: they continue when you leave the menu or the" "SSH session ends. Follow, cancel or read their log here.")
+${c}START & STOP $UI_SEP the containers$r
+$(help_item 6 run "Start / apply changes" "docker compose up -d: starts the stack or applies changed files.")
+$(help_item 12 run "Restart the stack" "Restarts all containers; the data is kept.")
+$(help_item 13 run "Stop (data is kept)" "docker compose down; the data volumes are kept.")
 
-${c}CATALOG DATA$r
+${c}MONITOR $UI_SEP is it running well?$r
+$(help_item 9 view "Status and health" "docker compose ps: which containers run and their health.")
+$(help_item 10 view "Follow the logs" "Follow the logs of all or one service.")
+$(help_item J view "Background jobs" "Long tasks run as jobs: they continue when you leave the menu or the" "SSH session ends. Follow, cancel or read their log here.")
+
+${c}CATALOG DATA $UI_SEP snapshots or a daily self-sync$r
 $(help_item 17 run "Download snapshot" "Catalog data from $CATALOG_CLOUD_URL (needs an API key): the full" "snapshot + all changes up to today, the changes since a date, or one file.")
+$(help_item 18 edit "API keys" "Shows, changes, tests and deletes the keys for the online and the" "local Catalog. Keys are tested before they are saved.")
 $(help_item 19 run "Import snapshot" "Uploads downloaded snapshots into the local Catalog; a chain file by" "file, in order. Catalog 25.x accepts at most 10 GB per file.")
 $(help_item 20 run "Daily self-sync" "Lets the local Catalog synchronize itself every day (servers with" "internet access).")
-$(help_item 18 edit "API keys" "Shows, changes, tests and deletes the keys for the online and the" "local Catalog. Keys are tested before they are saved.")
 
-${c}UPDATES & MAINTENANCE$r
-$(help_item 8 run "Updates & offline bundle" "Newest versions of all components, version picker, and" "\"Download only\": an offline bundle for servers without internet.")
-$(help_item 21 run "Guided upgrade" "Backup, new Catalog version, health check, patch updates; goes back" "by itself if you cancel it after the switch.")
+${c}UPDATE $UI_SEP newer versions$r
+$(help_item 8 run "Versions, offline bundle" "Newest versions of all components, version picker, and" "\"Download only\": an offline bundle for servers without internet.")
+$(help_item 11 run "Pull images" "Downloads the images named in docker-compose.yml (2 writes it from the settings).")
+$(help_item 21 run "Upgrade the Catalog" "Backup, new Catalog version, health check, patch updates; goes back" "by itself if you cancel it after the switch.")
 $(help_item 22 run "Update this installer" "Newest $SCRIPT_NAME from GitHub; your settings are kept.")
-$(help_item 23 run "Take over an installation" "Takes the settings of an existing installation (another folder," "or an older installer in this folder).")
-$(help_item 16 view "Check prerequisites" "Docker, Compose, kernel, ports, vm.max_map_count, time zone.")
-$(help_item 99 del "Reset" "Removes all containers AND all data volumes.")
+
+${c}REMOVE $UI_SEP cannot be undone$r
+$(help_item 99 del "Reset: delete all data" "Removes all containers AND all data volumes (type DELETE)." "R removes the Catalog step by step and lets you choose what goes.")
 
 ${c}KEYS IN THE MENU$r
-  Number + Enter   run an option          I U R    guided tasks       H or ?   this help
+  Number + Enter   run an option (the lines above the prompt say what it does while you type)
+  I U R            guided tasks           H or ?   this help
   J                jobs
   Tab              select a running job   hold X   cancel it (2 s)    Q   quit
   The box "Current processes" shows running jobs with progress, speed and remaining time.
@@ -8970,48 +9111,67 @@ menu_dispatch() {
   esac
 }
 
-# COLUMN|KEY|KIND|LABEL - KIND: edit (changes settings or files), run (does something),
-# view (only shows information), del (deletes data); KEY "-" is a heading, an empty KEY a gap.
+# COLUMN|KEY|KIND|LABEL|DESCRIPTION|WHAT-IT-DOES - KIND: edit (changes settings or files), run (does
+# something), view (only shows information), del (deletes data). The description shows on wide screens,
+# WHAT-IT-DOES under the menu while the number is typed. KEY "-" is a heading (COLUMN|-||TITLE|SHORT|WIDE:
+# what the group is for), an empty KEY a gap. A new option takes the next free number; numbers are
+# never reused, so that an old number never runs something else.
 menu_items() {
   cat <<EOF
-1|-||SETUP
-1|7|run|Full setup
-1|1|edit|Settings
-1|2|run|Generate .env + compose
-1|3|edit|.env file
-1|4|edit|docker-compose.yml
-1|5|view|Validate configuration
-1|6|run|Start / apply changes
+1|-||SETUP|install on this host|check the server, then install or take over
+1|7|run|Install in one go|writes files, checks, starts|Generates both files, validates, starts
+1|16|view|Check this server|Docker, ports, kernel, TZ|Checks Docker, Compose, kernel, ports, TZ
+1|23|run|Take over installation|keeps its passwords and data|Takes over an installation (copies its files)
 1|||
-1|-||ACCESS
-1|14|view|Credentials
-1|15|view|URLs and proxy setup
-2|-||RUN & MONITOR
-2|9|view|Status
-2|10|view|Logs
-2|11|run|Pull images
-2|12|run|Restart the stack
-2|13|run|Stop the stack (data kept)
-2|J|view|Jobs
+1|-||CONFIGURE|settings and files|edit settings - 2 writes the files, 6 applies
+1|1|edit|Edit settings|version, ports, proxy, TZ|All settings on one screen; 2 writes the files
+1|2|run|Generate .env + compose|from settings; passwords kept|Writes both files; the passwords are kept
+1|3|edit|Edit .env|by hand; 2 overwrites it|Opens .env (it holds the passwords)
+1|4|edit|Edit docker-compose.yml|by hand; 2 overwrites it|Opens docker-compose.yml in the editor
+1|5|view|Check the files|docker compose config|Lets Docker Compose check both files
+1|||
+1|-||ACCESS|addresses and logins|where to sign in, user names and passwords
+1|14|view|User names + passwords|MongoDB, MinIO, RabbitMQ|Logins of MongoDB, MinIO and RabbitMQ
+1|15|view|URLs and proxy setup|addresses, Nginx Proxy steps|Addresses of all services, TLS proxy steps
+2|-||START & STOP|the containers|all containers of this stack
+2|6|run|Start / apply changes|starts, or applies new files|docker compose up -d: starts or applies
+2|12|run|Restart the stack|all containers, data kept|Restarts all containers; data is kept
+2|13|run|Stop (data is kept)|containers go, data stays|docker compose down - data volumes stay
 2|||
+2|-||MONITOR|is it running well?|status, logs and background jobs
+2|9|view|Status and health|what runs and is healthy|Which containers run, and their health
+2|10|view|Follow the logs|all services or one|Follows the logs of all services or one
+2|J|view|Background jobs|follow, cancel, read the log|Long tasks: follow, cancel, read the log
 2|||
-2|-||CATALOG DATA
-2|17|run|Download snapshot
-2|19|run|Import snapshot
-2|20|run|Daily self-sync
-2|18|edit|API keys
-3|-||UPDATES & MAINTENANCE
-3|8|run|Updates & offline bundle
-3|21|run|Guided upgrade
-3|22|run|Update this installer
-3|23|run|Take over an installation
-3|16|view|Check prerequisites
-3|99|del|Reset (deletes all data)
+2|-||CATALOG DATA|snapshots, sync|fill the Catalog: snapshots or a sync
+2|17|run|Download snapshot|from Raynet, needs a key|Downloads catalog data (needs an API key)
+2|18|edit|API keys|online + local: show, test|Shows, changes and tests the API keys
+2|19|run|Import snapshot|into this Catalog, in order|Imports downloaded snapshots, in order
+2|20|run|Daily self-sync|Catalog fetches changes daily|The Catalog synchronizes itself daily
+3|-||UPDATE|newer versions|newer Catalog, components, installer
+3|8|run|Versions, offline bundle|pick versions, download only|Newest versions, picker, offline bundle
+3|11|run|Pull images|images in docker-compose.yml|Pulls the images named in docker-compose.yml
+3|21|run|Upgrade the Catalog|backup, switch, health check|Backup, new version, health check
+3|22|run|Update this installer|from GitHub, settings kept|Newest installer; the settings are kept
 3|||
+3|-||REMOVE|cannot be undone|deletes data - R removes step by step
+3|99|del|Reset: delete all data|containers + volumes; DELETE|Removes ALL containers AND data volumes
 3|||
-3|-||HELP
-3|H|view|Help & about Raynet
+3|-||HELP|every option explained|every option, the keys and the files
+3|H|view|Help & about Raynet|every option, keys, files|Explains every option, the keys, Raynet
 EOF
+}
+
+# menu_entry KEY -> KIND|LABEL|WHAT-IT-DOES of a menu option (1 when there is no such option)
+menu_entry() {
+  local col key kind label desc what
+  while IFS='|' read -r col key kind label desc what; do
+    if [ "$key" = "$1" ] && [ "$key" != "-" ]; then
+      printf '%s|%s|%s' "$kind" "$label" "$what"
+      return 0
+    fi
+  done < <(menu_items)
+  return 1
 }
 
 # Icon of a menu entry kind.
@@ -9030,32 +9190,41 @@ menu_legend() {
 }
 
 tui_item() {
-  local key="$1" kind="$2" label="$3" width="$4"
+  local key="$1" kind="$2" label="$3" width="$4" desc="${5:-}" wide="${6:-}" text
   if [ -z "$key" ]; then
     printf '%s' "$(ui_repeat ' ' "$width")"
   elif [ "$key" = "-" ]; then
-    ui_pad "$C_CYN$label$C_RST" "$width"
-  elif [ "$kind" = "del" ]; then
-    ui_pad "$C_BLD$(printf '%3s' "$key")$C_RST $(menu_icon "$kind") $C_RED$label$C_RST" "$width"
+    if [ "$width" -ge 62 ] && [ -n "$wide" ]; then
+      desc="$wide"
+    fi
+    ui_pad "$C_CYN$label$C_RST$C_DIM${desc:+ $UI_SEP $desc}$C_RST" "$width"
   else
-    ui_pad "$C_BLD$(printf '%3s' "$key")$C_RST $(menu_icon "$kind") $label" "$width"
+    text="$label"
+    if [ "$kind" = "del" ]; then
+      text="$C_RED$label$C_RST"
+    fi
+    if [ "$width" -ge 62 ] && [ -n "$desc" ]; then
+      text="$(ui_pad "$text" 25) $C_DIM$desc$C_RST"
+    fi
+    ui_pad "$C_BLD$(printf '%3s' "$key")$C_RST $(menu_icon "$kind") $text" "$width"
   fi
 }
 
-# tui_cell "KEY|KIND|LABEL" WIDTH -> one cell of the menu grid (empty: blank)
+# tui_cell "KEY|KIND|LABEL|DESCRIPTION|WIDE" WIDTH -> one cell of the menu grid (empty: blank)
 tui_cell() {
-  local key kind label
+  local key kind label desc more
   if [ -z "$1" ]; then
     printf '%s' "$(ui_repeat ' ' "$2")"
     return 0
   fi
-  IFS='|' read -r key kind label <<< "$1"
-  tui_item "$key" "$kind" "$label" "$2"
+  IFS='|' read -r key kind label desc more <<< "$1"
+  tui_item "$key" "$kind" "$label" "$2" "$desc" "$more"
 }
 
 tui_draw() {
   reload_settings
-  local tz_note sib cols="$1" rows="${2:-40}" line col key kind label i n col_w found head2 head3 version state need cards keys
+  menu_scan
+  local tz_note sib cols="$1" rows="${2:-40}" line col key kind label desc what i n col_w found head2 head3 version state need cards keys
   local -a c1=() c2=() c3=()
   version="$(version_label)"
   head2="Catalog $CATALOG_VERSION"
@@ -9071,10 +9240,13 @@ tui_draw() {
   if [ -n "$COMPOSE_PROJECT_NAME" ]; then
     head3="$head3 $UI_SEP project $COMPOSE_PROJECT_NAME"
   fi
-  head3="$head3 $UI_SEP .env $(if [ -f "$ENV_FILE" ]; then printf '%s' "$C_GRN$UI_OK$C_RST"; else printf '%s' "$C_YLW$UI_NO$C_RST"; fi)"
-  head3="$head3 $UI_SEP compose $(if [ -f "$COMPOSE_FILE" ]; then printf '%s' "$C_GRN$UI_OK$C_RST"; else printf '%s' "$C_YLW$UI_NO$C_RST"; fi)"
+  head3="$head3 $UI_SEP .env $(if [ -f "$ENV_FILE" ]; then printf '%s' "$C_GRN$UI_OK$C_RST"; else printf '%s' "$C_YLW$UI_NO missing$C_RST"; fi)"
+  head3="$head3 $UI_SEP compose $(if [ -f "$COMPOSE_FILE" ]; then printf '%s' "$C_GRN$UI_OK$C_RST"; else printf '%s' "$C_YLW$UI_NO missing$C_RST"; fi)"
   state="$(stack_state)"
-  head3="$head3 $UI_SEP stack $state"
+  case "$state" in
+    *" exist"*) head3="$head3 $UI_SEP $state" ;;
+    *) head3="$head3 $UI_SEP stack $state" ;;
+  esac
   local notes=()
   if [ ! -f "$ENV_FILE" ]; then
     found="$(first_installation_dir)"
@@ -9096,11 +9268,15 @@ tui_draw() {
   fi
   clear_screen
   col_w=$(( (cols - 4) / 3 ))
-  while IFS='|' read -r col key kind label; do
+  while IFS='|' read -r col key kind label desc what; do
+    # headings carry their wide text in the last field, entries the line shown while typing
+    if [ "$key" != "-" ]; then
+      what=""
+    fi
     case "$col" in
-      1) c1+=("$key|$kind|$label") ;;
-      2) c2+=("$key|$kind|$label") ;;
-      3) c3+=("$key|$kind|$label") ;;
+      1) c1+=("$key|$kind|$label|$desc|$what") ;;
+      2) c2+=("$key|$kind|$label|$desc|$what") ;;
+      3) c3+=("$key|$kind|$label|$desc|$what") ;;
     esac
   done < <(menu_items)
   n=${#c1[@]}
@@ -9132,14 +9308,40 @@ tui_draw() {
   if [ "$TUI_COMPACT" = "no" ]; then
     echo
     printf '  %s\n' "$(menu_legend)"
-    keys="Number + Enter $UI_SEP I U R guided tasks $UI_SEP H help $UI_SEP J jobs $UI_SEP Tab next process $UI_SEP hold X cancel process $UI_SEP Q quit"
+    keys="Number + Enter runs it $UI_SEP I U R guided tasks $UI_SEP H help $UI_SEP J jobs $UI_SEP Tab next process $UI_SEP hold X cancel process $UI_SEP Q quit"
     if [ "$(ui_len "$keys")" -gt $((cols - 2)) ]; then
-      keys="I U R guided tasks $UI_SEP H help $UI_SEP J jobs $UI_SEP hold X cancel process $UI_SEP Q quit"
+      keys="Number + Enter runs it $UI_SEP I U R guided tasks $UI_SEP H help $UI_SEP J jobs $UI_SEP hold X cancel $UI_SEP Q quit"
     fi
     printf '  %s\n' "$C_DIM$keys$C_RST"
   fi
+  menu_scan_done
 }
 TUI_COMPACT="no"
+
+# tui_draw_hint COLS ROWS TYPED -> the two lines above the prompt: what the typed number does
+# (left of the Current processes box)
+tui_draw_hint() {
+  local cols="$1" rows="$2" buf="$3" w kind="" label="" what="" l1 l2=""
+  w=$((cols - 52))
+  if [ -z "$buf" ]; then
+    l1="${C_DIM}Type a number - what it does shows here$C_RST"
+  elif [ "$buf" = "0" ]; then
+    l1="${C_BLD}0$C_RST Exit"
+    l2="${C_DIM}Leaves the menu; running jobs go on$C_RST"
+  else
+    IFS='|' read -r kind label what <<< "$(menu_entry "$buf" || true)"
+    if [ -z "$label" ]; then
+      l1="${C_YLW}No option $buf$C_RST"
+    elif [ "$kind" = "del" ]; then
+      l1="$C_BLD$buf$C_RST $(menu_icon "$kind") $C_RED$label - asks for DELETE$C_RST"
+      l2="$C_DIM$what$C_RST"
+    else
+      l1="$C_BLD$buf$C_RST $(menu_icon "$kind") $label"
+      l2="$C_DIM$what$C_RST"
+    fi
+  fi
+  printf '\0337\033[%d;3H%s\033[%d;3H%s\0338' $((rows - 3)) "$(ui_pad "$l1" "$w")" $((rows - 2)) "$(ui_pad "$l2" "$w")"
+}
 
 tui_draw_box() {
   local cols="$1" rows="$2" width=48 row col boxlines=() i blank
@@ -9205,7 +9407,7 @@ tui_draw_hold() {
 
 # Full screen menu with the live "Current processes" box. Returns 2 when the terminal is too small.
 tui_menu() {
-  local cols rows key buf="" redraw=1 last_box=0 now ids next rest held=0
+  local cols rows key buf="" redraw=1 last_box=0 now ids next rest held=0 hint_for
   while true; do
     if [ "$redraw" = 1 ]; then
       cols="$(ui_cols)"
@@ -9221,6 +9423,7 @@ tui_menu() {
       redraw=0
       last_box=0
       UI_BEAT_LAST=""
+      hint_for="-"
     fi
     now="$(ui_now_ms)"
     if [ "$UI_HOLD_PCT" -gt 0 ]; then
@@ -9231,7 +9434,12 @@ tui_menu() {
       last_box="$now"
       held=0
     fi
-    printf '\033[%d;3H%s Select: %s\033[K' $((rows - 1)) "$C_CYN$UI_ARROW$C_RST" "$buf"
+    if [ "$buf" != "$hint_for" ]; then
+      tui_draw_hint "$cols" "$rows" "$buf"
+      hint_for="$buf"
+    fi
+    # padded up to the Current processes box instead of erasing the rest of the line
+    printf '\033[%d;3H%s Select: %-*s\033[%d;%dH' $((rows - 1)) "$C_CYN$UI_ARROW$C_RST" $((cols - 62)) "$buf" $((rows - 1)) $((13 + ${#buf}))
     if [ "$TUI_COMPACT" = "yes" ]; then
       printf '\0337\033[%d;%dH%s\0338' $((rows - 1)) $((cols - 44)) "${C_DIM}I U R guided tasks $UI_SEP H help $UI_SEP J jobs $UI_SEP Q quit$C_RST"
     fi
@@ -9466,6 +9674,7 @@ main() {
     timezone|tz) timezone_cli ;;
     __cron_convert) cron_convert "$@"; echo ;;
     __settings_groups) settings_grouped "$SCRIPT_PATH" ;;
+    __menu_items) menu_items ;;
     updates) show_updates_cli ;;
     upgrade) INTERACTIVE="true"; do_upgrade ;;
     self-update)
