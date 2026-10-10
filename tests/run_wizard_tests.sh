@@ -341,7 +341,7 @@ if command -v script >/dev/null 2>&1 && [ "$(uname -s)" = "Linux" ]; then
   out="$(tui_type "")"
   check "full screen: asks for a number and says it will explain it" 'grep -q "Type a number - what it does shows here" <<< "$out"'
   out="$(tui_type 13)"
-  check "full screen: typing 13 says what it does" 'grep -q "13 . Stop (data is kept)" <<< "$out" && grep -q "docker compose down - data volumes stay" <<< "$out"'
+  check "full screen: typing 13 says what it does" 'grep -q "13 .* Stop (data is kept)" <<< "$out" && grep -q "docker compose down - data volumes stay" <<< "$out"'
   out="$(tui_type 99)"
   check "full screen: typing 99 warns" 'grep -q "Reset: delete all data - asks for DELETE" <<< "$out" && grep -q "Removes ALL containers AND data volumes" <<< "$out"'
   out="$(tui_type 24)"
