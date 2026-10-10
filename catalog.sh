@@ -750,7 +750,7 @@ install_podman_linux() {
   fi
   mapfile -t -O "${#steps[@]}" steps < <(podman_service_plan)
   echo
-  info "Podman $(if [ -n "$plan" ]; then printf 'is installed from the packages of %s, then its' "$(os_release PRETTY_NAME)"; else printf '%s is installed; its' "$(podman_version)"; fi) API socket and restart service are enabled:"
+  info "Podman $(if [ -n "$plan" ]; then printf 'will be installed from the packages of %s, then its' "$(os_release PRETTY_NAME)"; else printf '%s is installed; its' "$(podman_version)"; fi) API socket and restart service will be enabled:"
   printf '      %s\n' "${steps[@]}"
   if [ "$mode" = "ask" ] && ! confirm "Run these commands${SUDO[*]:+ with sudo}?" y; then
     info "Podman was not set up."
@@ -832,7 +832,7 @@ mac_prepare() {
     fi
   done
   if [ "${#missing[@]}" -gt 0 ]; then
-    info "Homebrew installs: ${missing[*]}"
+    info "Homebrew will install: ${missing[*]}"
     echo "      brew install ${missing[*]}"
     if [ "$mode" = "ask" ] && ! confirm "Run it now?" y; then
       info "Nothing was installed."
@@ -861,7 +861,7 @@ mac_prepare() {
     elif [ "$ram" -lt $((16 * 1024 * 1024 * 1024)) ]; then
       warn "This Mac has less than 16 GB of memory; the Catalog needs about 8 GB in the Podman machine."
     fi
-    info "A Podman machine (Linux VM) is created: rootful, $cpus CPUs, $((mem / 1024)) GB memory, 100 GB disk."
+    info "A Podman machine (Linux VM) will be created: rootful, $cpus CPUs, $((mem / 1024)) GB memory, 100 GB disk."
     echo "      podman machine init --rootful --cpus $cpus --memory $mem --disk-size 100 --now"
     if [ "$mode" = "ask" ] && ! confirm "Create it now?" y; then
       info "No Podman machine was created."
