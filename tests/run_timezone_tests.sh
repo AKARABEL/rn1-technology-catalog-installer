@@ -32,7 +32,7 @@ case "$a" in
   "compose --env-file .env -f docker-compose.yml "*)
     [ "${PODMAN_COMPOSE_PROVIDER:-}" = "$RN1_COMPOSE_PROVIDER" ] || { printf 'UNHANDLED podman %s (PODMAN_COMPOSE_PROVIDER=%s)\n' "$a" "${PODMAN_COMPOSE_PROVIDER:-unset}" >> "$UNH"; exit 125; }
     case "${a#compose --env-file .env -f docker-compose.yml }" in
-      "config --quiet"|ps|"ps -q mongo"|"ps --services --filter status=running"|"up -d --remove-orphans") ;;
+      "config --quiet"|ps|"ps -q mongo"|"ps -q catalog-web"|"ps -a -q mongo"|"ps -a -q catalog-web"|"ps --services --filter status=running"|"up -d --remove-orphans") ;;
       *) printf 'UNHANDLED podman %s\n' "$*" >> "$UNH"; exit 125 ;;
     esac ;;
   *) printf 'UNHANDLED podman %s\n' "$*" >> "$UNH"; exit 125 ;;

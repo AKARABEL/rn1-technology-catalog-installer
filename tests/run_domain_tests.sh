@@ -42,7 +42,7 @@ case "$a" in
   "compose --env-file .env -f docker-compose.yml "*)
     [ "${PODMAN_COMPOSE_PROVIDER:-}" = "$RN1_COMPOSE_PROVIDER" ] || { printf 'UNHANDLED podman %s (PODMAN_COMPOSE_PROVIDER=%s)\n' "$a" "${PODMAN_COMPOSE_PROVIDER:-unset}" >> "$UNH"; exit 125; }
     case "${a#compose --env-file .env -f docker-compose.yml }" in
-      "config --quiet"|ps|"ps --services --filter status=running") ;;
+      "config --quiet"|ps|"ps --services --filter status=running"|"ps -q catalog-web"|"ps -q mongo"|"ps -a -q catalog-web"|"ps -a -q mongo") ;;
       "ps -q nginx-proxy-manager") [ -f "$NS/npm_down" ] || echo 5f1c0e7a9b ;;
       "up -d --remove-orphans")
         echo up >> "$NS/ups"

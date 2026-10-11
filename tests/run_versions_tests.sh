@@ -155,6 +155,7 @@ case "${1:-}" in
         esac ;;
       ps)
         if [ "${1:-}" = -q ] && [ $# -eq 2 ]; then running && echo "id-$2"
+        elif [ "${1:-}" = -a ] && [ "${2:-}" = -q ] && [ $# -eq 3 ]; then running && echo "id-$3"
         elif [ $# -eq 0 ]; then echo "NAME STATUS"
         elif [ "$*" = "--services --filter status=running" ]; then if running; then printf '%s\n' $SVCS; fi
         else bad compose ps "$@"; fi ;;

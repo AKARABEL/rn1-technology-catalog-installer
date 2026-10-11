@@ -369,7 +369,9 @@ case "${1:-}" in
         esac ;;
       ps)
         case "$*" in
-          "-q "*)
+          "-q "*|"-a -q "*)
+            # -a: stopped containers too - these exist only while the stack runs
+            if [ "$1" = -a ]; then shift; fi
             [ $# -eq 2 ] || bad
             if running; then
               case "$2" in
@@ -551,7 +553,9 @@ case "${1:-}" in
         esac ;;
       ps)
         case "$*" in
-          "-q "*)
+          "-q "*|"-a -q "*)
+            # -a: stopped containers too - these exist only while the stack runs
+            if [ "$1" = -a ]; then shift; fi
             [ $# -eq 2 ] || bad
             if running; then case "$2" in mongo) echo a1b2c3d4e5f6 ;; catalog-web) echo b2c3d4e5f6a7 ;; worker-search) echo c3d4e5f6a7b8 ;; esac; fi ;;
           "--services --filter status=running") running && printf '%s\n' mongo catalog-web worker-search ;;
@@ -713,6 +717,25 @@ sed -i 's/^CATALOG_VERSION=.*/CATALOG_VERSION="26.3.4789.148"/' "$I"
 out="$(printf 'i\n1\ny\ny\n\ny\ny\nn\n\n0\n' | bash "$I" menu 2>&1)"
 check "repair: version of the installation kept" 'grep -q "the repair keeps 25.4.4191.133" <<< "$out" && grep -q "^CATALOG_VERSION=\"25.4.4191.133\"$" "$I" && grep -q "^CATALOG_IMAGE=.*:25.4.4191.133$" "$D/.env"'
 check "repair: the steps of a repair (check, settings, files, start)" 'grep -q "Install .* step 3 of 6" <<< "$out" && grep -q "Install .* step 4 of 6" <<< "$out" && ! grep -q "of 7" <<< "$out"'
+# 4b. 26.3 runs, a new download of the installer says 25.4 (and port 8080 instead of 8181): the start offers
+#     the values of the installation (declined here), the repair offers them again before it writes anything
+installed
+sed -i 's/^CATALOG_VERSION=.*/CATALOG_VERSION="26.3.4789.148"/; 0,/^CATALOG_WEB_PORT=/s/^CATALOG_WEB_PORT=.*/CATALOG_WEB_PORT="8181"/' "$I"
+(cd "$D" && bash rn1-technology-catalog-installer.sh generate </dev/null >/dev/null 2>&1)
+echo "26.3.4789.148" > "$ST/catalog_tag"
+sed -i 's/^CATALOG_VERSION=.*/CATALOG_VERSION="25.4.4191.133"/; 0,/^CATALOG_WEB_PORT=/s/^CATALOG_WEB_PORT=.*/CATALOG_WEB_PORT="8080"/' "$I"
+: > "$LOG"
+out="$(printf 'n\n\ni\n1\ny\ny\ny\n\ny\ny\nn\n\n0\n' | bash "$I" menu 2>&1)"
+check "repair after a new download: the values of the installation taken over first, 26.3 kept" '[ "$(grep -c "CATALOG_VERSION *25.4.4191.133 -> 26.3.4789.148" <<< "$out")" -eq 2 ] && grep -q "Took over 2 value(s) of the installation" <<< "$out" && grep -q "Catalog version: 26.3.4789.148" <<< "$out" && [ "$(setting CATALOG_VERSION)" = 26.3.4789.148 ] && [ "$(setting CATALOG_WEB_PORT)" = 8181 ] && grep -q "^CATALOG_IMAGE=.*:26.3.4789.148$" "$D/.env" && grep -qx "CATALOG_WEB_PORT=8181" "$D/.env"'
+# 4c. The same Catalog version, only the port differs from .env (a new download with the installed version):
+#     nothing is offered at the start, the repair offers the values of the installation before it writes
+installed
+sed -i '0,/^CATALOG_WEB_PORT=/s/^CATALOG_WEB_PORT=.*/CATALOG_WEB_PORT="8181"/' "$I"
+(cd "$D" && bash rn1-technology-catalog-installer.sh generate </dev/null >/dev/null 2>&1)
+sed -i '0,/^CATALOG_WEB_PORT=/s/^CATALOG_WEB_PORT=.*/CATALOG_WEB_PORT="8080"/' "$I"
+: > "$LOG"
+out="$(printf 'i\n1\ny\ny\ny\n\ny\ny\nn\n\n0\n' | bash "$I" menu 2>&1)"
+check "repair with another port in the settings: the port of the installation taken over first, kept" 'grep -q "The settings differ from the installation in CATALOG_WEB_PORT" <<< "$out" && [ "$(grep -c "CATALOG_WEB_PORT *8080 -> 8181" <<< "$out")" -eq 1 ] && grep -q "Took over 1 value(s) of the installation" <<< "$out" && [ "$(setting CATALOG_WEB_PORT)" = 8181 ] && grep -qx "CATALOG_WEB_PORT=8181" "$D/.env"'
 # 0 at the time zone question stops the repair; outside the guided tasks (option 2) 0 is a no, as before
 TZDATA="no"
 if [ -f /usr/share/zoneinfo/America/New_York ] && [ -f /usr/share/zoneinfo/Europe/Berlin ]; then TZDATA="yes"; fi
@@ -891,6 +914,13 @@ check "remove: compose down, then the data volumes one by one" 'grep -q "^podman
 check "remove: images of the stack removed once each, by their qualified names" '[ "$(grep -c "^podman image rm docker.io/library/mongo:8\.0$" "$LOG")" -eq 1 ] && [ "$(grep -c "^podman image rm docker.io/raynetgmbh/rayventory-catalog:25.4.4191.133$" "$LOG")" -eq 1 ] && [ "$(grep -c "^podman image rm " "$LOG")" -eq 3 ] && [ ! -s "$ST/images" ]'
 check "remove: generated files gone, snapshots and installer kept" '[ ! -f "$D/.env" ] && [ ! -f "$D/docker-compose.yml" ] && [ ! -e "$D/.jobs" ] && [ ! -e "$D/.setup-later" ] && [ -f "$D/snapshots/a.tar.gz" ] && [ -f "$I" ]'
 check "remove: done, I installs again" 'grep -q "The Catalog was removed from this server" <<< "$out" && grep -q "I installs it again" <<< "$out"'
+
+# 14b. 26.3 runs, the files say 25.4 (a new download and option 2 of an older installer): R that keeps the
+#      data does not remove the containers that show 26.3
+installed
+echo "26.3.4789.148" > "$ST/catalog_tag"
+out="$(printf 'n\n\nr\nn\ny\n1\n\nn\n\n0\n' | bash "$I" menu 2>&1)"
+check "remove keeping the data: refused while the files name an older Catalog than the containers" 'grep -q "Catalog 25.4.4191.133 would replace the installed 26.3.4789.148" <<< "$out" && grep -q "nothing was stopped" <<< "$out" && grep -q "Remove .* step 2 of 5" <<< "$out" && ! grep -q "Remove .* step 3 of 5" <<< "$out" && [ -f "$D/.env" ] && ! grep -Eq "$MUTATING" "$LOG"'
 
 # 15. Data volumes that cannot be removed: the files with the passwords stay
 installed

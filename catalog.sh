@@ -2373,15 +2373,19 @@ version_with_tag() {
   fi
 }
 
+# "Catalog X - up to date": the installed Catalog (the setting while nothing is installed)
 version_label() {
-  local label="Catalog $CATALOG_VERSION"
+  local cur label
+  cur="$(installed_catalog)"
+  cur="${cur:-$CATALOG_VERSION}"
+  label="Catalog $cur"
   case "$HUB_STATUS" in
     ok)
-      if [ "$LATEST_VERSION" = "$CATALOG_VERSION" ]; then
+      if [ "$LATEST_VERSION" = "$cur" ]; then
         label="$label - ${C_GRN}up to date${C_RST}"
-      elif ! is_version "$CATALOG_VERSION"; then
+      elif ! is_version "$cur"; then
         label="$label - newest on Docker Hub: $(version_with_tag "$LATEST_VERSION")"
-      elif version_gt "$LATEST_VERSION" "$CATALOG_VERSION"; then
+      elif version_gt "$LATEST_VERSION" "$cur"; then
         label="$label - ${C_YLW}update available: $(version_with_tag "$LATEST_VERSION"), option 8${C_RST}"
       fi
       ;;
@@ -2523,7 +2527,7 @@ print_version_choices() {
 
 # Menu: pick a version from Docker Hub, store it as CATALOG_VERSION and optionally apply it.
 select_version() {
-  local mode="${1:-}" choice selected="" generated count
+  local mode="${1:-}" choice selected="" generated count installed
   info "Reading the available versions from Docker Hub..."
   if ! fetch_hub_versions; then
     err "Could not read the versions from Docker Hub (no internet access, a proxy is needed, or the images are not on Docker Hub)."
@@ -2559,8 +2563,12 @@ select_version() {
     fi
   done
 
+  installed="$(installed_catalog)"
   if [ "$selected" = "$CATALOG_VERSION" ]; then
     info "$selected is already selected."
+  elif is_version "$installed" && version_gt "$installed" "$selected"; then
+    err "$selected is OLDER than the installed $installed, which migrated the database - not selected (option 21 goes back after a failed upgrade)."
+    return 0
   else
     if is_version "$CATALOG_VERSION" && version_gt "$CATALOG_VERSION" "$selected"; then
       warn "$selected is OLDER than the selected $CATALOG_VERSION."
@@ -2603,7 +2611,7 @@ list_versions() {
 }
 
 set_version_cli() {
-  local wanted="${1:-}"
+  local wanted="${1:-}" installed
   if [ -z "$wanted" ]; then
     err "Usage: $0 set-version VERSION|stable"
     return 2
@@ -2626,6 +2634,11 @@ set_version_cli() {
       return 1
     fi
     warn "Could not read the versions from Docker Hub - $wanted is not checked."
+  fi
+  installed="$(installed_catalog)"
+  if is_version "$installed" && version_gt "$installed" "$wanted"; then
+    err "$wanted is OLDER than the installed $installed, which migrated the database - not selected."
+    return 1
   fi
   if is_version "$CATALOG_VERSION" && version_gt "$CATALOG_VERSION" "$wanted"; then
     warn "$wanted is OLDER than $CATALOG_VERSION - a downgrade can fail if the database was already updated."
@@ -3333,6 +3346,8 @@ apply_updates() {
   do_up
 }
 
+# Reads the settings of this script again (a job or a take-over of the installation's values in a
+# subshell may have changed any of them); the engine is chosen once at the start.
 reload_settings() {
   local name value
   if [ -z "$SCRIPT_PATH" ]; then
@@ -3340,12 +3355,8 @@ reload_settings() {
   fi
   while IFS='|' read -r name value; do
     case "$name" in
-      CATALOG_VERSION|OPENSEARCH_TAG|OPENSEARCH_DASHBOARDS_TAG|MONGO_TAG|RABBITMQ_TAG|MINIO_TAG|NGINX_PROXY_MANAGER_TAG|TZ|AUTOSYNC_CRON|VULNERABILITIES_CACHING_CRON)
-        printf -v "$name" '%s' "$value"
-        ;;
-      CATALOG_DOMAIN|NPM_ADMIN_EMAIL|INSTALL_NGINX_PROXY_MANAGER|BASEURL)
-        printf -v "$name" '%s' "$value"
-        ;;
+      CONTAINER_ENGINE) ;;
+      *) printf -v "$name" '%s' "$value" ;;
     esac
   done < <(settings_pairs "$SCRIPT_PATH")
 }
@@ -3384,10 +3395,17 @@ show_updates_cli() {
   show_updates
 }
 
-# set_settings_atomic NAME|VALUE... -> writes the settings into this script all at once (into a copy
-# first, then over the script): either all of them change or none
+# set_settings_atomic [--keep-backup] NAME|VALUE... -> writes the settings into this script all at once
+# (into a copy first, then over the script): either all of them change or none. A setting a job writes
+# meanwhile is kept (the copy is made again). --keep-backup keeps the backup of the script (SETTINGS_BACKUP).
+SETTINGS_BACKUP=""
 set_settings_atomic() {
-  local spec copy backup
+  local spec copy backup keep="no" sum tries=0
+  SETTINGS_BACKUP=""
+  if [ "${1:-}" = "--keep-backup" ]; then
+    keep="yes"
+    shift
+  fi
   if [ "$#" -eq 0 ]; then
     return 0
   fi
@@ -3395,16 +3413,28 @@ set_settings_atomic() {
     err "${SCRIPT_PATH:-This installer} cannot be changed (not a writable file) - nothing was changed."
     return 1
   fi
-  copy="$(mktemp)" || return 1
-  if ! cp -- "$SCRIPT_PATH" "$copy"; then
-    rm -f -- "$copy"
-    err "Nothing was changed."
-    return 1
-  fi
-  for spec in "$@"; do
-    if ! set_setting "${spec%%|*}" "${spec#*|}" "$copy"; then
+  while true; do
+    copy="$(mktemp)" || return 1
+    sum="$(cksum < "$SCRIPT_PATH")"
+    if ! cp -- "$SCRIPT_PATH" "$copy"; then
       rm -f -- "$copy"
       err "Nothing was changed."
+      return 1
+    fi
+    for spec in "$@"; do
+      if ! set_setting "${spec%%|*}" "${spec#*|}" "$copy"; then
+        rm -f -- "$copy"
+        err "Nothing was changed."
+        return 1
+      fi
+    done
+    if [ "$(cksum < "$SCRIPT_PATH")" = "$sum" ]; then
+      break
+    fi
+    rm -f -- "$copy"
+    tries=$((tries + 1))
+    if [ "$tries" -ge 3 ]; then
+      err "$SCRIPT_NAME keeps changing (a running job?) - nothing was changed, try again later."
       return 1
     fi
   done
@@ -3419,7 +3449,12 @@ set_settings_atomic() {
     err "Cannot write $SCRIPT_PATH. If it is damaged, the previous version is $backup."
     return 1
   fi
-  rm -f -- "$copy" "$backup"
+  rm -f -- "$copy"
+  if [ "$keep" = "yes" ]; then
+    SETTINGS_BACKUP="$backup"
+  else
+    rm -f -- "$backup"
+  fi
   for spec in "$@"; do
     printf -v "${spec%%|*}" '%s' "${spec#*|}"
   done
@@ -3543,8 +3578,7 @@ choose_versions() {
     if [ "$key" = "catalog" ]; then
       cur[i]="$CATALOG_VERSION"
       res[i]=""
-      tag="$(env_value CATALOG_IMAGE)"
-      tag="${tag##*:}"
+      tag="$(installed_catalog)"
       if [ "$installed" = "yes" ] && is_version "$tag"; then
         res[i]="$tag"
       elif is_version "$CATALOG_VERSION"; then
@@ -5720,10 +5754,14 @@ self_sync_run() {
 # Guided upgrade
 ###############################################################################
 
-# Image tag of a running service (empty when it does not run).
+# Image tag of a running service (empty when it does not run); running_tag SERVICE all: also of its
+# stopped container
 running_tag() {
-  local id image
-  id="$(compose ps -q "$1" 2>/dev/null | head -n 1)" || id=""
+  local id image all=""
+  if [ "${2:-}" = "all" ]; then
+    all="-a"
+  fi
+  id="$(compose ps ${all:+"$all"} -q "$1" 2>/dev/null | head -n 1)" || id=""
   if [ -z "$id" ]; then
     return 0
   fi
@@ -5737,6 +5775,406 @@ mongo_running_version() {
   if [ -n "$id" ]; then
     "$ENGINE" exec "$id" mongod --version 2>/dev/null | sed -n 's/^db version v//p' | head -n 1 || true
   fi
+}
+
+###############################################################################
+# The installation in this folder against the settings
+###############################################################################
+
+# The Catalog version of catalog-web here: of its container, running or stopped (empty when there is
+# none - its image is what shows the installed version); the menu asks once per draw.
+running_catalog() {
+  if [ $((SECONDS - MENU_HERE_AT)) -le 2 ]; then
+    printf '%s' "$MENU_CATALOG"
+  elif [ -f "$ENV_FILE" ] && [ -f "$COMPOSE_FILE" ] && engine_cli && detect_compose >/dev/null 2>&1; then
+    running_tag catalog-web all 2>/dev/null || true
+  fi
+}
+
+# True when .env belongs to data of this stack: its data volumes exist, or the engine cannot tell. After
+# a reset (option 99) or R with the data, .env names nothing that is installed.
+install_data() {
+  local vols
+  if [ ! -f "$ENV_FILE" ]; then
+    return 1
+  fi
+  if [ $((SECONDS - MENU_HERE_AT)) -le 2 ]; then
+    [ "$MENU_DATA" = "yes" ]
+    return
+  fi
+  if ! engine_cli || ! vols="$("$ENGINE" volume ls -q --filter "label=com.docker.compose.project=$(stack_project)" 2>/dev/null)"; then
+    return 0
+  fi
+  [ -n "$vols" ]
+}
+
+# The installed Catalog version: the one of catalog-web's container, else the one .env names while the
+# data of the stack exists (empty: neither). CATALOG_VERSION is what the next generate writes, not what
+# is installed.
+installed_catalog() {
+  local v
+  v="$(running_catalog)"
+  if [ -z "$v" ] && install_data; then
+    v="$(env_value CATALOG_IMAGE)"
+    v="${v##*:}"
+  fi
+  printf '%s' "$v"
+}
+
+# tag_below A B -> true when the series of the version tag A lies below the one of B, compared as far
+# as both go up to the minor version: 8.0 and 8.0.30 are not below 8.0.32 (a patch may go back within
+# its series), 7.0 and 2.17.0 (against 2.19.5) are
+tag_below() {
+  local a="${1%%-*}" b="${2%%-*}" da db n
+  if ! [[ "$a" =~ ^[0-9]+(\.[0-9]+)*$ ]] || ! [[ "$b" =~ ^[0-9]+(\.[0-9]+)*$ ]]; then
+    return 1
+  fi
+  da="${a//[!.]/}"
+  db="${b//[!.]/}"
+  n=$((${#da} < ${#db} ? ${#da} + 1 : ${#db} + 1))
+  if [ "$n" -gt 2 ]; then
+    n=2
+  fi
+  version_gt "$(cut -d. -f1-"$n" <<< "$b")" "$(cut -d. -f1-"$n" <<< "$a")"
+}
+
+# The env file the installation runs with: .env, or - when the container of catalog-web has another version
+# than .env names - the newest backup of .env that names that one (empty when there is none)
+install_env() {
+  local run v f i
+  local -a baks=()
+  run="$(running_catalog)"
+  v="$(env_value CATALOG_IMAGE)"
+  if [ -f "$ENV_FILE" ] && { [ -z "$run" ] || [ "${v##*:}" = "$run" ]; }; then
+    printf '%s' "$ENV_FILE"
+    return 0
+  fi
+  if [ -z "$run" ]; then
+    return 0
+  fi
+  for f in "$ENV_FILE".bak-*; do
+    if [ -f "$f" ]; then
+      baks+=("$f")
+    fi
+  done
+  # the names carry the time: the newest first
+  for ((i = ${#baks[@]} - 1; i >= 0; i--)); do
+    v="$(env_unquote "$(env_file_value CATALOG_IMAGE "${baks[i]}")")"
+    if [ "${v##*:}" = "$run" ]; then
+      printf '%s' "${baks[i]}"
+      return 0
+    fi
+  done
+}
+
+# What the menu says when the settings would lower the installation in this folder (the Catalog, MongoDB,
+# OpenSearch, RabbitMQ or Nginx Proxy Manager), or its files name an older Catalog than the installed one
+# (empty: nothing). Option 23 takes the installation's values over.
+install_note() {
+  local run files inst src spec name tag
+  if [ ! -f "$ENV_FILE" ]; then
+    return 0
+  fi
+  run="$(running_catalog)"
+  files="$(env_value CATALOG_IMAGE)"
+  files="${files##*:}"
+  inst="$run"
+  if [ -z "$inst" ]; then
+    if ! install_data; then
+      return 0
+    fi
+    inst="$files"
+  fi
+  if is_version "$inst" && is_version "$CATALOG_VERSION" && version_gt "$inst" "$CATALOG_VERSION"; then
+    printf 'The settings say Catalog %s, %s is installed' "$CATALOG_VERSION" "$inst"
+  elif is_version "$run" && is_version "$files" && version_gt "$run" "$files"; then
+    printf 'The files say Catalog %s, %s is installed' "$files" "$run"
+  else
+    src="$(install_env)"
+    if [ -z "$src" ]; then
+      return 0
+    fi
+    for spec in MONGO_TAG:mongo OPENSEARCH_TAG:opensearch RABBITMQ_TAG:rabbitmq NGINX_PROXY_MANAGER_TAG:npm; do
+      name="${spec%%:*}"
+      tag="$(env_unquote "$(env_file_value "$name" "$src")")"
+      if tag_below "${!name}" "$tag"; then
+        printf 'The settings say %s %s, %s is installed' "$(series_name "${spec#*:}")" "$(version_core "${!name}")" "$(version_core "$tag")"
+        return 0
+      fi
+    done
+  fi
+}
+
+# The values of the installation in this folder (its env file, see install_env) that the settings would
+# change, the versions aside (newer ones are an update, older ones are install_note's): "The settings
+# differ from the installation in CATALOG_WEB_PORT, TZ" (empty: none). A new download of the installer
+# with the installed Catalog version has them, or settings changed after the files were written.
+install_diff_note() {
+  local src name value names="" n=0
+  if [ -z "$(running_catalog)" ] && ! install_data; then
+    return 0
+  fi
+  src="$(install_env)"
+  if [ -z "$src" ]; then
+    return 0
+  fi
+  while IFS='|' read -r name value; do
+    case "$name" in
+      ""|CATALOG_VERSION|*_TAG) continue ;;
+    esac
+    if [ "${!name-}" != "$value" ]; then
+      n=$((n + 1))
+      if [ "$n" -le 3 ]; then
+        names="$names${names:+, }$name"
+      fi
+    fi
+  done <<< "$(env_settings "$src")"
+  if [ -n "$COMPOSE_PROJECT_NAME" ] && ! grep -q '^COMPOSE_PROJECT_NAME=' "$src"; then
+    n=$((n + 1))
+    if [ "$n" -le 3 ]; then
+      names="$names${names:+, }COMPOSE_PROJECT_NAME"
+    fi
+  fi
+  if [ "$n" -gt 3 ]; then
+    names="$names and $((n - 3)) more"
+  fi
+  if [ "$n" -gt 0 ]; then
+    printf 'The settings differ from the installation in %s' "$names"
+  fi
+}
+
+# NAME|VALUE for every setting an env file holds (the passwords stay in the env file; CATALOG_IMAGE gives
+# CATALOG_IMAGE_REPO and CATALOG_VERSION). ENV_SKIPPED: the keys whose values a setting cannot hold.
+ENV_SKIPPED=""
+env_settings() {
+  local line key value names
+  ENV_SKIPPED=""
+  names="$(settings_pairs "$SCRIPT_PATH" | cut -d'|' -f1)"
+  while IFS= read -r line; do
+    line="${line%$'\r'}"
+    if ! [[ "$line" =~ ^([A-Z_][A-Z0-9_]*)=(.*)$ ]]; then
+      continue
+    fi
+    key="${BASH_REMATCH[1]}"
+    value="$(env_unquote "${BASH_REMATCH[2]}")"
+    case "$key" in
+      MONGO_INITDB_ROOT_PASSWORD|MINIO_ROOT_PASSWORD|RABBITMQ_DEFAULT_PASS|ENV_FILE|COMPOSE_FILE) continue ;;
+      CATALOG_IMAGE)
+        printf '%s|%s\n' CATALOG_IMAGE_REPO "${value%:*}" CATALOG_VERSION "${value##*:}"
+        continue
+        ;;
+      CATALOG_WORKER_IMAGE)
+        printf '%s|%s\n' CATALOG_WORKER_IMAGE_REPO "${value%:*}"
+        continue
+        ;;
+    esac
+    if [[ "$value" == *[\"\\\$\`]* ]]; then
+      ENV_SKIPPED="$ENV_SKIPPED $key"
+    elif grep -qx -- "$key" <<< "$names"; then
+      printf '%s|%s\n' "$key" "$value"
+    fi
+  done < "$1"
+}
+
+# install_values ENV-FILE -> NAME|VALUE of the installation in this folder (a later line wins): the
+# values of its env file (COMPOSE_PROJECT_NAME empty when the file has none), then the Catalog and the
+# component tags of its containers
+install_values() {
+  local src="$1" name tag
+  if [ -n "$src" ]; then
+    env_settings "$src"
+    if ! grep -q '^COMPOSE_PROJECT_NAME=' "$src"; then
+      printf 'COMPOSE_PROJECT_NAME|\n'
+    fi
+  fi
+  tag="$(running_catalog)"
+  if [ -n "$tag" ]; then
+    printf 'CATALOG_VERSION|%s\n' "$tag"
+  fi
+  if [ -f "$ENV_FILE" ] && [ -f "$COMPOSE_FILE" ] && engine_cli && detect_compose >/dev/null 2>&1; then
+    for name in MONGO_TAG OPENSEARCH_TAG OPENSEARCH_DASHBOARDS_TAG RABBITMQ_TAG MINIO_TAG NGINX_PROXY_MANAGER_TAG; do
+      tag="$(running_tag "$(setting_service "$name")" all)"
+      if [[ "$tag" =~ ^[A-Za-z0-9_][A-Za-z0-9_.-]*$ ]]; then
+        printf '%s|%s\n' "$name" "$tag"
+      fi
+    done
+  fi
+}
+
+# Takes the values of the installation in this folder over into the settings (after a new download of
+# the installer, for example): the table first, then all at once, with a backup of the installer. .env,
+# docker-compose.yml and the containers stay; when the files name an older Catalog than the one that
+# is installed, it then offers to put back their backups that belong to it. install_takeover [interactive|cli]
+install_takeover() {
+  local mode="${1:-interactive}" src name ours value spec run files stamp cbak
+  local -a diffs=() specs=()
+  local -A theirs=()
+  if [ -z "$SCRIPT_PATH" ] || [ ! -w "$SCRIPT_PATH" ]; then
+    err "Cannot change ${SCRIPT_PATH:-the installer} (not a writable file)."
+    return 1
+  fi
+  src="$(install_env)"
+  while IFS='|' read -r name value; do
+    if [ -n "$name" ]; then
+      theirs["$name"]="$value"
+    fi
+  done <<< "$(install_values "$src")"
+  while IFS='|' read -r name ours; do
+    if [ -n "$name" ] && [ -n "${theirs[$name]+set}" ] && [ "${theirs[$name]}" != "$ours" ]; then
+      diffs+=("$name|$ours|${theirs[$name]}")
+      specs+=("$name|${theirs[$name]}")
+    fi
+  done <<< "$(settings_pairs "$SCRIPT_PATH")"
+  run="$(running_catalog)"
+  files="$(env_value CATALOG_IMAGE)"
+  files="${files##*:}"
+  if [ "${#diffs[@]}" -gt 0 ]; then
+    echo
+    echo " The installation in this folder has other values than the settings of $SCRIPT_NAME:"
+    printf '   %-30s %s\n' "" "$SCRIPT_NAME -> installation"
+    for spec in "${diffs[@]}"; do
+      IFS='|' read -r name ours value <<< "$spec"
+      printf '   %-30s %s -> %s\n' "$name" "${ours:-(empty)}" "${value:-(empty)}"
+    done
+    if [ -n "$run" ] && [ -n "$src" ]; then
+      echo " The versions are those of the containers, the other values come from $src."
+    fi
+    if [ -z "$src" ]; then
+      warn "No $ENV_FILE and no backup of it names the installed Catalog $run: only the versions are known - check the other settings (option 1)."
+    elif [ "$src" != "$ENV_FILE" ]; then
+      echo " ($ENV_FILE names Catalog $files; $src is the newest backup that names the installed $run.)"
+    fi
+    if [ -n "$src" ]; then
+      env_settings "$src" > /dev/null
+    fi
+    if [ -n "$ENV_SKIPPED" ]; then
+      warn "Not taken over (special characters):$ENV_SKIPPED"
+    fi
+    echo " Taking them over writes these values into $SCRIPT_NAME (its previous version is kept). $ENV_FILE, $COMPOSE_FILE and the containers stay as they are."
+    if [ -n "$(job_running_ids)" ]; then
+      err "Jobs are running (J) - take the values over when they are done."
+      return 1
+    fi
+    if [ "$mode" != "cli" ] && ! confirm "Take over the installation's values?" y; then
+      info "Cancelled - nothing was changed."
+      return 0
+    fi
+    if ! set_settings_atomic --keep-backup "${specs[@]}"; then
+      return 1
+    fi
+    if ! "$BASH" -n "$SCRIPT_PATH" || ! "$BASH" "$SCRIPT_PATH" check-settings; then
+      cat -- "$SETTINGS_BACKUP" > "$SCRIPT_PATH"
+      reload_settings
+      err "The values of the installation do not fit the settings - nothing was changed in $SCRIPT_NAME."
+      return 1
+    fi
+    ok "Took over ${#specs[@]} value(s) of the installation (previous $SCRIPT_NAME: $SETTINGS_BACKUP)."
+  fi
+  if [ -n "$src" ] && [ "$src" != "$ENV_FILE" ]; then
+    stamp="${src#"$ENV_FILE".bak-}"
+    cbak="$COMPOSE_FILE.bak-$stamp"
+    if [ ! -f "$cbak" ]; then
+      cbak=""
+    fi
+    echo
+    echo " $ENV_FILE and $COMPOSE_FILE name Catalog $files, but $run is installed: $src${cbak:+ and $cbak} belong to it."
+    if [ "$mode" = "cli" ]; then
+      echo "  Menu option 23 puts them back, or '$0 generate' writes them from the settings, which now fit the installation."
+    elif confirm "Put $src${cbak:+ and $cbak} back? (the current files are kept as backups)" y; then
+      backup_file "$ENV_FILE"
+      if [ -n "$cbak" ]; then
+        backup_file "$COMPOSE_FILE"
+      fi
+      if (umask 077 && cp -- "$src" "$ENV_FILE") && chmod 600 "$ENV_FILE" && { [ -z "$cbak" ] || cp -- "$cbak" "$COMPOSE_FILE"; }; then
+        ok "$ENV_FILE${cbak:+ and $COMPOSE_FILE} name the installed Catalog $run again."
+      else
+        err "Cannot write $ENV_FILE${cbak:+ or $COMPOSE_FILE} - their previous versions are the newest backups."
+        return 1
+      fi
+    else
+      info "The files stay as they are - option 6 would start Catalog $files: put them back first (option 23)."
+    fi
+  elif [ "${#diffs[@]}" -eq 0 ]; then
+    if [ -z "$src" ] && [ -n "$run" ]; then
+      warn "$ENV_FILE names Catalog $files, but $run is installed, and no backup of $ENV_FILE names $run - option 2 writes the files from the settings ($CATALOG_VERSION)."
+    else
+      info "$WORK_DIR is the folder of $SCRIPT_NAME, and its settings match the installation - there is nothing to take over here."
+    fi
+  fi
+}
+
+# The step that writes these versions (settings: into the files) or starts them (files) would lower
+# the installation: catalog-web below the installed Catalog (the files: below the one of its container),
+# or MongoDB below the series that runs (or that its stopped container has). Prints what would happen
+# (empty: nothing). downgrade_problem CATALOG MONGO-TAG settings|files
+downgrade_problem() {
+  local catalog="$1" mongo="$2" inst run="" what="running"
+  if [ "$3" = "files" ]; then
+    inst="$(running_catalog)"
+  else
+    inst="$(installed_catalog)"
+  fi
+  if is_version "$catalog" && is_version "$inst" && version_gt "$inst" "$catalog"; then
+    printf 'Catalog %s would replace the installed %s; the database was migrated by %s.\n' "$catalog" "$inst" "$(cut -d. -f1-2 <<< "$inst")"
+  fi
+  if [ -f "$ENV_FILE" ] && [ -f "$COMPOSE_FILE" ] && engine_cli && detect_compose >/dev/null 2>&1; then
+    run="$(mongo_running_version)"
+    if [ -z "$run" ]; then
+      run="$(running_tag mongo all)"
+      what="installed"
+    fi
+  fi
+  if [ -n "$run" ] && tag_below "$mongo" "$run"; then
+    printf 'MongoDB %s would replace the %s %s; its data cannot go back to an older MongoDB.\n' "$mongo" "$what" "$run"
+  fi
+}
+
+# Stops a step that would lower the installation (downgrade_problem); only the go-back of an upgrade
+# (GUARD_ALLOW_CATALOG) or of patch updates (GUARD_ALLOW_MONGO) may, to the version it came from. The
+# menu offers the take-over of the installation's values. downgrade_guard settings|files [stop]
+# (stop: before the containers go whose images show the installed versions)
+GUARD_ALLOW_CATALOG=""
+GUARD_ALLOW_MONGO=""
+downgrade_guard() {
+  local problem line catalog mongo
+  if [ "$1" = "files" ]; then
+    catalog="$(env_value CATALOG_IMAGE)"
+    catalog="${catalog##*:}"
+    mongo="$(env_value MONGO_TAG)"
+  else
+    catalog="$CATALOG_VERSION"
+    mongo="$MONGO_TAG"
+  fi
+  if [ -n "$GUARD_ALLOW_CATALOG" ] && [ "$catalog" = "$GUARD_ALLOW_CATALOG" ]; then
+    catalog=""
+  fi
+  if [ -n "$GUARD_ALLOW_MONGO" ] && [ "$mongo" = "$GUARD_ALLOW_MONGO" ]; then
+    mongo=""
+  fi
+  problem="$(downgrade_problem "$catalog" "$mongo" "$1")"
+  if [ -z "$problem" ]; then
+    return 0
+  fi
+  while IFS= read -r line; do
+    err "$line"
+  done <<< "$problem"
+  if [ "${2:-}" = "stop" ]; then
+    echo "  $ENV_FILE and $COMPOSE_FILE name older versions than the installation - nothing was stopped: its containers show the installed versions, and a later start would start these files."
+  elif [ "$1" = "files" ]; then
+    echo "  $ENV_FILE and $COMPOSE_FILE name older versions than the installation - nothing was started."
+  else
+    echo "  The settings of $SCRIPT_NAME are older than the installation (a new download of the installer has its defaults) - nothing was written."
+  fi
+  if [ "$INTERACTIVE" = "true" ] && [ -z "$JOB_DIR" ]; then
+    if confirm "Take over the installation's values now?" y; then
+      install_takeover interactive || true
+    fi
+  elif [ "$1" = "files" ] && [ -z "$(downgrade_problem "$CATALOG_VERSION" "$MONGO_TAG" settings)" ]; then
+    echo "  The settings fit the installation: write the files from them first ($(hint 2 generate)), or put back the backups of $ENV_FILE and $COMPOSE_FILE that name the installed versions (menu option 23)."
+  else
+    echo "  Take the installation's values over first: menu option 23, or '$0 adopt .'."
+  fi
+  return 1
 }
 
 # health_pct READY SERVICES HTTP-CODE WEB-SECONDS -> how far the start is. The services fill the first
@@ -5968,6 +6406,8 @@ offer_patch_updates() {
     return 0
   fi
   sibling_guard || return 1
+  # the patch updates write all settings
+  downgrade_guard settings || return 1
   run_job "Patch updates ($count component(s))" -- patch_apply "${specs[@]}"
 }
 
@@ -6026,6 +6466,9 @@ patch_cleanup() {
     IFS='|' read -r name old new <<< "$spec"
     set_setting "$name" "$old"
     printf -v "$name" '%s' "$old"
+    if [ "$name" = "MONGO_TAG" ]; then
+      GUARD_ALLOW_MONGO="$old"
+    fi
   done
   do_generate keep no-next
   if [ "$PATCH_STAGE" = "switch" ]; then
@@ -6067,7 +6510,7 @@ do_upgrade() {
     return 1
   fi
   collect_updates || return $?
-  installed="$(running_tag catalog-web)"
+  installed="$(installed_catalog)"
   if [ -z "$installed" ]; then
     installed="$(env_value CATALOG_IMAGE)"
     installed="${installed##*:}"
@@ -6084,6 +6527,8 @@ do_upgrade() {
   if [ "$installed" = "$target" ] || { is_version "$installed" && ! version_gt "$target" "$installed"; }; then
     ok "The Catalog is up to date."
   else
+    # the upgrade writes all settings: older ones than the installation (a new download) are taken over first
+    downgrade_guard settings || return 1
     cat <<EOF
 
  Upgrade plan
@@ -6124,6 +6569,7 @@ EOF
 upgrade_revert_settings() {
   set_setting CATALOG_VERSION "$UPG_OLD"
   CATALOG_VERSION="$UPG_OLD"
+  GUARD_ALLOW_CATALOG="$UPG_OLD"
   do_generate keep no-next
 }
 
@@ -6156,7 +6602,8 @@ upgrade_cleanup() {
 upgrade_run() {
   local target="$1" installed="$2" backup="$3"
   require_engine || return 1
-  UPG_OLD="$CATALOG_VERSION"
+  # a go-back returns to what was installed, not to what the settings said
+  UPG_OLD="${installed:-$CATALOG_VERSION}"
   JOB_CLEANUP="upgrade_cleanup"
   rm -f -- "$UPGRADE_FAILED_FILE"
   LAST_BACKUP=""
@@ -6239,9 +6686,13 @@ install_line() {
 
 # Downloads the newest installer and carries the current settings over to it.
 update_installer() {
-  local mode="${1:-interactive}" tmp line name value backup new_names pairs url="$INSTALLER_URL"
+  local mode="${1:-interactive}" tmp line name value backup new_names pairs sum url="$INSTALLER_URL"
   if [ -z "$SCRIPT_PATH" ] || [ ! -w "$SCRIPT_PATH" ]; then
     err "Cannot update ${SCRIPT_PATH:-the installer} (not a writable file)."
+    return 1
+  fi
+  if [ -n "$(job_running_ids)" ]; then
+    err "Jobs are running (J) - update the installer when they are done (a job may still change the settings it carries over)."
     return 1
   fi
   if [ "$url" = "$LEGACY_INSTALLER_URL" ]; then
@@ -6260,6 +6711,7 @@ update_installer() {
     return 1
   fi
   new_names="$(settings_pairs "$tmp" | cut -d'|' -f1)"
+  sum="$(cksum < "$SCRIPT_PATH")"
   if ! pairs="$(settings_pairs "$SCRIPT_PATH")" || [ -z "$pairs" ]; then
     rm -f -- "$tmp"
     err "Cannot read the settings of $SCRIPT_NAME - not updated."
@@ -6296,6 +6748,11 @@ update_installer() {
     rm -f -- "$tmp"
     info "Cancelled."
     return 0
+  fi
+  if [ "$(cksum < "$SCRIPT_PATH")" != "$sum" ]; then
+    rm -f -- "$tmp"
+    err "$SCRIPT_NAME was changed meanwhile (a job?) - not updated, run the update again."
+    return 1
   fi
   if ! backup="$(script_backup)"; then
     rm -f -- "$tmp"
@@ -6507,21 +6964,42 @@ first_installation_dir() {
   fi
 }
 
+# sibling_fits FILE... -> true when one of these installers names the installed Catalog
+sibling_fits() {
+  local f inst
+  inst="$(installed_catalog)"
+  for f in "$@"; do
+    if [ -n "$inst" ] && [ "$(settings_pairs "$f" | sed -n 's/^CATALOG_VERSION|//p' | tail -n 1)" = "$inst" ]; then
+      return 0
+    fi
+  done
+  return 1
+}
+
 # takeover_settings [interactive|cli] FILE -> copies the settings of another installer in this folder
 takeover_settings() {
-  local mode="$1" src="$2" spec name ours theirs backup n=0 old
+  local mode="$1" src="$2" spec name ours theirs backup n=0 old inst lower=""
   local -a diffs=()
   mapfile -t diffs < <(settings_diff "$src")
   if [ "${#diffs[@]}" -eq 0 ]; then
     ok "$(basename -- "$src") has the same settings as $SCRIPT_NAME."
     return 0
   fi
+  inst="$(installed_catalog)"
   echo
   echo " $(basename -- "$src") in this folder has other settings than $SCRIPT_NAME:"
   for spec in "${diffs[@]}"; do
     IFS='|' read -r name ours theirs <<< "$spec"
     printf '   %-30s %s -> %s\n' "$name" "${ours:-(empty)}" "${theirs:-(empty)}"
+    if [ "$name" = "CATALOG_VERSION" ] && is_version "$inst" && is_version "$theirs" && version_gt "$inst" "$theirs"; then
+      lower="$theirs"
+    fi
   done
+  if [ -n "$lower" ]; then
+    err "$(basename -- "$src") names Catalog $lower, but $inst is installed - its settings would lower the installation."
+    echo "  If it is no longer used, rename or remove it."
+    return 1
+  fi
   echo " Taking them over writes these values into $SCRIPT_NAME. $ENV_FILE, $COMPOSE_FILE and the containers stay as they are."
   if [ -n "$(job_running_ids)" ]; then
     err "Jobs are running (J) - take the settings over when they are done."
@@ -6584,6 +7062,11 @@ adopt_installation() {
   fi
   if [ -z "$wanted" ]; then
     mapfile -t sibs < <(sibling_installers)
+    # settings that would lower the installation here: its own values, unless another installer here has them
+    if [ -n "$(install_note)" ] && ! sibling_fits ${sibs[@]+"${sibs[@]}"}; then
+      install_takeover "$mode"
+      return
+    fi
     if [ "${#sibs[@]}" -gt 0 ] && [ "$mode" != "interactive" ]; then
       err "Installers with other settings in this folder: $(for i in "${sibs[@]}"; do printf '%s ' "$(basename -- "$i")"; done)"
       echo "  Name the one that manages this installation, for example: ./$SCRIPT_NAME adopt ./$(basename -- "${sibs[0]}")"
@@ -6605,9 +7088,10 @@ adopt_installation() {
         info "Cancelled."
       fi
       return
-    elif [ "$this_folder" = "true" ]; then
-      info "$WORK_DIR is the folder of $SCRIPT_NAME - there is nothing to take over here."
-      return 0
+    elif [ "$this_folder" = "true" ] || [ -n "$(install_diff_note)" ]; then
+      # the installation here has other values than the settings; else installations in other folders
+      install_takeover "$mode"
+      return
     fi
   fi
   while IFS= read -r line; do
@@ -6696,34 +7180,14 @@ adopt_installation() {
   chmod 600 "$ENV_FILE"
   cp -- "$cfg" "$COMPOSE_FILE"
 
-  while IFS= read -r line; do
-    line="${line%$'\r'}"
-    if ! [[ "$line" =~ ^([A-Z_][A-Z0-9_]*)=(.*)$ ]]; then
-      continue
-    fi
-    key="${BASH_REMATCH[1]}"
-    value="$(env_unquote "${BASH_REMATCH[2]}")"
-    case "$key" in
-      MONGO_INITDB_ROOT_PASSWORD|MINIO_ROOT_PASSWORD|RABBITMQ_DEFAULT_PASS|ENV_FILE|COMPOSE_FILE) continue ;;
-      CATALOG_IMAGE)
-        set_setting CATALOG_IMAGE_REPO "${value%:*}"
-        set_setting CATALOG_VERSION "${value##*:}"
-        imported=$((imported + 2))
-        continue
-        ;;
-      CATALOG_WORKER_IMAGE)
-        set_setting CATALOG_WORKER_IMAGE_REPO "${value%:*}"
-        imported=$((imported + 1))
-        continue
-        ;;
-    esac
-    if [[ "$value" == *[\"\\\$\`]* ]]; then
-      skipped="$skipped $key"
-    elif has_setting "$SCRIPT_PATH" "$key"; then
+  while IFS='|' read -r key value; do
+    if [ -n "$key" ]; then
       set_setting "$key" "$value"
       imported=$((imported + 1))
     fi
-  done < "$envf"
+  done <<< "$(env_settings "$envf")"
+  env_settings "$envf" > /dev/null
+  skipped="$ENV_SKIPPED"
   if [ "$project" != "$(project_name_of "$(basename -- "$WORK_DIR")")" ]; then
     set_setting COMPOSE_PROJECT_NAME "$project"
     if ! grep -q '^COMPOSE_PROJECT_NAME=' "$ENV_FILE"; then
@@ -8102,6 +8566,11 @@ tz_menu_note() {
     return 0
   fi
   if [ -f "$TZ_KEEP_FILE" ] && [ "$(cat -- "$TZ_KEEP_FILE")" = "$TZ|$host" ]; then
+    return 0
+  fi
+  # the Catalog runs with the TZ of .env: when that is the server's, the setting only differs from the
+  # installation (install_diff_note)
+  if [ -f "$ENV_FILE" ] && tz_same "$host" "$(env_value TZ)"; then
     return 0
   fi
   printf 'The server runs in %s, the Catalog in %s (TZ) - option 2 offers to align it' "$host" "${TZ:-UTC}"
@@ -9535,6 +10004,10 @@ do_generate() {
     err "Fix the settings at the top of $SCRIPT_NAME first (menu option 1 opens them)."
     return 1
   fi
+  if ! downgrade_guard settings; then
+    GENERATE_CANCELLED="true"
+    return 1
+  fi
 
   if [ -f "$ENV_FILE" ]; then
     if [ "$mode" = "ask" ]; then
@@ -9798,9 +10271,11 @@ do_validate() {
 }
 
 do_up() {
+  local note
   require_files || return 1
   require_engine || return 1
   engine_guard || return 1
+  downgrade_guard files || return 1
   if mongo_kernel_problem; then
     warn "MongoDB $(setting MONGO_TAG) refuses to start on kernel $(engine_kernel) without a workaround (SERVER-121912)."
     warn "Regenerate the files ($(hint 2 generate)): MongoDB then starts with GLIBC_TUNABLES=glibc.pthread.rseq=1."
@@ -9810,8 +10285,15 @@ do_up() {
   fi
   if settings_stale; then
     warn "$ENV_FILE / $COMPOSE_FILE do not match the settings at the top of $SCRIPT_NAME"
-    warn "(settings changed after generating, or the files were edited by hand)."
-    warn "Regenerate them first ($(hint 2 generate)) if the new settings should be used."
+    note="$(install_note)"
+    if [ -n "$note" ]; then
+      warn "$note: the settings are older than the installation - take its values over ($(hint 23 "adopt .")), do not regenerate."
+    elif note="$(install_diff_note)" && [ -n "$note" ]; then
+      warn "$note - $(hint 23 "adopt .") takes the installation's values over, $(hint 2 generate) writes the settings."
+    else
+      warn "(settings changed after generating, or the files were edited by hand)."
+      warn "Regenerate them first ($(hint 2 generate)) if the new settings should be used."
+    fi
     if [ "$INTERACTIVE" = "true" ] && ! confirm "Start with the files as they are?" n; then
       info "Cancelled."
       return 0
@@ -9845,9 +10327,21 @@ do_full_setup() {
 }
 
 do_status() {
+  local inst note
   require_files || return 1
   require_engine || return 1
   compose ps
+  inst="$(installed_catalog)"
+  if [ -n "$inst" ]; then
+    echo
+    echo "Catalog $inst installed$(if [ "$inst" != "$CATALOG_VERSION" ]; then printf ' (the settings say %s)' "$CATALOG_VERSION"; fi)"
+  fi
+  note="$(install_note)"
+  if [ -n "$note" ]; then
+    warn "$note - $(hint 23 "adopt .") takes the installation's values over."
+  elif note="$(install_diff_note)" && [ -n "$note" ]; then
+    warn "$note - $(hint 23 "adopt .") takes the installation's values over, $(hint 2 generate) writes the settings."
+  fi
 }
 
 do_logs() {
@@ -9904,6 +10398,7 @@ do_restart() {
 do_down() {
   require_files || return 1
   require_engine || return 1
+  downgrade_guard files stop || return 1
   if [ "$INTERACTIVE" = "true" ]; then
     if ! confirm "Stop and remove all containers of this stack? (data volumes are kept)" n; then
       info "Cancelled."
@@ -10174,6 +10669,12 @@ do_check() {
     warn "Time zone: the Catalog uses ${TZ:-UTC}, this server $host_tz ($SCRIPT_NAME is not writable, so TZ cannot be aligned here)."
   else
     warn "Time zone: the Catalog uses ${TZ:-UTC}, this server $host_tz - './$SCRIPT_NAME timezone' or option 2 can align it."
+  fi
+  v="$(install_note)"
+  if [ -n "$v" ]; then
+    warn "$v - $(hint 23 "adopt .") takes the installation's values over (older settings are not written into the files)."
+  elif v="$(install_diff_note)" && [ -n "$v" ]; then
+    warn "$v - $(hint 23 "adopt .") takes the installation's values over, $(hint 2 generate) writes the settings."
   fi
 
   if [ "$CHECK_FOR_UPDATES" = "true" ]; then
@@ -11220,6 +11721,12 @@ edit_config() {
     err "Editor '$editor' not found. Install vi/vim or set EDITOR (e.g. EDITOR=nano)."
     return 0
   fi
+  if [ -n "$(job_running_ids)" ]; then
+    warn "Jobs are running (J): one may still change a setting, which saving in the editor would overwrite."
+    if ! confirm "Open the editor anyway?" n; then
+      return 0
+    fi
+  fi
   line="$(grep -n -m 1 '^# CONFIGURE ONLY THIS SECTION' "$SCRIPT_PATH" | cut -d: -f1)" || line=""
   before="$(cksum < "$SCRIPT_PATH")"
   hub="$(settings_hub_keys "$SCRIPT_PATH")"
@@ -11309,7 +11816,7 @@ stack_state() {
 }
 
 show_menu() {
-  local found tz_note sib state
+  local found tz_note sib state inote dnote
   reload_settings
   menu_scan
   state="$(stack_state)"
@@ -11323,27 +11830,41 @@ show_menu() {
       printf '%s\n' "${C_YLW}A Catalog installation already exists in $found - option 23 takes it over (settings, passwords, data).${C_RST}"
     fi
   fi
+  inote="$(install_note)"
+  if [ -n "$inote" ]; then
+    printf '%s\n' "${C_YLW}$inote - option 23 takes the installation's values over.${C_RST}"
+  fi
   sib="$(conflicting_sibling)"
   if [ -n "$sib" ]; then
     printf '%s\n' "${C_YLW}$(basename -- "$sib") in this folder has other settings - option 23 takes them over (or rename it if it is no longer used).${C_RST}"
+  elif [ -n "$inote" ]; then
+    :
   elif mongo_kernel_problem; then
     printf '%s\n' "${C_YLW}MongoDB needs the kernel workaround (SERVER-121912), and the files lack it - option 2 (or I - repair) writes them again.${C_RST}"
   elif mongo_workaround_unneeded; then
     printf '%s\n' "${C_YLW}This kernel no longer needs the MongoDB workaround in the files - option 2 writes them again (faster MongoDB).${C_RST}"
   elif settings_stale; then
-    printf '%s\n' "${C_YLW}The generated files do not match the settings above (changed settings or manual edits) - option 2 regenerates them.${C_RST}"
+    dnote="$(install_diff_note)"
+    if [ -n "$dnote" ]; then
+      printf '%s\n' "${C_YLW}$dnote - option 23 takes the installation's values over, option 2 writes the settings.${C_RST}"
+    else
+      printf '%s\n' "${C_YLW}The generated files do not match the settings above (changed settings or manual edits) - option 2 regenerates them.${C_RST}"
+    fi
   fi
-  if tz_note="$(tz_menu_note)" && [ -n "$tz_note" ]; then
+  if [ -z "$inote" ] && tz_note="$(tz_menu_note)" && [ -n "$tz_note" ]; then
     printf '%s\n' "${C_YLW}$tz_note${C_RST}"
   fi
-  local col key kind label desc what installed title color l1 l2 wide="no" text
+  local col key kind label desc what installed title color l1 l2 wide="no" text current=""
   installed="$(install_state)"
+  if [ "$installed" != "no" ]; then
+    current="$(installed_catalog)"
+  fi
   if [ "$(ui_cols)" -ge 70 ]; then
     wide="yes"
   fi
   printf '\n %s\n' "${C_CYN}START HERE$C_RST"
   for key in I U R; do
-    IFS='|' read -r title color l1 l2 <<< "$(wiz_card "$key" "$installed" "$state" 40)"
+    IFS='|' read -r title color l1 l2 <<< "$(wiz_card "$key" "$installed" "$state" 40 "$current")"
     if [ "$installed" = "incomplete" ] && [ "$key" != "R" ]; then
       l1="$l1 $UI_SEP $l2"
     fi
@@ -11368,8 +11889,16 @@ show_menu() {
 }
 
 menu_up() {
+  local note
+  downgrade_guard files || return 1
   if [ -f "$ENV_FILE" ] && [ -f "$COMPOSE_FILE" ] && settings_stale; then
     warn "$ENV_FILE / $COMPOSE_FILE do not match the settings at the top of $SCRIPT_NAME."
+    note="$(install_note)"
+    if [ -n "$note" ]; then
+      warn "$note - option 23 takes the installation's values over."
+    elif note="$(install_diff_note)" && [ -n "$note" ]; then
+      warn "$note - option 23 takes the installation's values over, option 2 writes the settings."
+    fi
     if ! confirm "Start with the files as they are?" n; then
       info "Cancelled."
       return 0
@@ -11389,6 +11918,7 @@ menu_full_setup() {
 }
 
 menu_down() {
+  downgrade_guard files stop || return 1
   if ! confirm "Stop and remove all containers of this stack? (data volumes are kept)" n; then
     info "Cancelled."
     return 0
@@ -11484,12 +12014,12 @@ wiz_stop() {
   info "Stopped. $1 starts it again; the steps done so far are kept."
 }
 
-# Version of the installed Catalog: from .env, else from the running catalog-web, else from the newest .env backup
+# Version of the installed Catalog: catalog-web's container, else .env, else the newest .env backup
 wiz_installed_version() {
   local v
-  v="$(env_value CATALOG_IMAGE)"
-  if [ -z "$v" ] && detect_compose >/dev/null 2>&1; then
-    v="$(running_tag catalog-web 2>/dev/null)" || v=""
+  v="$(installed_catalog)"
+  if [ -z "$v" ]; then
+    v="$(env_value CATALOG_IMAGE)"
   fi
   if [ -z "$v" ] && [ -n "$(newest_env_backup)" ]; then
     v="$(sed -n 's/^CATALOG_IMAGE=//p' "$(newest_env_backup)" | tail -n 1)"
@@ -11535,10 +12065,19 @@ wiz_job_since() {
 # the draw and asks the engine again at any other time.
 MENU_HERE=""
 MENU_HERE_AT=-10
+MENU_CATALOG=""
+MENU_DATA=""
 menu_scan() {
   MENU_HERE=""
+  MENU_HERE_AT=-10
   if engine_cli && { [ ! -f "$ENV_FILE" ] || [ ! -f "$COMPOSE_FILE" ]; }; then
     MENU_HERE="$(remove_containers 2>/dev/null)" || MENU_HERE=""
+  fi
+  MENU_CATALOG="$(running_catalog)"
+  # asked only without a container of catalog-web (install_data)
+  MENU_DATA="yes"
+  if [ -z "$MENU_CATALOG" ] && ! install_data; then
+    MENU_DATA="no"
   fi
   MENU_HERE_AT="$SECONDS"
 }
@@ -12163,7 +12702,7 @@ install_snapshots() {
 # start), continue with the data, update or remove. install_wizard [first]
 install_wizard() {
   local -a steps=(Check Settings Files Start Data Done)
-  local jobs found choice rc ans step=1 installed="" npm
+  local jobs found choice rc ans step=1 installed="" npm note
   jobs="$(wiz_running_jobs)"
   if [ -n "$jobs" ]; then
     warn "A background job is running - wait for it or follow it with J first:"
@@ -12228,7 +12767,19 @@ install_wizard() {
   echo
   ui_ask choice "Select [0]:" || choice="0"
   case "$choice" in
-    1) wiz_head "Install" 1 "${steps[@]}" ;;
+    1)
+      # a repair writes the settings: older ones than the installation (or other values) are offered first
+      note="$(install_note)"
+      if [ -z "$note" ]; then
+        note="$(install_diff_note)"
+      fi
+      if [ -n "$note" ]; then
+        warn "$note."
+        install_takeover interactive || true
+        ui_pause_tty
+      fi
+      wiz_head "Install" 1 "${steps[@]}"
+      ;;
     2) step=5 ;;
     3) update_wizard; return 0 ;;
     4) remove_wizard; return 0 ;;
@@ -13186,6 +13737,10 @@ remove_wizard() {
       esac
     fi
   done
+  # the data stays: the containers show its versions, which the files must not lower at the next start
+  if [ "$ncont" -gt 0 ] && [ "$nvol" -gt 0 ] && [ "$vol" = "no" ] && remove_compose_ok && ! downgrade_guard files stop; then
+    return 0
+  fi
 
   # 3. Confirm
   wiz_head "Remove" 3 "${steps[@]}"
@@ -13345,7 +13900,12 @@ wiz_card() {
             l2="16 checks the server"
             ;;
         esac
-        printf '%s|%s|%s|%s' "INSTALL" "$C_GRN" "$C_GRN$UI_OK$C_RST Installed $UI_SEP $l1" "$C_DIM$l2$C_RST"
+        if [ -n "${5:-}" ]; then
+          l1="$(ui_fit "$width" "$C_GRN$UI_OK$C_RST Catalog $5 $UI_SEP $l1" "$C_GRN$UI_OK$C_RST Installed $UI_SEP $l1")"
+        else
+          l1="$C_GRN$UI_OK$C_RST Installed $UI_SEP $l1"
+        fi
+        printf '%s|%s|%s|%s' "INSTALL" "$C_GRN" "$l1" "$C_DIM$l2$C_RST"
       else
         l1="$(ui_fit "$width" "$C_GRN$UI_RUN$C_RST New installation, step by step" "$C_GRN$UI_RUN$C_RST New installation")"
         l2="$(ui_fit "$width" "engine $UI_SEP domain $UI_SEP proxy $UI_SEP versions" "engine $UI_SEP domain $UI_SEP proxy")"
@@ -13394,8 +13954,7 @@ tui_cards() {
   inner=$((w - 2))
   installed="$(install_state)"
   if [ "$installed" != "no" ]; then
-    current="$(env_value CATALOG_IMAGE)"
-    current="${current##*:}"
+    current="$(installed_catalog)"
   fi
   for key in I U R; do
     spec="$(wiz_card "$key" "$installed" "$state" $((inner - 2)) "$current")"
@@ -13475,7 +14034,7 @@ $(help_item R del "Remove" "Removes the Catalog from this server: you choose dat
 ${c}SETUP $UI_SEP install on this host$r
 $(help_item 7 run "Install in one go" "Generates .env and docker-compose.yml, validates them and starts the stack" "in one go; asks only about existing passwords and the time zone (I guides).")
 $(help_item 16 view "Check this server" "$ENGINE_NAME, $ENGINE compose, kernel, ports, vm.max_map_count, time zone.")
-$(help_item 23 run "Take over installation" "Takes the settings of an existing installation (another folder," "or an older installer in this folder); its passwords and data stay.")
+$(help_item 23 run "Take over installation" "Takes the settings of an existing installation (another folder, an older" "installer here, or the versions that run here and their .env); data stays.")
 
 ${c}CONFIGURE $UI_SEP edit settings, 2 writes the files, 6 applies them$r
 $(help_item 1 edit "Edit settings" "All settings on one screen, grouped by name (CATALOG_*, MINIO_*," "*_TAG ...); checked before they are saved. E opens them in $(editor_short).")
@@ -13509,7 +14068,7 @@ ${c}UPDATE $UI_SEP newer versions$r
 $(help_item 8 run "Versions, offline bundle" "Recommended versions of all components, version picker, and" "\"Download only\": an offline bundle for servers without internet.")
 $(help_item 11 run "Pull images" "Downloads the images named in docker-compose.yml (2 writes it from the settings).")
 $(help_item 21 run "Upgrade the Catalog" "Backup, new Catalog version, health check, patch updates; goes back" "by itself if you cancel it after the switch.")
-$(help_item 22 run "Update this installer" "Newest $SCRIPT_NAME from GitHub; your settings are kept.")
+$(help_item 22 run "Update this installer" "Newest $SCRIPT_NAME from GitHub; your settings are kept (a new" "download of the installer has the default settings - use 22 instead).")
 
 ${c}REMOVE $UI_SEP cannot be undone$r
 $(help_item 99 del "Reset: delete all data" "Removes all containers AND all data volumes (type DELETE)." "R removes the Catalog step by step and lets you choose what goes.")
@@ -13690,13 +14249,15 @@ tui_cell() {
 tui_draw() {
   reload_settings
   menu_scan
-  local tz_note sib cols="$1" rows="${2:-40}" line col key kind label desc what i n col_w found head2 head3 version state need cards keys
+  local tz_note sib cols="$1" rows="${2:-40}" line col key kind label desc what i n col_w found head2 head3 version state need cards keys cur inote dnote
   local -a c1=() c2=() c3=()
   version="$(version_label)"
-  head2="Catalog $CATALOG_VERSION"
+  cur="$(installed_catalog)"
+  cur="${cur:-$CATALOG_VERSION}"
+  head2="Catalog $cur"
   if [[ "$version" == *"update available"* ]]; then
     head2="$head2   $C_YLW$UI_UP ${version#*update available: }$C_RST"
-    if [ -n "$LATEST_VERSION" ] && is_version "$CATALOG_VERSION" && version_gt "$LATEST_VERSION" "$CATALOG_VERSION"; then
+    if [ -n "$LATEST_VERSION" ] && is_version "$cur" && version_gt "$LATEST_VERSION" "$cur"; then
       head2="${head2%, option 8*}$C_YLW $UI_SEP U or option 21$C_RST"
     fi
   elif [[ "$version" == *"up to date"* ]]; then
@@ -13723,17 +14284,28 @@ tui_draw() {
   if [ -f "$UPGRADE_FAILED_FILE" ]; then
     notes+=("$C_YLW$UI_ARROW The last upgrade did not become healthy - option 21 can go back$C_RST")
   fi
+  inote="$(install_note)"
+  if [ -n "$inote" ]; then
+    notes+=("$(ui_fit $((cols - 4)) "$C_YLW$UI_ARROW $inote - option 23 takes the installation's values over$C_RST" "$C_YLW$UI_ARROW $inote - option 23 takes them over$C_RST")")
+  fi
   sib="$(conflicting_sibling)"
   if [ -n "$sib" ]; then
     notes+=("$C_YLW$UI_ARROW $(basename -- "$sib") in this folder has other settings - option 23 takes them over$C_RST")
+  elif [ -n "$inote" ]; then
+    :
   elif mongo_kernel_problem; then
     notes+=("$C_YLW$UI_ARROW MongoDB needs the kernel workaround, the files lack it - option 2 or I (repair) adds it$C_RST")
   elif mongo_workaround_unneeded; then
     notes+=("$C_YLW$UI_ARROW This kernel no longer needs the MongoDB workaround - option 2 writes the files again$C_RST")
   elif settings_stale; then
-    notes+=("$C_YLW$UI_ARROW The generated files differ from the settings - option 2 regenerates them$C_RST")
+    dnote="$(install_diff_note)"
+    if [ -n "$dnote" ]; then
+      notes+=("$(ui_fit $((cols - 4)) "$C_YLW$UI_ARROW $dnote - option 23 takes the installation's values over, option 2 writes the settings$C_RST" "$C_YLW$UI_ARROW $dnote - 23 takes them over, 2 writes the settings$C_RST" "$C_YLW$UI_ARROW The settings differ from the installation - 23 takes its values over, 2 writes the settings$C_RST")")
+    else
+      notes+=("$C_YLW$UI_ARROW The generated files differ from the settings - option 2 regenerates them$C_RST")
+    fi
   fi
-  if tz_note="$(tz_menu_note)" && [ -n "$tz_note" ]; then
+  if [ -z "$inote" ] && tz_note="$(tz_menu_note)" && [ -n "$tz_note" ]; then
     notes+=("$C_YLW$UI_ARROW $tz_note$C_RST")
   fi
   clear_screen
@@ -13990,7 +14562,7 @@ tui_run() {
 }
 
 menu() {
-  local choice notice="${RVC_NOTICE:-}" resume="${1:-}"
+  local choice note notice="${RVC_NOTICE:-}" resume="${1:-}"
   INTERACTIVE="true"
   TUI_NOTICE="$notice"
   unset RVC_NOTICE
@@ -14005,6 +14577,16 @@ menu() {
     read -r -p "Press Enter to open the menu..." choice || true
   elif [ -n "$CONTAINER_ENGINE" ] || [ "$(install_state)" != "no" ]; then
     engine_offer
+  fi
+  # settings older than the installation here (a new download of the installer has its defaults): its
+  # values are offered before anything else can write the files or start the containers with them
+  note="$(install_note)"
+  if [ -n "$note" ]; then
+    echo
+    warn "$note."
+    adopt_installation interactive || true
+    echo
+    pause
   fi
 
   if [ -n "${RVC_HUB_STATUS:-}" ]; then

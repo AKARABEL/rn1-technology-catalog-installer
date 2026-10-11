@@ -244,7 +244,9 @@ case "${1:-}" in
         esac ;;
       ps)
         case "$*" in
-          "-q "*)
+          "-q "*|"-a -q "*)
+            # -a: stopped containers too - these exist only while the stack runs
+            if [ "$1" = -a ]; then shift; fi
             [ $# -eq 2 ] || bad
             if running; then case "$2" in mongo) echo a1b2c3d4e5f6 ;; catalog-web) echo b2c3d4e5f6a7 ;; worker-search) echo c3d4e5f6a7b8 ;; esac; fi ;;
           "--services --filter status=running") running && printf '%s\n' mongo catalog-web worker-search ;;

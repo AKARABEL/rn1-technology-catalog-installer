@@ -103,13 +103,19 @@ cat > "$T/bin/docker-compose" <<'EOF'
 #!/usr/bin/env bash
 ARGS="$*"
 unhandled() { echo "UNHANDLED docker-compose $ARGS" >> "$UNHANDLED"; echo "fake docker-compose: unhandled: $ARGS" >&2; exit 1; }
-while [ $# -gt 0 ]; do case "$1" in -p|--env-file|-f) shift 2 ;; *) break ;; esac; done
+proj=""
+while [ $# -gt 0 ]; do case "$1" in -p) proj="$2"; shift 2 ;; --env-file|-f) shift 2 ;; *) break ;; esac; done
 case "${1:-}" in
   version) if [ "${2:-}" = --short ]; then echo "5.6.0"; else echo "Docker Compose version v5.6.0"; fi ;;
   ps)
     case "${2:-}" in
       "") ;;
       --services) echo catalog-web ;;
+      # the one container: catalog-web of the project "root" (-a: stopped ones too)
+      -q|-a)
+        if [ "$2" = -a ]; then [ "${3:-}" = -q ] || unhandled; shift; fi
+        [ $# -eq 3 ] || unhandled
+        if [ "$proj" = root ] && [ "$3" = catalog-web ] && [ "${SHIM_NO_LABELS:-}" != 1 ]; then echo c0ffee000001; fi ;;
       *) unhandled ;;
     esac ;;
   config)
@@ -279,6 +285,12 @@ K="$T/comments"; installer "$K" catalog.sh "0,/^CATALOG_WEB_PORT=/s/^CATALOG_WEB
 gen "$K" catalog.sh; installer "$K" "$N"
 out="$(SHIM_NO_LABELS=1 bash "$K/$N" adopt ./catalog.sh </dev/null 2>&1)"; rc=$?
 check "comments and quotes: values as bash reads them" '[ "$rc" -eq 0 ] && grep -qxF "CATALOG_WEB_PORT=\"9090\"" "$K/$N" && grep -qxF "QUEUE_PREFIX=\"rvc\\\$x\"" "$K/$N" && bash "$K/$N" check-settings >/dev/null 2>&1'
+
+# 16. A .env here without an installation (generated, never started): option 23 still lists the
+#     installation in the other folder
+X="$T/stray"; installer "$X" "$N"; (cd "$X" && bash "$N" generate </dev/null >/dev/null 2>&1)
+out="$(printf '23\nn\n0\n' | bash "$X/$N" menu 2>&1)"
+check "a .env here without an installation: option 23 lists the one in the other folder" '[ -f "$X/.env" ] && grep -q "Existing Catalog installations:" <<< "$out" && grep -q "$OLD .*project root" <<< "$out" && grep -q "Found in $OLD:" <<< "$out" && grep -q "Cancelled." <<< "$out" && ! grep -q "nothing to take over here" <<< "$out"'
 
 check "no unhandled podman, compose or systemctl calls" '[ ! -s "$UNHANDLED" ]'
 if [ -s "$UNHANDLED" ]; then sort -u "$UNHANDLED" | sed 's/^/  /'; fi

@@ -191,5 +191,16 @@ for how in cli menu; do
   fi
 done
 
+# 12. Not while a job runs: it may still write a setting the update would carry over with its old value
+J="$T/jobrun"; mkdir -p "$J"; cp "$NEW" "$J/rn1-technology-catalog-installer.sh"
+sed -i 's/^CHECK_FOR_UPDATES=.*/CHECK_FOR_UPDATES="false"/' "$J/rn1-technology-catalog-installer.sh"
+before="$(cksum < "$J/rn1-technology-catalog-installer.sh")"
+sleep 60 & sp=$!
+mkdir -p "$J/.jobs/1"; echo "Upgrade to Catalog 26.3.4789.148" > "$J/.jobs/1/title"; echo running > "$J/.jobs/1/state"; echo "$sp" > "$J/.jobs/1/pid"
+: > "$SRV/urls"
+out="$(bash "$J/rn1-technology-catalog-installer.sh" self-update </dev/null 2>&1)"; rc=$?
+kill "$sp" 2>/dev/null; wait "$sp" 2>/dev/null
+check "job running: no update, nothing downloaded, installer untouched" '[ "$rc" -ne 0 ] && grep -q "Jobs are running (J) - update the installer when they are done" <<< "$out" && [ ! -s "$SRV/urls" ] && [ "$(cksum < "$J/rn1-technology-catalog-installer.sh")" = "$before" ] && ! ls "$J"/rn1-technology-catalog-installer.sh.bak-* >/dev/null 2>&1'
+
 echo "== $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]

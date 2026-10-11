@@ -69,7 +69,7 @@ fi
 case "$*" in
   "config --services") printf 'opensearch\nmongo\ncatalog-web\n' ;;
   "ps --services"*) printf 'mongo\ncatalog-web\n' ;;
-  "config --quiet"|"config"|"config --volumes"|"config --images"|"up -d --remove-orphans"|"down --remove-orphans"|"down -v --remove-orphans"|"ps"|"ps -q "*|"pull"|"pull "*|"logs "*|"restart -t 30") ;;
+  "config --quiet"|"config"|"config --volumes"|"config --images"|"up -d --remove-orphans"|"down --remove-orphans"|"down -v --remove-orphans"|"ps"|"ps -q "*|"ps -a -q "*|"pull"|"pull "*|"logs "*|"restart -t 30") ;;
   *) echo "UNHANDLED docker-compose $all" | tee -a "$SHIM_UNHANDLED" >> "$SHIM_LOG"; echo "unknown compose call: $*" >&2; exit 1 ;;
 esac
 exit 0
