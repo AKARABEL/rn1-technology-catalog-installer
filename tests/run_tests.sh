@@ -4,6 +4,8 @@ NEW="$1"
 SP="$(cd "$(dirname "$0")" && pwd)"
 T="$(mktemp -d)/t"
 rm -rf "$T"; mkdir -p "$T/bin"
+# these tests run Podman: CONTAINER_ENGINE names it (on a CI runner, detection would see its real Docker)
+sed 's/^CONTAINER_ENGINE=""$/CONTAINER_ENGINE="podman"/' "$1" > "${T%/*}/podman-installer.sh"; NEW="${T%/*}/podman-installer.sh"
 PASS=0; FAIL=0
 check() { if eval "$2"; then PASS=$((PASS+1)); echo "PASS: $1"; else FAIL=$((FAIL+1)); echo "FAIL: $1"; fi; }
 
@@ -25,7 +27,7 @@ case "$*" in
     printf '%s' "${SHIM_VOLUMES:-}" | grep "^${p}_" || true
     exit 0 ;;
   "network ls -q --filter label=com.docker.compose.project="*) exit 0 ;;
-  "volume exists "*|"image exists "*) exit 1 ;;
+  "volume inspect "*|"image inspect "*) exit 1 ;;
 esac
 if [ "${1:-}" = compose ]; then
   shift
@@ -117,7 +119,11 @@ export PATH="$T/bin:$PATH" SHIM_LOG="$T/podman.log" HUB_DIR="$SP/hub" RN1_COMPOS
 # every call the fakes did not know, over all runs (the tests empty $SHIM_LOG now and then)
 export SHIM_UNHANDLED="$T/unhandled.log"; : > "$SHIM_UNHANDLED"
 : > "$SHIM_LOG"
-mask() { sed -E 's/^((MONGO_INITDB_ROOT|MINIO_ROOT)_PASSWORD|RABBITMQ_DEFAULT_PASS)=.*/\1=X/' "$1"; }
+mask() { sed -E 's/^((MONGO_INITDB_ROOT|MINIO_ROOT|NPM_ADMIN)_PASSWORD|RABBITMQ_DEFAULT_PASS)=.*/\1=X/' "$1"; }
+# New since the original: the domain and the admin of Nginx Proxy Manager in .env; in the compose file
+# that admin and, with Nginx Proxy Manager, the networks catalog-web takes X-Forwarded-Proto from
+ADDED_ENV='CATALOG_DOMAIN=|NPM_ADMIN_EMAIL=|NPM_ADMIN_PASSWORD=X'
+ADDED_COMPOSE='^      (INITIAL_ADMIN_(EMAIL|PASSWORD)|ForwardedHeaders__KnownNetworks__[0-2]): '
 newdir() { rm -rf "$T/$1"; mkdir -p "$T/$1"; cp "$NEW" "$T/$1/gen.sh"; echo "$T/$1"; }
 # With Podman every service has "restart: always" (podman-restart.service starts only those again after
 # a reboot): mongo and the two workers had unless-stopped, opensearch and opensearch-dashboards had none
@@ -127,17 +133,23 @@ restart_always() {
        $0 == "    container_name: opensearch" || $0 == "    container_name: opensearch-dashboards" { print "    restart: always" }
        $0 == "      MINIO_ROOT_PASSWORD: \"${MINIO_ROOT_PASSWORD}\"" { print "      HOME: /root" }' "$1"
 }
+# The default tags name the series Raynet runs with the Catalog instead of a floating major or latest:
+# MongoDB 8 -> 8.0, RabbitMQ 3-management-alpine -> 3.13-management-alpine, Nginx Proxy Manager latest -> 2
+series_tags() {
+  sed 's|^MONGO_TAG="8"$|MONGO_TAG="8.0"|; s|^RABBITMQ_TAG="3-management-alpine"$|RABBITMQ_TAG="3.13-management-alpine"|; s|^NGINX_PROXY_MANAGER_TAG="latest"$|NGINX_PROXY_MANAGER_TAG="2"|'
+}
 
-# 1. Byte-identical output vs original (NPM true / false), apart from the restart policy
+# 1. Byte-identical output vs original (NPM true / false), apart from the restart policy and the series tags
 for npm in true false; do
   D="$(newdir "id_$npm")"; O="$T/orig_$npm"; rm -rf "$O"; mkdir -p "$O"
   sed -i "s/^INSTALL_NGINX_PROXY_MANAGER=\"true\"/INSTALL_NGINX_PROXY_MANAGER=\"$npm\"/" "$D/gen.sh"
-  sed "s/^INSTALL_NGINX_PROXY_MANAGER=\"true\"/INSTALL_NGINX_PROXY_MANAGER=\"$npm\"/" "$SP/original.sh" | sed 's|^MINIO_TAG="latest"|MINIO_TAG="RELEASE.2025-10-15T17-29-55Z"|; s|image: minio/minio:|image: ghcr.io/golithus/minio:|' > "$O/gen.sh"
+  sed "s/^INSTALL_NGINX_PROXY_MANAGER=\"true\"/INSTALL_NGINX_PROXY_MANAGER=\"$npm\"/" "$SP/original.sh" | sed 's|^MINIO_TAG="latest"|MINIO_TAG="RELEASE.2025-10-15T17-29-55Z"|; s|image: minio/minio:|image: ghcr.io/golithus/minio:|' | series_tags > "$O/gen.sh"
   (cd "$O" && bash gen.sh >/dev/null)
   restart_always "$O/docker-compose.yml" > "$O/podman-compose.yml"
   bash "$D/gen.sh" generate </dev/null >/dev/null 2>&1
-  check "env identical NPM=$npm" 'diff <(mask "$O/.env") <(mask "$D/.env") >/dev/null'
-  check "compose identical NPM=$npm (3 restart lines changed, 2 added, HOME for MinIO)" '[ "$(diff "$O/docker-compose.yml" "$O/podman-compose.yml" | grep -c "^[<>]")" -eq 9 ] && cmp -s "$O/podman-compose.yml" "$D/docker-compose.yml"'
+  check "env identical NPM=$npm (plus domain and NPM admin)" 'diff <(mask "$O/.env") <(mask "$D/.env" | grep -vxE "$ADDED_ENV") >/dev/null && [ "$(mask "$D/.env" | grep -cxE "$ADDED_ENV")" -eq 3 ]'
+  added=0; [ "$npm" = true ] && added=5
+  check "compose identical NPM=$npm (3 restart lines changed, 2 added, HOME for MinIO; $added lines NPM admin and proxy networks)" '[ "$(diff "$O/docker-compose.yml" "$O/podman-compose.yml" | grep -c "^[<>]")" -eq 9 ] && cmp -s "$O/podman-compose.yml" <(grep -vE "$ADDED_COMPOSE" "$D/docker-compose.yml") && [ "$(grep -cE "$ADDED_COMPOSE" "$D/docker-compose.yml")" -eq "$added" ]'
 done
 
 # 2. keep / new / unknown flag

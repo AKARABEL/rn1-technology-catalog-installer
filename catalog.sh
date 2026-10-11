@@ -29,13 +29,19 @@ BASEURL="http://catalog-web"
 # Enable / Disable optional services
 INSTALL_NGINX_PROXY_MANAGER="true"
 
+# Container engine: podman, docker or colima (macOS); empty: the one that holds this installation
+CONTAINER_ENGINE=""
+# Domain and HTTPS (option 24); an empty domain uses the address of the server
+CATALOG_DOMAIN=""
+NPM_ADMIN_EMAIL=""
+
 # Image Tags
-NGINX_PROXY_MANAGER_TAG="latest"
+NGINX_PROXY_MANAGER_TAG="2"
 OPENSEARCH_TAG="2"
 OPENSEARCH_DASHBOARDS_TAG="2"
-MONGO_TAG="8"
+MONGO_TAG="8.0"
 MINIO_TAG="RELEASE.2025-10-15T17-29-55Z"
-RABBITMQ_TAG="3-management-alpine"
+RABBITMQ_TAG="3.13-management-alpine"
 
 CATALOG_VERSION="25.4.4191.133"
 CATALOG_IMAGE_REPO="raynetgmbh/rayventory-catalog"
@@ -134,12 +140,20 @@ SCP_SECRET=""
 INTERACTIVE="false"
 GENERATE_CANCELLED="false"
 TZ_CHANGED="false"
+TZ_STOPPED="false"
 COMPOSE=()
 COMPOSE_PROBLEM=""
-# Podman only: "podman compose" runs the official Docker Compose (the provider) against Podman's API
-# socket. A DOCKER_HOST from the environment would make it talk to something else.
-unset DOCKER_HOST DOCKER_CONTEXT
-export PODMAN_COMPOSE_WARNING_LOGS=false
+# The container engine, set once at startup by resolve_engine: ENGINE is the command (podman or docker),
+# ENGINE_KIND what runs the containers (podman, docker or colima), ENGINE_NAME its name in the texts
+ENGINE="podman"
+ENGINE_KIND="podman"
+ENGINE_NAME="Podman"
+ENGINE_GUARD_NOTED=""
+# DOCKER_HOST and DOCKER_CONTEXT as the environment gave them: Podman drops them, Docker needs them back
+ENV_DOCKER_HOST="${DOCKER_HOST-}"
+ENV_DOCKER_HOST_SET="${DOCKER_HOST+1}"
+ENV_DOCKER_CONTEXT="${DOCKER_CONTEXT-}"
+ENV_DOCKER_CONTEXT_SET="${DOCKER_CONTEXT+1}"
 PODMAN_MIN="4.9.0"
 if [ -n "${RN1_COMPOSE_PROVIDER:-}" ]; then
   COMPOSE_PROVIDER="$RN1_COMPOSE_PROVIDER"
@@ -170,13 +184,16 @@ ok()   { printf '%s OK%s %s\n' "$C_GRN" "$C_RST" "$*"; }
 warn() { printf '%sWARN%s %s\n' "$C_YLW" "$C_RST" "$*" >&2; }
 err()  { printf '%sERROR%s %s\n' "$C_RED" "$C_RST" "$*" >&2; }
 
-# confirm "Question" [y|n]  -> returns 0 for yes
+# confirm "Question" [y|n]  -> returns 0 for yes. CONFIRM_LAST: what was typed (the guided tasks stop at 0).
+CONFIRM_LAST=""
 confirm() {
   local prompt="$1" default="${2:-n}" hint answer
   if [ "$default" = "y" ]; then hint="[Y/n]"; else hint="[y/N]"; fi
+  CONFIRM_LAST=""
   if ! read -r -p "$prompt $hint " answer; then
     return 1
   fi
+  CONFIRM_LAST="$answer"
   case "${answer:-$default}" in
     [Yy]|[Yy][Ee][Ss]) return 0 ;;
     *) return 1 ;;
@@ -331,7 +348,7 @@ port_settings() {
 }
 
 ###############################################################################
-# Podman / Compose
+# Container engine (Podman, Docker or Colima) / Compose
 ###############################################################################
 
 # pkg_hint PACKAGE... -> the command that installs them on this machine ("sudo dnf install jq")
@@ -373,23 +390,85 @@ ssh_package() {
   fi
 }
 
-# The version of the podman command (podman version 5.7.0 -> 5.7.0)
-podman_version() {
+# The version of the engine's command (podman version 5.7.0 -> 5.7.0, Docker version 29.9.0, build x -> 29.9.0)
+engine_version() {
   local v
-  v="$(podman --version 2>/dev/null)" || v=""
+  v="$("$ENGINE" --version 2>/dev/null)" || v=""
+  v="${v%%,*}"
   v="${v##* }"
   printf '%s' "${v%%[!0-9.]*}"
 }
 
-# "false" when Podman runs rootful (what the Catalog needs), "true" when rootless
+# True when the docker command is Podman's emulation (podman-docker), which is not Docker
+docker_is_podman() {
+  local v
+  v="$(docker --version 2>/dev/null)" || v=""
+  case "$v" in
+    *[Pp]odman*) return 0 ;;
+  esac
+  return 1
+}
+
+# True when docker is the snap of Docker (offered by the Ubuntu Server installer): not docker.service,
+# and its confinement keeps it out of folders outside /home
+docker_is_snap() {
+  local p
+  if [ "$OS_KIND" = "Darwin" ]; then
+    return 1
+  fi
+  p="$(command -v docker 2>/dev/null)" || return 1
+  case "$p" in
+    /snap/*) return 0 ;;
+  esac
+  p="$(readlink -f -- "$p" 2>/dev/null)" || return 1
+  [ "${p##*/}" = "snap" ]
+}
+
+docker_snap_problem() {
+  printf '%s' "Docker is installed as a snap, which the Catalog cannot use (no docker.service, no access to folders outside /home). Remove it - 'snap remove docker' deletes its containers, volumes and images - then './$SCRIPT_NAME install-docker' installs Docker from Docker's repository."
+}
+
+# compose_v2 TEXT -> true when TEXT (docker compose version) is Docker Compose 2 or newer: v2.40.3, or
+# without the v in the builds of the distributions (2.40.3+ds1-0ubuntu1~24.04.1)
+compose_v2() {
+  local v="${1%%$'\n'*}"
+  case "$v" in
+    "Docker Compose version "*) ;;
+    *) return 1 ;;
+  esac
+  v="${v#Docker Compose version }"
+  v="${v#v}"
+  v="${v%%.*}"
+  [[ "$v" =~ ^[0-9]+$ ]] && [ "$v" -ge 2 ]
+}
+
+# True when the command of the engine is there (a docker that is Podman's emulation does not count)
+engine_cli() {
+  command -v "$ENGINE" >/dev/null 2>&1 && { [ "$ENGINE" = "podman" ] || ! docker_is_podman; }
+}
+
+# "false" when the engine runs rootful (what the Catalog needs), "true" when rootless, empty when it
+# does not answer
 engine_rootless() {
+  local s
+  if [ "$ENGINE" = "docker" ]; then
+    s="$(docker info --format '{{range .SecurityOptions}}{{.}} {{end}}' 2>/dev/null)" || return 0
+    case "$s" in
+      *name=rootless*) printf 'true' ;;
+      *) printf 'false' ;;
+    esac
+    return 0
+  fi
   podman info --format '{{.Host.Security.Rootless}}' 2>/dev/null || true
 }
 
-# True when Podman's API answers: on Linux the systemd socket (podman.socket), on macOS the machine
+# True when the engine's API answers: Podman's systemd socket (podman.socket) or its machine on macOS,
+# the Docker daemon (Docker Desktop, the Colima VM)
 engine_socket_ok() {
   local state m
-  if [ "$OS_KIND" = "Darwin" ]; then
+  if [ "$ENGINE" = "docker" ]; then
+    docker info >/dev/null 2>&1
+  elif [ "$OS_KIND" = "Darwin" ]; then
     m="$(mac_machine)"
     state=""
     if [ -n "$m" ]; then
@@ -425,12 +504,15 @@ mac_machine() {
   printf '%s' "${def:-$first}"
 }
 
-# The kernel the containers run on: this machine's, or the Podman machine's on macOS
+# The kernel the containers run on: this machine's, or on macOS the one of the Linux VM (the Podman
+# machine, Docker Desktop, Colima)
 engine_kernel() {
-  if [ "$OS_KIND" = "Darwin" ]; then
-    podman info --format '{{.Host.Kernel}}' 2>/dev/null || true
-  else
+  if [ "$OS_KIND" != "Darwin" ]; then
     uname -r 2>/dev/null || true
+  elif [ "$ENGINE" = "docker" ]; then
+    docker info --format '{{.KernelVersion}}' 2>/dev/null || true
+  else
+    podman info --format '{{.Host.Kernel}}' 2>/dev/null || true
   fi
 }
 
@@ -459,8 +541,8 @@ short_ref() {
   printf '%s' "${r#docker.io/}"
 }
 
-# use_sudo -> SUDO=() as root and on macOS (Homebrew, the Podman machine and ~/.docker belong to the
-# user), SUDO=(sudo) otherwise; 1 when there is no sudo
+# use_sudo -> SUDO=() as root and on macOS (Homebrew, the Linux VM and ~/.docker belong to the user),
+# SUDO=(sudo) otherwise; 1 when there is no sudo
 use_sudo() {
   if [ "$OS_KIND" = "Darwin" ] || [ "$(id -u)" -eq 0 ]; then
     SUDO=()
@@ -471,9 +553,279 @@ use_sudo() {
   fi
 }
 
-# True when Podman is ready for the stack (quiet; for the menu): installed, rootful, compose there
+# engine_use podman|docker|colima -> ENGINE, ENGINE_KIND and ENGINE_NAME for that kind. "podman compose"
+# runs Docker Compose against Podman's API socket: a DOCKER_HOST from the environment would make it talk
+# to something else. Docker gets both back as the environment gave them (rootless Docker, the contexts of
+# Colima and Docker Desktop); on macOS without them, the docker command is pinned to the VM of the kind.
+engine_use() {
+  case "$1" in
+    docker|colima)
+      ENGINE="docker"
+      ENGINE_KIND="docker"
+      ENGINE_NAME="Docker"
+      if [ "$1" = "colima" ] && [ "$OS_KIND" = "Darwin" ]; then
+        ENGINE_KIND="colima"
+        ENGINE_NAME="Colima"
+      fi
+      if [ -n "$ENV_DOCKER_HOST_SET" ]; then
+        export DOCKER_HOST="$ENV_DOCKER_HOST"
+      else
+        unset DOCKER_HOST
+      fi
+      if [ -n "$ENV_DOCKER_CONTEXT_SET" ]; then
+        export DOCKER_CONTEXT="$ENV_DOCKER_CONTEXT"
+      else
+        unset DOCKER_CONTEXT
+      fi
+      if [ "$OS_KIND" = "Darwin" ]; then
+        mac_docker_path
+        mac_docker_pin
+      fi
+      ;;
+    *)
+      ENGINE="podman"
+      ENGINE_KIND="podman"
+      ENGINE_NAME="Podman"
+      unset DOCKER_HOST DOCKER_CONTEXT
+      export PODMAN_COMPOSE_WARNING_LOGS=false
+      ;;
+  esac
+  COMPOSE=()
+  COMPOSE_PROBLEM=""
+}
+
+# docker_orig ARG... -> docker with DOCKER_HOST and DOCKER_CONTEXT as the environment gave them
+docker_orig() {
+  (
+    if [ -n "$ENV_DOCKER_HOST_SET" ]; then
+      export DOCKER_HOST="$ENV_DOCKER_HOST"
+    else
+      unset DOCKER_HOST
+    fi
+    if [ -n "$ENV_DOCKER_CONTEXT_SET" ]; then
+      export DOCKER_CONTEXT="$ENV_DOCKER_CONTEXT"
+    else
+      unset DOCKER_CONTEXT
+    fi
+    docker "$@"
+  )
+}
+
+# The engines that can hold containers and volumes here: on macOS Docker Desktop and Colima are two
+# Linux VMs, each with its own
+engine_kinds() {
+  if [ "$OS_KIND" = "Darwin" ]; then
+    printf 'podman docker colima'
+  else
+    printf 'podman docker'
+  fi
+}
+
+# kind_name podman|docker|colima -> its name in the texts
+kind_name() {
+  case "$1" in
+    podman) printf 'Podman' ;;
+    colima) printf 'Colima' ;;
+    *)
+      if [ "$OS_KIND" = "Darwin" ]; then
+        printf 'Docker Desktop'
+      else
+        printf 'Docker'
+      fi
+      ;;
+  esac
+}
+
+# kinds_text "KIND..." -> their names: Docker Desktop and Colima
+kinds_text() {
+  local k out=""
+  for k in $1; do
+    out="${out:+$out and }$(kind_name "$k")"
+  done
+  printf '%s' "$out"
+}
+
+# engine_has_data podman|docker|colima [containers] -> true when that engine holds containers or volumes
+# of this project (containers: only containers count). A docker that is Podman's emulation holds nothing
+# of its own. On macOS Docker Desktop and Colima are asked through their own Docker context.
+engine_has_data() {
+  local filter ctx
+  local -a cmd=(podman)
+  filter="label=com.docker.compose.project=$(stack_project)"
+  if [ "$1" != "podman" ]; then
+    cmd=(docker_orig)
+    if [ "$OS_KIND" = "Darwin" ]; then
+      mac_docker_path
+    fi
+    if ! command -v docker >/dev/null 2>&1 || docker_is_podman; then
+      return 1
+    fi
+    if [ "$OS_KIND" = "Darwin" ]; then
+      ctx="$(mac_docker_context "$1")"
+      if [ -z "$ctx" ]; then
+        return 1
+      fi
+      cmd+=(--context "$ctx")
+    fi
+  elif ! command -v podman >/dev/null 2>&1; then
+    return 1
+  fi
+  [ -n "$("${cmd[@]}" ps -aq --filter "$filter" 2>/dev/null)" ] \
+    || { [ "${2:-}" != "containers" ] && [ -n "$("${cmd[@]}" volume ls -q --filter "$filter" 2>/dev/null)" ]; }
+}
+
+# The engine a CONTAINER_ENGINE that is empty stands for: the one that alone holds this project's
+# containers or volumes (when more than one does, engine_guard asks for the choice); else Podman when it
+# is installed, else a Docker that answers, else Podman. Docker on macOS is Colima when the current Docker
+# context is Colima's.
+engine_detect() {
+  local k kind=""
+  if [ "$OS_KIND" = "Darwin" ]; then
+    mac_docker_path
+  fi
+  if ! engine_has_data podman; then
+    for k in $(engine_kinds); do
+      if [ "$k" != "podman" ] && engine_has_data "$k"; then
+        kind="$k"
+        break
+      fi
+    done
+  fi
+  if [ -z "$kind" ]; then
+    kind="podman"
+    if ! command -v podman >/dev/null 2>&1 && command -v docker >/dev/null 2>&1 && ! docker_is_podman && docker_orig info >/dev/null 2>&1; then
+      kind="docker"
+      if [ "$OS_KIND" = "Darwin" ] && [ "$(mac_docker_kind)" = "colima" ]; then
+        kind="colima"
+      fi
+    fi
+  fi
+  printf '%s' "$kind"
+}
+
+# resolve_engine -> ENGINE, ENGINE_KIND and ENGINE_NAME from CONTAINER_ENGINE (engine_detect when it is empty)
+resolve_engine() {
+  local kind="$CONTAINER_ENGINE"
+  if [ -z "$kind" ]; then
+    kind="$(engine_detect)"
+  fi
+  engine_use "$kind"
+}
+
+# True when CONTAINER_ENGINE names an engine this machine can have (empty included)
+engine_setting_ok() {
+  case "$CONTAINER_ENGINE" in
+    ""|podman|docker) return 0 ;;
+    colima) [ "$OS_KIND" = "Darwin" ] ;;
+    *) return 1 ;;
+  esac
+}
+
+# The other engines (podman, docker, colima) that hold containers or volumes of this project; empty when none
+other_engine_data() {
+  local k out=""
+  for k in $(engine_kinds); do
+    if [ "$k" != "$ENGINE_KIND" ] && engine_has_data "$k"; then
+      out="$out $k"
+    fi
+  done
+  printf '%s' "${out# }"
+}
+
+# engine_guard -> fails, with the reason, when another engine holds this project's containers or volumes
+# and this one does not: one engine per server - starting here would leave that data behind. When this
+# one holds them too, it goes on with a note (once); with CONTAINER_ENGINE empty it asks for the choice.
+engine_guard() {
+  local other first name
+  other="$(other_engine_data)"
+  if [ -z "$other" ]; then
+    return 0
+  fi
+  first="${other%% *}"
+  name="$(kind_name "$ENGINE_KIND")"
+  if engine_has_data "$ENGINE_KIND"; then
+    if [ -z "$CONTAINER_ENGINE" ]; then
+      err "The containers or data volumes of project \"$(stack_project)\" are in $name and in $(kinds_text "$other"):"
+      echo "  choose the one to go on with: CONTAINER_ENGINE=\"$ENGINE_KIND\" or \"$first\" (option 1). The other one can"
+      echo "  then be removed: R with CONTAINER_ENGINE set to it."
+      return 1
+    fi
+    if [ -z "$ENGINE_GUARD_NOTED" ]; then
+      ENGINE_GUARD_NOTED="yes"
+      warn "The containers or data volumes of project \"$(stack_project)\" are also in $(kinds_text "$other"); this folder uses $name."
+      echo "  To remove them: R with CONTAINER_ENGINE=\"$first\" (option 1), then CONTAINER_ENGINE=\"$ENGINE_KIND\" again."
+    fi
+    return 0
+  fi
+  err "The containers or data volumes of project \"$(stack_project)\" are in $(kinds_text "$other"), but this folder uses $name:"
+  echo "  $name would start an empty Catalog and leave that data behind (one engine per server)."
+  echo "  Use CONTAINER_ENGINE=\"$first\" (option 1) to go on with it, or remove that installation first"
+  echo "  (R with CONTAINER_ENGINE=\"$first\"), then start again."
+  return 1
+}
+
+# engine_switch_problem KIND -> why CONTAINER_ENGINE cannot become KIND in this folder (empty when it can):
+# KIND holds none of this project's containers or volumes, and another engine does
+engine_switch_problem() {
+  local want="$1" k
+  if [ -z "$want" ]; then
+    return 0
+  fi
+  if [ "$want" = "colima" ] && [ "$OS_KIND" != "Darwin" ]; then
+    want="docker"
+  fi
+  if engine_has_data "$want"; then
+    return 0
+  fi
+  for k in $(engine_kinds); do
+    if [ "$k" != "$want" ] && engine_has_data "$k"; then
+      printf 'The containers or data volumes of project "%s" are in %s - one engine per server: keep "%s", or remove that installation first (R).' \
+        "$(stack_project)" "$(kind_name "$k")" "$k"
+      return 0
+    fi
+  done
+}
+
+# The command that sets up the engine of this folder
+engine_install_cmd() {
+  case "$ENGINE_KIND" in
+    podman) printf 'install-podman' ;;
+    docker) printf 'install-docker' ;;
+    *) printf 'install-engine' ;;
+  esac
+}
+
+# What to do when the engine does not answer
+engine_down_hint() {
+  case "$ENGINE_KIND" in
+    podman)
+      if [ "$OS_KIND" = "Darwin" ]; then
+        printf 'start the Podman machine: podman machine start %s' "$(mac_machine)"
+      else
+        printf 'run %s as root, with podman.socket active' "$SCRIPT_NAME"
+      fi
+      ;;
+    colima) printf 'start Colima: colima start' ;;
+    *)
+      if [ "$OS_KIND" = "Darwin" ]; then
+        printf 'start Docker Desktop: open -a Docker'
+      else
+        printf 'start the daemon (systemctl enable --now docker) and run as root or as a member of the docker group'
+      fi
+      ;;
+  esac
+}
+
+# True when the engine is ready for the stack (quiet; for the menu): installed, rootful, compose there
 engine_ready() {
-  command -v podman >/dev/null 2>&1 && [ "$(engine_rootless)" = "false" ] && detect_compose >/dev/null 2>&1
+  engine_cli && [ "$(engine_rootless)" = "false" ] && detect_compose >/dev/null 2>&1 \
+    && { [ "$ENGINE_KIND" != "colima" ] || colima status >/dev/null 2>&1; }
+}
+
+# True when the Docker Compose at COMPOSE_PROVIDER is the installer's own (it keeps it at the newest
+# release): always with Podman; with Docker when it is a file there, not a link of Docker Desktop
+compose_own() {
+  [ "$ENGINE" = "podman" ] || { [ -x "$COMPOSE_PROVIDER" ] && [ ! -L "$COMPOSE_PROVIDER" ]; }
 }
 
 detect_compose() {
@@ -481,11 +833,32 @@ detect_compose() {
   if [ "${#COMPOSE[@]}" -gt 0 ]; then
     return 0
   fi
+  if [ "$ENGINE" = "docker" ]; then
+    if ! command -v docker >/dev/null 2>&1; then
+      COMPOSE_PROBLEM="$ENGINE_NAME is not installed - './$SCRIPT_NAME $(engine_install_cmd)' installs it (option 16 shows how)."
+      return 1
+    fi
+    if docker_is_podman; then
+      COMPOSE_PROBLEM="'docker' on this machine is Podman (podman-docker), not Docker - './$SCRIPT_NAME $(engine_install_cmd)' installs Docker, or use CONTAINER_ENGINE=\"podman\"."
+      return 1
+    fi
+    if docker_is_snap; then
+      COMPOSE_PROBLEM="$(docker_snap_problem)"
+      return 1
+    fi
+    v="$(docker compose version 2>/dev/null)" || v=""
+    if ! compose_v2 "$v"; then
+      COMPOSE_PROBLEM="Docker Compose ('docker compose') is missing or too old - './$SCRIPT_NAME $(engine_install_cmd)' installs the newest one."
+      return 1
+    fi
+    COMPOSE=(docker compose)
+    return 0
+  fi
   if ! command -v podman >/dev/null 2>&1; then
     COMPOSE_PROBLEM="Podman is not installed - './$SCRIPT_NAME install-podman' installs it (option 16 shows the commands)."
     return 1
   fi
-  v="$(podman_version)"
+  v="$(engine_version)"
   if [ -z "$v" ] || version_gt "$PODMAN_MIN" "$v"; then
     COMPOSE_PROBLEM="Podman ${v:-(unknown version)} is too old: $PODMAN_MIN or newer is needed ('podman compose' came with 4.7; Debian 12 has 4.3 - use Debian 13)."
     return 1
@@ -506,7 +879,15 @@ detect_compose() {
   COMPOSE=(podman compose)
 }
 
-require_podman() {
+require_engine() {
+  if ! engine_setting_ok; then
+    err "CONTAINER_ENGINE must be \"podman\", \"docker\"$(if [ "$OS_KIND" = "Darwin" ]; then printf ', "colima"'; fi) or empty (is \"$CONTAINER_ENGINE\") - option 1 changes it."
+    return 1
+  fi
+  if [ "$ENGINE" = "docker" ]; then
+    require_docker
+    return
+  fi
   if ! command -v podman >/dev/null 2>&1; then
     err "Podman is not installed - './$SCRIPT_NAME install-podman' installs it (option 16 shows the commands)."
     return 1
@@ -541,8 +922,50 @@ require_podman() {
   fi
 }
 
+# require_engine for Docker (Docker Engine, Docker Desktop, Colima)
+require_docker() {
+  if ! command -v docker >/dev/null 2>&1; then
+    err "$ENGINE_NAME is not installed - './$SCRIPT_NAME $(engine_install_cmd)' installs it (option 16 shows how)."
+    return 1
+  fi
+  if docker_is_podman; then
+    err "'docker' on this machine is Podman (podman-docker), not Docker - './$SCRIPT_NAME $(engine_install_cmd)' installs Docker, or use CONTAINER_ENGINE=\"podman\"."
+    return 1
+  fi
+  if docker_is_snap; then
+    err "$(docker_snap_problem)"
+    return 1
+  fi
+  if [ "$OS_KIND" != "Darwin" ] && [ "$(engine_arch)" != "amd64" ]; then
+    err "The Catalog images exist only for amd64 (x86_64); this machine is $(uname -m 2>/dev/null)."
+    return 1
+  fi
+  if [ "$ENGINE_KIND" = "colima" ]; then
+    if ! command -v colima >/dev/null 2>&1; then
+      err "Colima is not installed - './$SCRIPT_NAME install-engine' installs it (option 16 shows how)."
+      return 1
+    fi
+    if ! colima status >/dev/null 2>&1; then
+      err "Colima does not run - $(engine_down_hint)."
+      return 1
+    fi
+  fi
+  if ! docker info >/dev/null 2>&1; then
+    err "$ENGINE_NAME does not answer (docker info failed) - $(engine_down_hint)."
+    return 1
+  fi
+  if [ "$(engine_rootless)" != "false" ]; then
+    err "Docker runs rootless here; the Catalog needs the rootful Docker daemon (ports 80 and 443 of Nginx Proxy Manager, the memory lock of OpenSearch)."
+    return 1
+  fi
+  if ! detect_compose; then
+    err "$COMPOSE_PROBLEM"
+    return 1
+  fi
+}
+
 ###############################################################################
-# Install Podman and the newest Docker Compose (the engine behind "podman compose")
+# Install the engine (Podman, Docker, Colima) and the newest Docker Compose
 ###############################################################################
 
 # podman_install_plan -> the commands (as root, one per line) that install Podman on this Linux.
@@ -601,6 +1024,137 @@ podman_service_plan() {
   echo "mkdir -p /etc/containers/containers.conf.d && printf '[engine]\\ncompose_warning_logs = false\\n' > /etc/containers/containers.conf.d/50-rn1-compose.conf"
 }
 
+# installed_packages PACKAGE... -> those of the packages that are installed (dpkg or rpm)
+installed_packages() {
+  local p st out=""
+  for p in "$@"; do
+    if command -v dpkg-query >/dev/null 2>&1; then
+      st="$(dpkg-query -W -f='${Status}' "$p" 2>/dev/null)" || st=""
+      if [ "$st" = "install ok installed" ]; then
+        out="$out $p"
+      fi
+    elif command -v rpm >/dev/null 2>&1 && rpm -q "$p" >/dev/null 2>&1; then
+      out="$out $p"
+    fi
+  done
+  printf '%s' "${out# }"
+}
+
+# docker_install_plan -> the commands (as root, one per line) that install the newest Docker Engine with
+# its Compose plugin from Docker's repository (download.docker.com), as docs.docker.com describes it for
+# this Linux; openSUSE and SLES get the Docker of their own packages. Packages that conflict are removed
+# first. 2 (the reason on stderr) when Docker cannot run the Catalog here.
+docker_install_plan() {
+  local id like ver major repo="" codename="" arch old
+  local pkgs="docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin"
+  local uncovered="This Linux is not covered - install Docker Engine with its Compose plugin as https://docs.docker.com/engine/install/ describes it."
+  id="$(os_release ID)"
+  like=" $(os_release ID_LIKE) "
+  ver="$(os_release VERSION_ID)"
+  major="${ver%%.*}"
+  if [ "$(engine_arch)" != "amd64" ]; then
+    echo "The Catalog images exist only for amd64 (x86_64); this machine is $(uname -m 2>/dev/null)." >&2
+    return 2
+  fi
+  case "$id $like" in
+    ubuntu*|*" ubuntu "*)
+      repo="ubuntu"
+      codename="$(os_release UBUNTU_CODENAME)"
+      codename="${codename:-$(os_release VERSION_CODENAME)}"
+      if [ "$id" = "ubuntu" ] && [ -n "$ver" ] && version_gt "22.04" "$ver"; then
+        echo "Ubuntu $ver has no packages in Docker's repository any more - use Ubuntu 22.04 or newer." >&2
+        return 2
+      fi
+      ;;
+    debian*|*" debian "*)
+      repo="debian"
+      codename="$(os_release VERSION_CODENAME)"
+      ;;
+  esac
+  if [ -n "$repo" ]; then
+    if [ -z "$codename" ] || ! command -v apt-get >/dev/null 2>&1 || ! command -v dpkg >/dev/null 2>&1; then
+      echo "$uncovered" >&2
+      return 2
+    fi
+    # a derivative (Linux Mint, Kali ...) needs a release that Docker's repository has
+    if [ "$id" != "$repo" ] && ! http_get "https://download.docker.com/linux/$repo/dists/$codename/Release" >/dev/null 2>&1; then
+      echo "Docker's repository has no packages for $(os_release PRETTY_NAME) ($repo $codename)." >&2
+      return 2
+    fi
+    arch="$(dpkg --print-architecture)"
+    old="$(installed_packages docker.io docker-compose docker-compose-v2 docker-doc docker-buildx podman-docker containerd runc)"
+    echo "apt-get update"
+    echo "DEBIAN_FRONTEND=noninteractive apt-get install -y ca-certificates curl"
+    if [ -n "$old" ]; then
+      echo "DEBIAN_FRONTEND=noninteractive apt-get remove -y $old"
+    fi
+    echo "install -m 0755 -d /etc/apt/keyrings"
+    echo "curl -fsSL https://download.docker.com/linux/$repo/gpg -o /etc/apt/keyrings/docker.asc"
+    echo "chmod a+r /etc/apt/keyrings/docker.asc"
+    echo "printf '%s\\n' 'Types: deb' 'URIs: https://download.docker.com/linux/$repo' 'Suites: $codename' 'Components: stable' 'Architectures: $arch' 'Signed-By: /etc/apt/keyrings/docker.asc' > /etc/apt/sources.list.d/docker.sources"
+    echo "apt-get update"
+    echo "DEBIAN_FRONTEND=noninteractive apt-get install -y $pkgs"
+    return 0
+  fi
+  case "$id" in
+    amzn) ;;
+    fedora) repo="fedora" ;;
+    rhel) repo="rhel" ;;
+    centos|rocky|almalinux|ol) repo="centos" ;;
+    *)
+      case "$like" in
+        *" rhel "*|*" centos "*) repo="centos" ;;
+        *" fedora "*) repo="fedora" ;;
+      esac
+      ;;
+  esac
+  if [ -n "$repo" ] && [ "$repo" != "fedora" ]; then
+    if ! [[ "$major" =~ ^[0-9]+$ ]] || [ "$major" -lt 8 ]; then
+      echo "$(os_release PRETTY_NAME) is too old for Docker's packages - use version 8 or newer." >&2
+      return 2
+    fi
+    # Docker's centos/8 repository stopped at an old Docker: version 8 of every RHEL rebuild takes rhel/8
+    if [ "$major" -eq 8 ]; then
+      repo="rhel"
+    fi
+  fi
+  if [ -n "$repo" ]; then
+    if ! command -v dnf >/dev/null 2>&1; then
+      echo "$uncovered" >&2
+      return 2
+    fi
+    old="docker docker-client docker-client-latest docker-common docker-latest docker-latest-logrotate docker-logrotate docker-engine podman-docker"
+    # as Docker's pages list them: only the one for RHEL takes out Podman and runc, Fedora's the SELinux
+    # packages of the old Docker
+    case "$repo" in
+      rhel) old="$old podman runc" ;;
+      fedora) old="$old docker-selinux docker-engine-selinux" ;;
+    esac
+    # shellcheck disable=SC2086
+    old="$(installed_packages $old)"
+    if [ -n "$old" ]; then
+      echo "dnf remove -y $old"
+    fi
+    if ! command -v curl >/dev/null 2>&1; then
+      echo "dnf install -y curl"
+    fi
+    echo "curl -fsSL https://download.docker.com/linux/$repo/docker-ce.repo -o /etc/yum.repos.d/docker-ce.repo"
+    echo "dnf install -y $pkgs"
+    return 0
+  fi
+  if [[ " $id $like " == *suse* || "$id" == sles* ]] && command -v zypper >/dev/null 2>&1; then
+    echo "zypper -n install docker"
+    return 0
+  fi
+  echo "$uncovered" >&2
+  return 2
+}
+
+# The systemd unit of Docker: the daemon now and after every reboot (it restarts the containers itself)
+docker_service_plan() {
+  echo "systemctl enable --now docker"
+}
+
 # run_plan "STEP" ... -> runs each step as root (sudo when needed), stops at the first failure
 run_plan() {
   local step n=0
@@ -622,9 +1176,19 @@ compose_latest_tag() {
   printf '%s' "${head%%$'\n'*}"
 }
 
-# install_compose_provider ask|yes -> keeps Docker Compose (the engine behind "podman compose") at the
-# newest release: downloads it from GitHub, checks the checksum and that it works with this Podman.
-# A newest release that does not work here is not installed: the previous one stays.
+# compose_try FILE -> true when the Docker Compose FILE works with the engine here
+compose_try() {
+  if [ "$ENGINE" = "docker" ]; then
+    "$1" ls -q >/dev/null 2>&1
+  else
+    PODMAN_COMPOSE_PROVIDER="$1" podman compose ls -q >/dev/null 2>&1
+  fi
+}
+
+# install_compose_provider ask|yes -> keeps Docker Compose (the engine behind "podman compose", or the
+# Compose plugin of Docker) at the newest release: downloads it from GitHub, checks the checksum and that
+# it works with the engine here. A newest release that does not work here is not installed: the previous
+# one stays.
 install_compose_provider() {
   local mode="$1" tag have os arch url tmp exp got v rc
   if ! command -v curl >/dev/null 2>&1; then
@@ -642,15 +1206,15 @@ install_compose_provider() {
       warn "GitHub cannot be reached - Docker Compose $have stays."
       return 0
     fi
-    err "GitHub cannot be reached, and Docker Compose (the engine behind 'podman compose') is missing."
+    err "GitHub cannot be reached, and Docker Compose (the engine behind '$ENGINE compose') is missing."
     echo "  On a server without internet, use an offline bundle: it carries Docker Compose."
     return 1
   fi
   if [ "$have" = "${tag#v}" ]; then
-    ok "Docker Compose ${tag#v} (the newest) runs 'podman compose'."
+    ok "Docker Compose ${tag#v} (the newest) runs '$ENGINE compose'."
     return 0
   fi
-  info "Docker Compose ${tag#v} is the newest release${have:+ (installed: $have)}; 'podman compose' runs it."
+  info "Docker Compose ${tag#v} is the newest release${have:+ (installed: $have)}; '$ENGINE compose' runs it."
   if [ "$mode" = "ask" ] && ! confirm "Install Docker Compose ${tag#v} from github.com/docker/compose?" y; then
     info "Docker Compose was not changed."
     [ -n "$have" ]
@@ -700,14 +1264,14 @@ install_compose_provider() {
       return 1
       ;;
   esac
-  # try it against this Podman first: a release that needs a newer Podman API is not installed
-  if engine_socket_ok && [ "$(engine_rootless)" = "false" ] && ! PODMAN_COMPOSE_PROVIDER="$tmp" podman compose ls -q >/dev/null 2>&1; then
+  # try it against the engine first: a release that needs a newer API is not installed
+  if engine_socket_ok && [ "$(engine_rootless)" = "false" ] && ! compose_try "$tmp"; then
     ${SUDO[@]+"${SUDO[@]}"} rm -f -- "$tmp"
     if [ -n "$have" ]; then
-      warn "Docker Compose ${tag#v} does not work with Podman $(podman_version) here - Docker Compose $have stays."
+      warn "Docker Compose ${tag#v} does not work with $ENGINE_NAME $(engine_version) here - Docker Compose $have stays."
       return 0
     fi
-    err "Docker Compose ${tag#v} does not work with Podman $(podman_version) here."
+    err "Docker Compose ${tag#v} does not work with $ENGINE_NAME $(engine_version) here."
     return 1
   fi
   if [ -n "$have" ]; then
@@ -719,7 +1283,7 @@ install_compose_provider() {
     return 1
   fi
   COMPOSE=()
-  ok "Docker Compose ${tag#v} installed ($COMPOSE_PROVIDER); 'podman compose' runs it."
+  ok "Docker Compose ${tag#v} installed ($COMPOSE_PROVIDER); '$ENGINE compose' runs it."
 }
 
 # install_podman_linux ask|yes -> Podman with its socket and restart service on this Linux
@@ -735,7 +1299,7 @@ install_podman_linux() {
     return 1
   fi
   if command -v podman >/dev/null 2>&1; then
-    v="$(podman_version)"
+    v="$(engine_version)"
     if [ -z "$v" ] || version_gt "$PODMAN_MIN" "$v"; then
       err "Podman ${v:-(unknown version)} is too old: $PODMAN_MIN or newer is needed. Update it with the package manager."
       return 1
@@ -750,7 +1314,7 @@ install_podman_linux() {
   fi
   mapfile -t -O "${#steps[@]}" steps < <(podman_service_plan)
   echo
-  info "Podman $(if [ -n "$plan" ]; then printf 'will be installed from the packages of %s, then its' "$(os_release PRETTY_NAME)"; else printf '%s is installed; its' "$(podman_version)"; fi) API socket and restart service will be enabled:"
+  info "Podman $(if [ -n "$plan" ]; then printf 'will be installed from the packages of %s, then its' "$(os_release PRETTY_NAME)"; else printf '%s is installed; its' "$(engine_version)"; fi) API socket and restart service will be enabled:"
   printf '      %s\n' "${steps[@]}"
   if [ "$mode" = "ask" ] && ! confirm "Run these commands${SUDO[*]:+ with sudo}?" y; then
     info "Podman was not set up."
@@ -758,11 +1322,74 @@ install_podman_linux() {
   fi
   run_plan "${steps[@]}" || return 1
   COMPOSE=()
-  ok "Podman $(podman_version) is ready (rootful, API socket on, containers restart after a reboot)."
+  ok "Podman $(engine_version) is ready (rootful, API socket on, containers restart after a reboot)."
+}
+
+# install_docker_linux ask|yes -> Docker Engine with its service on this Linux (from Docker's repository;
+# openSUSE and SLES: their packages). A Docker that is there already only gets its service enabled.
+install_docker_linux() {
+  local mode="$1" plan="" rc=0 from
+  local -a steps=()
+  if [ "$(engine_arch)" != "amd64" ]; then
+    err "The Catalog images exist only for amd64 (x86_64); this machine is $(uname -m 2>/dev/null)."
+    return 1
+  fi
+  if [ ! -d "${RN1_SYSTEMD_DIR:-/run/systemd/system}" ]; then
+    err "This Linux does not run systemd, which Docker needs here (its daemon, the restart after a reboot)."
+    return 1
+  fi
+  if docker_is_snap; then
+    err "$(docker_snap_problem)"
+    return 1
+  fi
+  if ! command -v docker >/dev/null 2>&1 || docker_is_podman; then
+    plan="$(docker_install_plan)" || rc=$?
+    if [ "$rc" -ne 0 ]; then
+      err "Docker cannot be installed here by the installer."
+      return 1
+    fi
+    mapfile -t steps <<< "$plan"
+  fi
+  mapfile -t -O "${#steps[@]}" steps < <(docker_service_plan)
+  from="the packages of $(os_release PRETTY_NAME)"
+  if [[ "$plan" == *download.docker.com* ]]; then
+    from="Docker's repository (download.docker.com) for $(os_release PRETTY_NAME)"
+  fi
+  echo
+  info "Docker $(if [ -n "$plan" ]; then printf 'will be installed from %s, then its' "$from"; else printf '%s is installed; its' "$(engine_version)"; fi) service will be enabled:"
+  printf '      %s\n' "${steps[@]}"
+  if [[ "$plan" == *" remove -y "* ]]; then
+    echo "  The remove step takes out the packages that conflict with Docker's (named in it)."
+  fi
+  if [ "$mode" = "ask" ] && ! confirm "Run these commands${SUDO[*]:+ with sudo}?" y; then
+    info "Docker was not set up."
+    return 1
+  fi
+  run_plan "${steps[@]}" || return 1
+  COMPOSE=()
+  ok "Docker $(engine_version) is ready (daemon on, the containers restart after a reboot)."
 }
 
 # The LaunchAgent that starts the Podman machine when the user logs in (macOS)
 MAC_AGENT="$HOME/Library/LaunchAgents/de.raynet.rn1-podman-machine.plist"
+# Docker Desktop's settings (Rosetta ...)
+MAC_DD_SETTINGS="$HOME/Library/Group Containers/group.com.docker/settings-store.json"
+
+# The settings of the Colima VM (its type, the provision scripts): colima.yaml of the default profile, in
+# the folder Colima takes - COLIMA_HOME, ~/.colima, $XDG_CONFIG_HOME/colima, ~/.config/colima
+mac_colima_yaml() {
+  local dir="$HOME/.colima"
+  if [ -n "${COLIMA_HOME:-}" ] && [ -d "$COLIMA_HOME" ]; then
+    dir="$COLIMA_HOME"
+  elif [ ! -d "$HOME/.colima" ]; then
+    if [ -n "${XDG_CONFIG_HOME:-}" ]; then
+      dir="$XDG_CONFIG_HOME/colima"
+    elif [ -d "$HOME/.config/colima" ]; then
+      dir="$HOME/.config/colima"
+    fi
+  fi
+  printf '%s/default/colima.yaml' "$dir"
+}
 
 # The type of a Podman machine (applehv, libkrun, ...)
 mac_vmtype() {
@@ -799,33 +1426,36 @@ mac_agent() {
 EOF
 }
 
-# mac_prepare ask|yes -> Homebrew packages, a rootful Podman machine with enough memory and Rosetta,
-# vm.max_map_count and the restart service in it, and the LaunchAgent
-mac_prepare() {
-  local mode="$1" t mem cpus ram name rootful state type osver
+# mac_vm_size -> "CPUS MEMORY-MB" of the Linux VM for the Catalog: up to 6 CPUs, 12 GB of memory on a Mac
+# with 24 GB or more, else 8 GB
+mac_vm_size() {
+  local ram cpus mem=8192
+  ram="$(sysctl -n hw.memsize 2>/dev/null)" || ram=0
+  cpus="$(sysctl -n hw.ncpu 2>/dev/null)" || cpus=4
+  if [ "$cpus" -gt 6 ]; then
+    cpus=6
+  fi
+  if [ "$ram" -ge $((24 * 1024 * 1024 * 1024)) ]; then
+    mem=12288
+  elif [ "$ram" -lt $((16 * 1024 * 1024 * 1024)) ]; then
+    warn "This Mac has less than 16 GB of memory; the Catalog needs about 8 GB in its Linux VM."
+  fi
+  printf '%s %s' "$cpus" "$mem"
+}
+
+# mac_brew_tools ask|yes [COMMAND...] -> Homebrew with the GNU tools the script uses and the formulas of
+# the COMMANDs (podman, colima, docker): what is missing is installed after asking
+mac_brew_tools() {
+  local mode="$1" t
   local -a missing=()
-  if [ "$(engine_arch)" != "arm64" ]; then
-    err "Intel Macs are not supported: Podman runs only on Apple Silicon (M1 or newer)."
-    return 1
-  fi
-  if [ "$(id -u)" -eq 0 ]; then
-    err "On macOS run $SCRIPT_NAME as your normal user, not as root: the Podman machine belongs to the user."
-    return 1
-  fi
-  # Rosetta runs the amd64 Catalog images; with the Linux kernel of current Podman machines it works
-  # only from macOS 26
-  osver="$(sw_vers -productVersion 2>/dev/null)" || osver=""
-  if [[ "${osver%%.*}" =~ ^[0-9]+$ ]] && [ "${osver%%.*}" -lt 26 ]; then
-    err "macOS $osver is too old for the Catalog: macOS 26 (Tahoe) or newer is needed."
-    echo "  The Catalog images are amd64; Rosetta runs them in the Podman machine, and with its Linux kernel"
-    echo "  Rosetta works only from macOS 26."
-    return 1
-  fi
+  shift
   if ! command -v brew >/dev/null 2>&1; then
     err "Homebrew is needed: install it from https://brew.sh, then start $SCRIPT_NAME again."
     return 1
   fi
-  command -v podman >/dev/null 2>&1 || missing+=(podman)
+  for t in "$@"; do
+    command -v "$t" >/dev/null 2>&1 || missing+=("$t")
+  done
   for t in coreutils gnu-sed grep findutils; do
     if [ ! -d "$(brew --prefix 2>/dev/null)/opt/$t" ]; then
       missing+=("$t")
@@ -842,6 +1472,31 @@ mac_prepare() {
     # the GNU tools count from now on, not only from the next start
     mac_gnu_path
   fi
+}
+
+# mac_prepare ask|yes -> Homebrew packages, a rootful Podman machine with enough memory and Rosetta,
+# vm.max_map_count and the restart service in it, and the LaunchAgent
+mac_prepare() {
+  local mode="$1" t mem cpus name rootful state type osver
+  if [ "$(engine_arch)" != "arm64" ]; then
+    err "Intel Macs are not supported: Podman runs only on Apple Silicon (M1 or newer)."
+    echo "  Docker Desktop or Colima runs the Catalog on an Intel Mac: CONTAINER_ENGINE=\"docker\" or \"colima\"."
+    return 1
+  fi
+  if [ "$(id -u)" -eq 0 ]; then
+    err "On macOS run $SCRIPT_NAME as your normal user, not as root: the Podman machine belongs to the user."
+    return 1
+  fi
+  # Rosetta runs the amd64 Catalog images; with the Linux kernel of current Podman machines it works
+  # only from macOS 26
+  osver="$(sw_vers -productVersion 2>/dev/null)" || osver=""
+  if [[ "${osver%%.*}" =~ ^[0-9]+$ ]] && [ "${osver%%.*}" -lt 26 ]; then
+    err "macOS $osver is too old for the Catalog: macOS 26 (Tahoe) or newer is needed."
+    echo "  The Catalog images are amd64; Rosetta runs them in the Podman machine, and with its Linux kernel"
+    echo "  Rosetta works only from macOS 26."
+    return 1
+  fi
+  mac_brew_tools "$mode" podman || return 1
   # the Catalog images are amd64: Apple's hypervisor with Rosetta runs them
   t="$HOME/.config/containers/containers.conf.d/50-rn1-machine.conf"
   if [ ! -f "$t" ]; then
@@ -850,17 +1505,7 @@ mac_prepare() {
   fi
   name="$(mac_machine)"
   if [ -z "$name" ]; then
-    ram="$(sysctl -n hw.memsize 2>/dev/null)" || ram=0
-    cpus="$(sysctl -n hw.ncpu 2>/dev/null)" || cpus=4
-    if [ "$cpus" -gt 6 ]; then
-      cpus=6
-    fi
-    mem=8192
-    if [ "$ram" -ge $((24 * 1024 * 1024 * 1024)) ]; then
-      mem=12288
-    elif [ "$ram" -lt $((16 * 1024 * 1024 * 1024)) ]; then
-      warn "This Mac has less than 16 GB of memory; the Catalog needs about 8 GB in the Podman machine."
-    fi
+    read -r cpus mem <<< "$(mac_vm_size)"
     info "A Podman machine (Linux VM) will be created: rootful, $cpus CPUs, $((mem / 1024)) GB memory, 100 GB disk."
     echo "      podman machine init --rootful --cpus $cpus --memory $mem --disk-size 100 --now"
     if [ "$mode" = "ask" ] && ! confirm "Create it now?" y; then
@@ -939,23 +1584,320 @@ mac_prepare() {
   COMPOSE=()
 }
 
-# podman_offer -> in a terminal: when Podman is not ready, says why and offers to set it up
-podman_offer() {
+# Docker on macOS: colima when the current Docker context (or DOCKER_HOST) is Colima's, else docker
+mac_docker_kind() {
+  local ctx
+  ctx="$(docker_orig context show 2>/dev/null)" || ctx=""
+  case "$ctx ${ENV_DOCKER_HOST}" in
+    *colima*) printf 'colima' ;;
+    *) printf 'docker' ;;
+  esac
+}
+
+# mac_docker_context docker|colima -> the Docker context of that VM: colima, or desktop-linux (Docker
+# Desktop). Without desktop-linux the current context (another Docker that answers), default when that is
+# Colima's. Empty for Colima without its context (no Colima VM yet).
+mac_docker_context() {
+  local cur
+  if [ "$1" = "colima" ]; then
+    if docker_orig context inspect colima >/dev/null 2>&1; then
+      printf 'colima'
+    fi
+    return 0
+  fi
+  if docker_orig context inspect desktop-linux >/dev/null 2>&1; then
+    printf 'desktop-linux'
+    return 0
+  fi
+  cur="$(docker_orig context show 2>/dev/null)" || cur=""
+  case "$cur" in
+    ""|colima|colima-*) printf 'default' ;;
+    *) printf '%s' "$cur" ;;
+  esac
+}
+
+# mac_docker_pin -> DOCKER_CONTEXT for the VM of ENGINE_KIND (Docker Desktop and Colima each hold their own
+# containers and volumes), unless the environment set DOCKER_HOST or DOCKER_CONTEXT
+mac_docker_pin() {
+  local ctx
+  if [ "$ENGINE" != "docker" ] || [ -n "$ENV_DOCKER_HOST_SET$ENV_DOCKER_CONTEXT_SET" ] || ! command -v docker >/dev/null 2>&1; then
+    return 0
+  fi
+  ctx="$(mac_docker_context "$ENGINE_KIND")"
+  if [ -n "$ctx" ]; then
+    export DOCKER_CONTEXT="$ctx"
+  else
+    unset DOCKER_CONTEXT
+  fi
+}
+
+# The docker command of Docker Desktop on the PATH when it is not there yet (~/.docker/bin, the app)
+mac_docker_path() {
+  local d
+  if command -v docker >/dev/null 2>&1; then
+    return 0
+  fi
+  for d in "$HOME/.docker/bin" /Applications/Docker.app/Contents/Resources/bin "$HOME/Applications/Docker.app/Contents/Resources/bin"; do
+    if [ -x "$d/docker" ]; then
+      PATH="$PATH:$d"
+      export PATH
+      return 0
+    fi
+  done
+  return 0
+}
+
+# The folder of Docker Desktop (Docker.app); fails when it is not installed
+mac_docker_app() {
+  local a
+  for a in /Applications/Docker.app "$HOME/Applications/Docker.app"; do
+    if [ -d "$a" ]; then
+      printf '%s' "$a"
+      return 0
+    fi
+  done
+  return 1
+}
+
+mac_docker_license() {
+  echo "  Docker Desktop is free only for companies with fewer than 250 employees AND less than 10 million"
+  echo "  USD annual revenue, for personal use, education and non-commercial open source projects; everyone"
+  echo "  else needs a paid Docker subscription. Colima (CONTAINER_ENGINE=\"colima\") is free."
+}
+
+# mac_wait_docker -> waits until Docker answers (docker info), at most RN1_DOCKER_WAIT seconds (300).
+# Docker Desktop creates its context (desktop-linux) at its first start.
+mac_wait_docker() {
+  local start="$SECONDS" limit="${RN1_DOCKER_WAIT:-300}"
+  until mac_docker_path && mac_docker_pin && docker info >/dev/null 2>&1; do
+    if [ $((SECONDS - start)) -ge "$limit" ]; then
+      return 1
+    fi
+    sleep 3
+  done
+}
+
+# True when the settings of Docker Desktop show Rosetta off (the amd64 Catalog images then run in QEMU)
+mac_docker_rosetta_off() {
+  grep -Eiq '"UseVirtualizationFrameworkRosetta"[[:space:]]*:[[:space:]]*false' "$MAC_DD_SETTINGS" 2>/dev/null
+}
+
+# True when Rosetta cannot run the amd64 Catalog images in the Linux VM of Docker Desktop or Colima: it
+# fails with Linux 6.13 and newer before macOS 26
+mac_kernel_problem() {
+  local k osver
+  if [ "$(engine_arch)" != "arm64" ]; then
+    return 1
+  fi
+  osver="$(sw_vers -productVersion 2>/dev/null)" || osver=""
+  if ! [[ "${osver%%.*}" =~ ^[0-9]+$ ]] || [ "${osver%%.*}" -ge 26 ]; then
+    return 1
+  fi
+  k="$(engine_kernel)"
+  [[ "$k" =~ ^[0-9]+\.[0-9]+ ]] && ! version_gt "6.13" "${BASH_REMATCH[0]}"
+}
+
+mac_kernel_error() {
+  err "macOS $(sw_vers -productVersion 2>/dev/null) with Linux $(engine_kernel) in the $ENGINE_NAME VM: Rosetta, which runs the amd64"
+  echo "  Catalog images, fails with Linux 6.13 and newer before macOS 26 - update macOS to 26 (Tahoe)."
+}
+
+# mac_docker_desktop ask|yes -> a Docker that answers (Docker Desktop, or any other that does): Docker
+# Desktop is installed with Homebrew when it is missing (only after its license note and a question - also
+# with yes; without a terminal it is not installed), started, and waited for
+mac_docker_desktop() {
+  local mode="$1"
+  if [ "$(id -u)" -eq 0 ]; then
+    err "On macOS run $SCRIPT_NAME as your normal user, not as root: Docker Desktop belongs to the user."
+    return 1
+  fi
+  mac_brew_tools "$mode" || return 1
+  mac_docker_pin
+  if ! docker info >/dev/null 2>&1; then
+    if ! mac_docker_app >/dev/null; then
+      info "Docker Desktop is not installed; Homebrew can install it:"
+      echo "      brew install --cask docker-desktop"
+      mac_docker_license
+      if [ "$mode" = "yes" ] && [ ! -t 0 ]; then
+        err "Docker Desktop is not installed without a question (its license): install it with the command above,"
+        echo "  or start $SCRIPT_NAME in a terminal, then start it again."
+        return 1
+      fi
+      if ! confirm "Install Docker Desktop now (its license above applies)?" n; then
+        info "Docker Desktop was not installed."
+        return 1
+      fi
+      brew install --cask docker-desktop || return 1
+      mac_docker_path
+    fi
+    info "Starting Docker Desktop (open -a Docker). At its first start, accept its agreement."
+    if [ "$(engine_arch)" = "arm64" ]; then
+      echo "  Then turn on Settings > General > \"Use Rosetta for x86_64/amd64 emulation\" (the Catalog images are amd64)."
+    fi
+    open -a Docker >/dev/null 2>&1 || true
+    while ! mac_wait_docker; do
+      if [ "$mode" = "yes" ] || ! confirm "Docker Desktop does not answer yet. Wait again?" y; then
+        err "Docker Desktop does not answer (docker info) - start it, accept its agreement, then start $SCRIPT_NAME again."
+        return 1
+      fi
+    done
+    mac_docker_path
+  fi
+  ok "Docker answers: $(docker --version 2>/dev/null)"
+  if [ "$(engine_arch)" = "arm64" ] && mac_docker_rosetta_off; then
+    warn "Rosetta is off in Docker Desktop, and the Catalog images are amd64 (slow and unreliable without it):"
+    echo "  turn on Settings > General > \"Use Rosetta for x86_64/amd64 emulation\", then Apply & restart."
+  fi
+  if mac_kernel_problem; then
+    mac_kernel_error
+    return 1
+  fi
+  COMPOSE=()
+}
+
+# True when Rosetta runs amd64 programs in the Colima VM
+mac_colima_rosetta_on() {
+  local s
+  s="$(colima ssh -- cat /proc/sys/fs/binfmt_misc/rosetta 2>/dev/null)" || s=""
+  [ "${s%%$'\n'*}" = "enabled" ]
+}
+
+# Keeps vm.max_map_count in the Colima VM after a restart: a provision script in colima.yaml, which
+# Colima runs at every start
+mac_colima_provision() {
+  local tmp yaml
+  yaml="$(mac_colima_yaml)"
+  if [ ! -f "$yaml" ] || grep -q 'vm.max_map_count' "$yaml"; then
+    return 0
+  fi
+  tmp="$(mktemp)" || return 0
+  awk -v s="sysctl -w vm.max_map_count=262144" '
+    !done && /^provision:[[:space:]]*\[\][[:space:]]*$/ { print "provision:"; print "  - mode: system"; print "    script: " s; done = 1; next }
+    !done && /^provision:[[:space:]]*$/ {
+      print
+      ind = "  "
+      if ((getline nxt) > 0) {
+        if (nxt ~ /^ *- /) { ind = nxt; sub(/-.*/, "", ind) }
+        print ind "- mode: system"; print ind "  script: " s; print nxt
+      } else {
+        print ind "- mode: system"; print ind "  script: " s
+      }
+      done = 1; next
+    }
+    { print }
+    END { if (!done) { print "provision:"; print "  - mode: system"; print "    script: " s } }' "$yaml" > "$tmp" \
+    && cat -- "$tmp" > "$yaml"
+  rm -f -- "$tmp"
+}
+
+# mac_colima ask|yes -> Colima from Homebrew (a Linux VM with Docker): a VM with Apple's virtualization and
+# Rosetta, vm.max_map_count in it, and its start at login (brew services)
+mac_colima() {
+  local mode="$1" osver t cpus mem yaml
+  local -a args=()
+  if [ "$(id -u)" -eq 0 ]; then
+    err "On macOS run $SCRIPT_NAME as your normal user, not as root: Colima belongs to the user."
+    return 1
+  fi
+  osver="$(sw_vers -productVersion 2>/dev/null)" || osver=""
+  if [[ "${osver%%.*}" =~ ^[0-9]+$ ]] && [ "${osver%%.*}" -lt 13 ]; then
+    err "macOS $osver is too old for Colima: macOS 13 or newer is needed (Apple's virtualization)."
+    return 1
+  fi
+  mac_brew_tools "$mode" colima docker || return 1
+  yaml="$(mac_colima_yaml)"
+  if ! colima status >/dev/null 2>&1; then
+    if [ -f "$yaml" ]; then
+      t="$(sed -n 's/^vmType:[[:space:]]*//p' "$yaml")"
+      t="${t%%$'\n'*}"
+      if [ "$(engine_arch)" = "arm64" ] && [ -n "$t" ] && [ "$t" != "vz" ]; then
+        err "The Colima VM runs with $t, which cannot use Rosetta for the amd64 Catalog images."
+        echo "  The Catalog needs a VM with Apple's virtualization. Removing it deletes its containers and data:"
+        echo "      colima delete, then start $SCRIPT_NAME again."
+        return 1
+      fi
+      info "Starting the Colima VM: colima start"
+      colima start || return 1
+    else
+      read -r cpus mem <<< "$(mac_vm_size)"
+      args=(--vm-type=vz)
+      if [ "$(engine_arch)" = "arm64" ]; then
+        args+=(--vz-rosetta)
+      fi
+      args+=(--cpu "$cpus" --memory "$((mem / 1024))" --disk 100)
+      info "A Colima VM (Linux with Docker) will be created: $cpus CPUs, $((mem / 1024)) GB memory, 100 GB disk."
+      echo "      colima start ${args[*]}"
+      if [ "$mode" = "ask" ] && ! confirm "Create it now?" y; then
+        info "No Colima VM was created."
+        return 1
+      fi
+      colima start "${args[@]}" || return 1
+    fi
+  fi
+  # the context colima exists from the first start on: the docker command talks to this VM
+  mac_docker_pin
+  if [ "$(engine_arch)" = "arm64" ] && ! mac_colima_rosetta_on; then
+    err "Rosetta does not run in the Colima VM, and the Catalog images (amd64) need it."
+    echo "  Update Colima (brew upgrade colima), or create a new VM with Rosetta (its containers and data are lost):"
+    echo "      colima delete, then start $SCRIPT_NAME again."
+    return 1
+  fi
+  if mac_kernel_problem; then
+    mac_kernel_error
+    return 1
+  fi
+  t="$(colima ssh -- sysctl -n vm.max_map_count 2>/dev/null)" || t=0
+  t="${t//[^0-9]/}"
+  if [ "${t:-0}" -lt 262144 ]; then
+    colima ssh -- sudo sysctl -w vm.max_map_count=262144 >/dev/null 2>&1 || true
+  fi
+  mac_colima_provision
+  if [ "$(brew services list 2>/dev/null | awk '$1 == "colima" { print $2 }')" != "started" ]; then
+    info "Colima does not start by itself after a restart of the Mac. Homebrew can start it when you log in"
+    echo "  (brew services start colima); the Catalog then comes back by itself."
+    if [ "$mode" = "yes" ] || confirm "Start Colima at login?" y; then
+      if brew services start colima >/dev/null 2>&1; then
+        ok "Colima starts when you log in."
+      else
+        warn "brew services start colima failed - after a restart of the Mac, start it yourself: colima start"
+      fi
+    fi
+  fi
+  COMPOSE=()
+}
+
+# engine_offer -> in a terminal: when the engine is not ready, says why and offers to set it up
+engine_offer() {
   if [ ! -t 0 ] || engine_ready; then
     return 0
   fi
-  if [ "$OS_KIND" != "Darwin" ] && [ "$(id -u)" -ne 0 ]; then
+  if [ "$ENGINE" = "podman" ] && [ "$OS_KIND" != "Darwin" ] && [ "$(id -u)" -ne 0 ]; then
     warn "Prerequisites are not met: run $SCRIPT_NAME as root (sudo) - the Catalog uses rootful Podman."
     echo
     return 0
   fi
   detect_compose >/dev/null 2>&1 || true
-  warn "Prerequisites are not met: ${COMPOSE_PROBLEM:-Podman is not ready for the Catalog}"
-  podman_setup ask || true
+  warn "Prerequisites are not met: ${COMPOSE_PROBLEM:-$ENGINE_NAME is not ready for the Catalog}"
+  engine_setup ask || true
   echo
 }
 
-# podman_setup ask|yes -> everything the stack needs: Podman, its services or machine, and Docker Compose
+# engine_setup ask|yes -> everything the stack needs with the engine of this folder: the engine, its
+# services or Linux VM, and Docker Compose. An empty CONTAINER_ENGINE is set to it afterwards.
+engine_setup() {
+  local mode="${1:-ask}"
+  engine_guard || return 1
+  case "$ENGINE_KIND" in
+    podman) podman_setup "$mode" || return 1 ;;
+    *) docker_setup "$mode" || return 1 ;;
+  esac
+  if [ -z "$CONTAINER_ENGINE" ] && [ -n "$SCRIPT_PATH" ] && [ -w "$SCRIPT_PATH" ] && set_setting CONTAINER_ENGINE "$ENGINE_KIND"; then
+    CONTAINER_ENGINE="$ENGINE_KIND"
+    ok "CONTAINER_ENGINE = \"$ENGINE_KIND\": this folder uses $ENGINE_NAME from now on."
+  fi
+}
+
+# podman_setup ask|yes -> Podman, its services or machine, and Docker Compose
 podman_setup() {
   local mode="${1:-ask}"
   if ! use_sudo; then
@@ -968,7 +1910,169 @@ podman_setup() {
     install_podman_linux "$mode" || return 1
   fi
   install_compose_provider "$mode" || return 1
-  require_podman
+  require_engine
+}
+
+# True when Docker comes from the packages of this Linux (openSUSE, SLES): their Docker Compose is old,
+# the installer keeps the newest one as Docker's plugin
+docker_from_distro() {
+  [ "$OS_KIND" != "Darwin" ] && [[ " $(os_release ID) $(os_release ID_LIKE) " == *suse* || "$(os_release ID)" == sles* ]]
+}
+
+# docker_setup ask|yes -> Docker Engine and its service (Linux), Docker Desktop or Colima (macOS), and
+# the newest Docker Compose from GitHub when Docker has none, an old one of its distribution, or the
+# installer's own
+docker_setup() {
+  local mode="${1:-ask}"
+  if ! use_sudo; then
+    err "Setting up Docker needs root: run $SCRIPT_NAME as root, or install sudo."
+    return 1
+  fi
+  case "$OS_KIND:$ENGINE_KIND" in
+    Darwin:colima) mac_colima "$mode" || return 1 ;;
+    Darwin:*) mac_docker_desktop "$mode" || return 1 ;;
+    *) install_docker_linux "$mode" || return 1 ;;
+  esac
+  if [ "$OS_KIND" = "Darwin" ]; then
+    mac_docker_pin
+  fi
+  if compose_own || docker_from_distro || ! detect_compose >/dev/null 2>&1; then
+    install_compose_provider "$mode" || return 1
+  fi
+  require_engine
+}
+
+# engine_cli_setup KIND -> the commands install-podman and install-docker: set up KIND when the folder
+# uses it or has not chosen yet
+engine_cli_setup() {
+  if [ -n "$CONTAINER_ENGINE" ] && [ "$CONTAINER_ENGINE" != "$1" ]; then
+    err "This folder uses CONTAINER_ENGINE=\"$CONTAINER_ENGINE\" - './$SCRIPT_NAME install-engine' sets that up (option 1 changes it)."
+    return 1
+  fi
+  engine_use "$1"
+  engine_setup yes
+}
+
+# engine_not_here KIND -> why KIND cannot run the Catalog on this machine (empty when it can)
+engine_not_here() {
+  local osver major v
+  osver="$(sw_vers -productVersion 2>/dev/null)" || osver=""
+  major="${osver%%.*}"
+  case "$OS_KIND:$1" in
+    Darwin:podman)
+      if [ "$(engine_arch)" != "arm64" ]; then
+        echo "Intel Macs are not supported: Podman runs only on Apple Silicon (M1 or newer)."
+      elif [[ "$major" =~ ^[0-9]+$ ]] && [ "$major" -lt 26 ]; then
+        echo "macOS $osver is too old for Podman: Rosetta in the Podman machine needs macOS 26 (Tahoe) or newer."
+      fi
+      ;;
+    Darwin:docker)
+      if ! mac_docker_app >/dev/null && ! ( engine_use docker; docker info >/dev/null 2>&1 ) && [[ "$major" =~ ^[0-9]+$ ]] && [ "$major" -lt 14 ]; then
+        echo "macOS $osver is too old for Docker Desktop: macOS 14 or newer is needed."
+      fi
+      ;;
+    Darwin:colima)
+      if [[ "$major" =~ ^[0-9]+$ ]] && [ "$major" -lt 13 ]; then
+        echo "macOS $osver is too old for Colima: macOS 13 or newer is needed (Apple's virtualization)."
+      fi
+      ;;
+    *:colima) echo "Colima runs only on macOS." ;;
+    *:podman)
+      if command -v podman >/dev/null 2>&1; then
+        v="$(engine_use podman; engine_version)"
+        if [ -z "$v" ] || version_gt "$PODMAN_MIN" "$v"; then
+          echo "Podman ${v:-(unknown version)} is too old: $PODMAN_MIN or newer is needed."
+        fi
+      elif [ ! -d "${RN1_SYSTEMD_DIR:-/run/systemd/system}" ]; then
+        echo "This Linux does not run systemd, which rootful Podman needs here."
+      else
+        podman_install_plan 2>&1 >/dev/null || true
+      fi
+      ;;
+    *:docker)
+      if [ "$(engine_arch)" != "amd64" ]; then
+        echo "The Catalog images exist only for amd64 (x86_64); this machine is $(uname -m 2>/dev/null)."
+      elif docker_is_snap; then
+        docker_snap_problem
+        echo
+      elif ! command -v docker >/dev/null 2>&1 || docker_is_podman; then
+        if [ ! -d "${RN1_SYSTEMD_DIR:-/run/systemd/system}" ]; then
+          echo "This Linux does not run systemd, which Docker needs here."
+        else
+          docker_install_plan 2>&1 >/dev/null || true
+        fi
+      fi
+      ;;
+  esac
+}
+
+# engine_choices -> the engines of this machine, one per line: KIND|LABEL|STATE|REASON. STATE is data
+# (it holds the containers or volumes of this folder's project), ready, installed (setup does the rest)
+# or missing (setup installs it). REASON says why KIND cannot be chosen here; empty when it can. When
+# engines hold data, only they can be chosen.
+engine_choices() {
+  local kind label state reason holders="" k
+  for k in $(engine_kinds); do
+    if engine_has_data "$k"; then
+      holders="$holders $k"
+    fi
+  done
+  holders="${holders# }"
+  for kind in $(engine_kinds); do
+    case "$OS_KIND:$kind" in
+      *:podman) label="Podman" ;;
+      Darwin:docker) label="Docker Desktop" ;;
+      *:docker) label="Docker Engine" ;;
+      *) label="Colima" ;;
+    esac
+    reason="$(engine_not_here "$kind")"
+    reason="${reason%%$'\n'*}"
+    if [[ " $holders " == *" $kind "* ]]; then
+      state="data"
+    elif ( engine_use "$kind"; engine_ready ); then
+      state="ready"
+    elif [ "$kind" = "podman" ] && command -v podman >/dev/null 2>&1; then
+      state="installed"
+    elif [ "$kind" = "colima" ] && command -v colima >/dev/null 2>&1; then
+      state="installed"
+    elif [ "$OS_KIND:$kind" = "Darwin:docker" ] && mac_docker_app >/dev/null; then
+      state="installed"
+    elif [ "$OS_KIND:$kind" != "Darwin:docker" ] && [ "$kind" = "docker" ] && command -v docker >/dev/null 2>&1 && ! docker_is_podman; then
+      state="installed"
+    else
+      state="missing"
+    fi
+    if [ "$state" != "data" ] && [ -n "$holders" ]; then
+      reason="The containers or data volumes of this installation are in $(kinds_text "$holders") - one engine per server."
+    fi
+    printf '%s|%s|%s|%s\n' "$kind" "$label" "$state" "$reason"
+  done
+}
+
+# engine_choose KIND -> CONTAINER_ENGINE=KIND in the settings of this script, used from now on; fails,
+# with the reason, when KIND cannot be used on this machine
+engine_choose() {
+  local want="$1" kind label state reason found="no"
+  while IFS='|' read -r kind label state reason; do
+    if [ "$kind" = "$want" ]; then
+      found="yes"
+      break
+    fi
+  done <<< "$(engine_choices)"
+  if [ "$found" = "no" ]; then
+    err "Unknown container engine \"$want\" - choose one of: $(if [ "$OS_KIND" = "Darwin" ]; then echo "podman, docker, colima"; else echo "podman, docker"; fi)."
+    return 1
+  fi
+  if [ -n "$reason" ]; then
+    err "$label cannot be used here: $reason"
+    return 1
+  fi
+  if [ "$CONTAINER_ENGINE" != "$want" ]; then
+    set_setting CONTAINER_ENGINE "$want" || return 1
+    CONTAINER_ENGINE="$want"
+  fi
+  engine_use "$want"
+  ok "CONTAINER_ENGINE = \"$want\" ($label)"
 }
 
 compose() {
@@ -986,12 +2090,12 @@ require_files() {
   fi
 }
 
-# Volumes that already belong to this Compose project (empty if none, or if Podman cannot be reached).
+# Volumes that already belong to this Compose project (empty if none, or if the engine cannot be reached).
 project_volumes() {
-  if ! command -v podman >/dev/null 2>&1; then
+  if ! engine_cli; then
     return 0
   fi
-  podman volume ls -q --filter "label=com.docker.compose.project=$(stack_project)" 2>/dev/null || true
+  "$ENGINE" volume ls -q --filter "label=com.docker.compose.project=$(stack_project)" 2>/dev/null || true
 }
 
 # True when the generated files differ from what the current settings would
@@ -1004,7 +2108,7 @@ settings_stale() {
   tmp_env="$(mktemp)" || return 1
   tmp_compose="$(mktemp)" || { rm -f "$tmp_env"; return 1; }
   (
-    for var in MONGO_INITDB_ROOT_PASSWORD MINIO_ROOT_PASSWORD RABBITMQ_DEFAULT_PASS; do
+    for var in MONGO_INITDB_ROOT_PASSWORD MINIO_ROOT_PASSWORD RABBITMQ_DEFAULT_PASS NPM_ADMIN_PASSWORD; do
       printf -v "$var" '%s' "$(env_value "$var")"
     done
     ENV_FILE="$tmp_env"
@@ -1444,7 +2548,12 @@ set_version_cli() {
 
 MANIFEST_TYPES="application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.docker.distribution.manifest.v2+json, application/vnd.oci.image.manifest.v1+json"
 UPD_KEYS=(opensearch mongo rabbitmq minio npm)
+# Release series Raynet runs with the Catalog (8.0 = 8.0.x, 2 = 2.x.y, empty = any); raised when Raynet moves its own servers, installations get it with the installer update.
+declare -A SERIES_ALLOWED=([mongo]="8.0" [opensearch]="2" [rabbitmq]="3" [npm]="2" [minio]="")
+# The moving tag inside each series, for when the registry cannot be read (empty: the tag stays)
+declare -A SERIES_TAG=([mongo]="8.0" [opensearch]="2" [rabbitmq]="3.13-management-alpine" [npm]="2" [minio]="")
 declare -A UPD_VERSIONS=() UPD_RESOLVED=()
+UPD_MONGO_HERE=""
 UPD_CATALOG_OK="0"
 UPD_CHECKED=""
 REG_HOST=""
@@ -1537,6 +2646,107 @@ is_exact_tag() {
     fi
   done
   return 1
+}
+
+# in_series KEY VERSION -> true when VERSION (or a tag like 3.13-management-alpine) lies inside the
+# allowed series of KEY; without a series every version does
+in_series() {
+  local s="${SERIES_ALLOWED[$1]-}" core
+  if [ -z "$s" ]; then
+    return 0
+  fi
+  core="$(version_core "$2")"
+  [ "$core" = "$s" ] || [[ "$core" == "$s".* ]]
+}
+
+# The versions of KEY in the registry that lie inside its allowed series, newest first.
+series_versions() {
+  local v
+  while IFS= read -r v; do
+    if [ -n "$v" ] && in_series "$1" "$v"; then
+      printf '%s\n' "$v"
+    fi
+  done <<< "${UPD_VERSIONS[$1]-}"
+}
+
+# The version recommended for KEY: the newest inside its allowed series (empty: registry not reachable).
+recommended_version() {
+  local v
+  while IFS= read -r v; do
+    if [ -n "$v" ] && in_series "$1" "$v"; then
+      printf '%s' "$v"
+      return 0
+    fi
+  done <<< "${UPD_VERSIONS[$1]-}"
+}
+
+# upd_current KEY TAG -> the exact version behind TAG (after component_info KEY): TAG itself when it
+# is exact; for MongoDB the version that runs here (a moving tag such as "8" can point further in the
+# registry than the binary that runs); else the version the registry resolves TAG to (empty: unknown)
+upd_current() {
+  if [[ "$2" =~ $(kind_regex "$C_KIND") ]]; then
+    printf '%s' "$2"
+  elif [ "$1" = "mongo" ] && [ -n "$UPD_MONGO_HERE" ]; then
+    printf '%s' "$UPD_MONGO_HERE"
+  else
+    printf '%s' "${UPD_RESOLVED[$1]-}"
+  fi
+}
+
+# The Catalog version recommended: always the newest one on Docker Hub.
+recommended_catalog() {
+  printf '%s' "${HUB_VERSIONS%%$'\n'*}"
+}
+
+series_name() {
+  case "$1" in
+    mongo) printf 'MongoDB' ;;
+    opensearch) printf 'OpenSearch' ;;
+    rabbitmq) printf 'RabbitMQ' ;;
+    minio) printf 'MinIO' ;;
+    npm) printf 'Nginx Proxy Manager' ;;
+  esac
+}
+
+# The series of the newest version of KEY when the registry has one newer than the allowed series
+# ("4" for RabbitMQ 4.3.6 next to the series 3), empty otherwise.
+newer_series() {
+  local s="${SERIES_ALLOWED[$1]-}" newest rec dots
+  newest="${UPD_VERSIONS[$1]-}"
+  newest="${newest%%$'\n'*}"
+  if [ -z "$s" ] || [ -z "$newest" ] || in_series "$1" "$newest"; then
+    return 0
+  fi
+  rec="$(recommended_version "$1")"
+  if [ -n "$rec" ] && ! version_gt "$(version_core "$newest")" "$(version_core "$rec")"; then
+    return 0
+  fi
+  dots="${s//[!.]/}"
+  version_core "$newest" | cut -d. -f"1-$((${#dots} + 1))"
+}
+
+# newer_series_note KEY... -> "MongoDB 9.0 and RabbitMQ 4 exist - not released for the Catalog yet"
+# (empty when no newer series exists)
+newer_series_note() {
+  local key s list="" n=0
+  for key in "$@"; do
+    s="$(newer_series "$key")"
+    if [ -n "$s" ]; then
+      list="$list, $(series_name "$key") $s"
+      n=$((n + 1))
+    fi
+  done
+  list="${list#, }"
+  case "$n" in
+    0) ;;
+    1) printf '%s exists - not released for the Catalog yet' "$list" ;;
+    *) printf '%s and %s exist - not released for the Catalog yet' "${list%, *}" "${list##*, }" ;;
+  esac
+}
+
+# rabbitmq_flags_hint FROM TO -> RabbitMQ wants all feature flags enabled before every step
+rabbitmq_flags_hint() {
+  printf 'Before RabbitMQ %s -> %s enable all feature flags (with the stack running): %s exec rabbitmq rabbitmqctl enable_feature_flag all' "$1" "$2" "$ENGINE"
 }
 
 # Sets REG_HOST, REG_REPO and REG_AUTH (anonymous pull token) for an image name.
@@ -1669,12 +2879,14 @@ fetch_component() {
   [ -n "$versions" ]
 }
 
-# Checks all components in parallel; results come back through files.
+# Checks all components in parallel; results come back through files. Ctrl+C stops the checks and
+# returns 130 (nothing is changed); the traps of the caller (the menu's Ctrl+C) come back afterwards.
 collect_updates() {
-  local key tmp
+  local key tmp traps stopped=""
   info "Checking Docker Hub and GHCR for new versions..."
-  tmp="$(mktemp -d)"
-  trap 'kill $(jobs -p) 2>/dev/null; rm -rf -- "$tmp"; exit 130' INT TERM
+  tmp="$(mktemp -d)" || return 1
+  traps="$(trap -p INT TERM)"
+  trap 'stopped="yes"; kill $(jobs -p) 2>/dev/null || true' INT TERM
   (
     if fetch_hub_versions; then
       printf '%s' "$HUB_VERSIONS" > "$tmp/catalog.versions"
@@ -1689,8 +2901,15 @@ collect_updates() {
       printf '%s' "${UPD_RESOLVED[$key]-}" > "$tmp/$key.resolved"
     ) &
   done
-  wait
+  until wait; do
+    :
+  done
   trap - INT TERM
+  eval "$traps"
+  if [ -n "$stopped" ]; then
+    rm -rf -- "$tmp"
+    return 130
+  fi
   UPD_CATALOG_OK="0"
   HUB_VERSIONS=""
   HUB_STABLE=""
@@ -1710,18 +2929,33 @@ collect_updates() {
     fi
   done
   rm -rf -- "$tmp"
+  UPD_MONGO_HERE=""
+  if ! is_exact_tag "$MONGO_TAG" && remove_compose_ok; then
+    UPD_MONGO_HERE="$(mongo_running_version)"
+  fi
   UPD_CHECKED="$(date +%H:%M)"
 }
 
-# Sets ST_TEXT and ST_COLOR for a component row.
+# Sets ST_TEXT and ST_COLOR for a row: the current version against the recommended one, the newest
+# inside the allowed series of KEY (the Catalog has none).
+# row_status KIND RESOLVED VERSIONS [KEY]
 row_status() {
-  local kind="$1" resolved="$2" versions="$3" newest same="" v core major
+  local kind="$1" resolved="$2" versions="$3" key="${4:-catalog}" newest="" v
   ST_COLOR="$C_RED"
   if [ -z "$versions" ]; then
     ST_TEXT="unknown (registry not reachable)"
     return 0
   fi
-  newest="${versions%%$'\n'*}"
+  while IFS= read -r v; do
+    if [ -n "$v" ] && in_series "$key" "$v"; then
+      newest="$v"
+      break
+    fi
+  done <<< "$versions"
+  if [ -z "$newest" ]; then
+    ST_TEXT="no version of the series ${SERIES_ALLOWED[$key]-} found"
+    return 0
+  fi
   if [ -z "$resolved" ]; then
     ST_TEXT="current tag not found in the registry"
     return 0
@@ -1732,30 +2966,17 @@ row_status() {
     return 0
   fi
   ST_COLOR="$C_YLW"
-  if [ "$kind" = "catalog" ] || [ "$kind" = "minio" ]; then
-    if kind_newer "$kind" "$newest" "$resolved"; then
-      ST_TEXT="update available"
-    else
-      ST_TEXT="up to date"
-      ST_COLOR="$C_GRN"
-    fi
-    return 0
-  fi
-  major="$(version_major "$resolved")"
-  while IFS= read -r v; do
-    core="${v%-management-alpine}"
-    if [ "${core%%.*}" = "$major" ]; then
-      same="$v"
-      break
-    fi
-  done <<< "$versions"
-  if [ -n "$same" ] && kind_newer "$kind" "$same" "$resolved"; then
-    ST_TEXT="update available: $(version_core "$same")"
-  elif kind_newer "$kind" "$newest" "$resolved"; then
-    ST_TEXT="major update"
-  else
+  if ! in_series "$key" "$resolved" && kind_newer "$kind" "$resolved" "$newest"; then
+    ST_TEXT="outside the series ${SERIES_ALLOWED[$key]-}"
+  elif ! kind_newer "$kind" "$newest" "$resolved"; then
     ST_TEXT="up to date"
     ST_COLOR="$C_GRN"
+  elif [ "$kind" = "catalog" ] || [ "$kind" = "minio" ]; then
+    ST_TEXT="update available"
+  elif [ "$(version_major "$resolved")" = "$(version_major "$newest")" ]; then
+    ST_TEXT="update available: $(version_core "$newest")"
+  else
+    ST_TEXT="major update"
   fi
 }
 
@@ -1770,7 +2991,7 @@ current_label() {
 }
 
 show_updates() {
-  local i=1 key first tag resolved versions newest cat_resolved w_cur=34 w_new=31 head
+  local i=1 key first tag resolved versions newest cat_resolved w_cur=34 w_new=31 head note
   local -a rows=()
   if [ "$(ui_width)" -lt 112 ]; then
     w_cur=26
@@ -1789,7 +3010,7 @@ show_updates() {
     if [ -z "$cat_resolved" ]; then
       ST_TEXT="version behind the tag unknown"
     fi
-    newest="$(ui_version "${HUB_VERSIONS%%$'\n'*}")"
+    newest="$(ui_version "$(recommended_catalog)")"
   else
     row_status catalog "" ""
     newest="-"
@@ -1802,20 +3023,13 @@ show_updates() {
     first="${C_SETTINGS%% *}"
     tag="${!first}"
     versions="${UPD_VERSIONS[$key]-}"
-    if [[ "$tag" =~ $(kind_regex "$C_KIND") ]]; then
-      resolved="$tag"
-    else
-      resolved="${UPD_RESOLVED[$key]-}"
-    fi
-    row_status "$C_KIND" "$resolved" "$versions"
-    newest="-"
-    if [ -n "$versions" ]; then
-      newest="$(version_core "${versions%%$'\n'*}")"
-    fi
+    resolved="$(upd_current "$key" "$tag")"
+    row_status "$C_KIND" "$resolved" "$versions" "$key"
+    newest="$(version_core "$(recommended_version "$key")")"
     if [ "$key" = "npm" ] && [ "$INSTALL_NGINX_PROXY_MANAGER" != "true" ]; then
       ST_TEXT="$ST_TEXT (disabled)"
     fi
-    rows+=("$(ui_pad "$C_BLD$i$C_RST" 4)$(ui_pad "$C_LABEL" 26)$(ui_pad "$(ui_current "$tag" "$resolved")" "$w_cur")$(ui_pad "$newest" "$w_new")$(ui_badge "$ST_TEXT" "$ST_COLOR")")
+    rows+=("$(ui_pad "$C_BLD$i$C_RST" 4)$(ui_pad "$C_LABEL" 26)$(ui_pad "$(ui_current "$tag" "$resolved")" "$w_cur")$(ui_pad "${newest:--}" "$w_new")$(ui_badge "$ST_TEXT" "$ST_COLOR")")
   done
 
   head="Checked $UPD_CHECKED $UI_SEP Docker Hub and GHCR $UI_SEP linux/amd64"
@@ -1823,70 +3037,99 @@ show_updates() {
     head="$head $UI_SEP $ENV_FILE has Catalog $(env_value CATALOG_IMAGE | sed 's/.*://')"
   fi
   ui_screen "Updates" "$head"
-  printf '  %s\n' "$C_DIM$(ui_pad "#" 4)$(ui_pad "COMPONENT" 26)$(ui_pad "CURRENT" "$w_cur")$(ui_pad "NEWEST" "$w_new")STATUS$C_RST"
+  printf '  %s\n' "$C_DIM$(ui_pad "#" 4)$(ui_pad "COMPONENT" 26)$(ui_pad "CURRENT" "$w_cur")$(ui_pad "RECOMMENDED" "$w_new")STATUS$C_RST"
   printf '  %s\n' "${rows[@]}"
+  echo
+  printf '  %s\n' "${C_DIM}Recommended: the newest Catalog $UI_SEP the others: the newest of the series Raynet runs$C_RST"
+  note="$(newer_series_note mongo opensearch rabbitmq minio npm)"
+  if [ -n "$note" ]; then
+    printf '  %s\n' "$C_DIM$note$C_RST"
+  fi
 }
 
-# Up to 4 versions, newest first: the 2 newest of the current major, the newest
-# of the next major (upgrades go one major at a time), the newest overall, then
-# the next newest ones. With "x.0" the next major means its .0 series (MongoDB
-# upgrades 7.0 -> 8.0 -> later 8.x).
+# Up to 4 versions of a list inside one allowed series, newest first: the newest of every release
+# line (X.Y) from the current one on, then the next newest ones.
+# pick_list VERSIONS CURRENT
 pick_list() {
-  awk -F. -v cur="$2" -v series="${3:-}" '
-    { v[NR] = $0; m[NR] = $1 }
+  awk -F. -v cur="$(version_core "${2:-}")" '
+    BEGIN { split(cur, c, "."); num = (c[1] ~ /^[0-9]+$/) }
+    { v[NR] = $0; line = $1 "." $2 }
+    $1 ~ /^[0-9]+$/ && !(line in seen) && n < 4 {
+      seen[line] = 1
+      if (!num || $1 + 0 > c[1] + 0 || ($1 + 0 == c[1] + 0 && $2 + 0 >= c[2] + 0)) { pick[NR] = 1; n++ }
+    }
     END {
-      for (i = 1; i <= NR && c < 2; i++) if (m[i] == cur) { pick[i] = 1; c++ }
-      if (cur ~ /^[0-9]+$/) for (i = 1; i <= NR; i++) {
-        if (series == "x.0" && index(v[i], (cur + 1) ".0.") != 1) continue
-        if (m[i] == cur + 1) { pick[i] = 1; break }
-      }
-      if (NR > 0) pick[1] = 1
-      for (i = 1; i <= NR; i++) if (pick[i]) n++
       for (i = 1; i <= NR && n < 4; i++) if (!pick[i]) { pick[i] = 1; n++ }
       for (i = 1; i <= NR; i++) if (pick[i]) print v[i]
     }' <<< "$1"
 }
 
+# list_tag LIST CHOICE -> the entry of LIST that is CHOICE, or whose version is CHOICE (3.13.7 for
+# 3.13.7-management-alpine); empty when there is none
+list_tag() {
+  local v
+  while IFS= read -r v; do
+    if [ -n "$v" ] && { [ "$v" = "$2" ] || [ "$(version_core "$v")" = "$2" ]; }; then
+      printf '%s' "$v"
+      return 0
+    fi
+  done <<< "$1"
+}
+
+# Option 8, rows 2-6: another version of a component, only inside its allowed series.
 pick_component() {
-  local key="$1" first tag resolved versions list choice selected="" count i=0 v marker cur_major sel_major setting last_series
+  local key="$1" first tag resolved versions list choice selected="" count i=0 v marker cur_major sel_major setting last_series series rec note
+  local -a box=()
   component_info "$key"
   first="${C_SETTINGS%% *}"
   tag="${!first}"
-  versions="${UPD_VERSIONS[$key]-}"
-  if [ -z "$versions" ]; then
+  series="${SERIES_ALLOWED[$key]-}"
+  if [ -z "${UPD_VERSIONS[$key]-}" ]; then
     err "No versions known for $C_LABEL (registry not reachable) - try r) Check again."
     return 1
   fi
-  if [[ "$tag" =~ $(kind_regex "$C_KIND") ]]; then
-    resolved="$tag"
-  else
-    resolved="${UPD_RESOLVED[$key]-}"
+  versions="$(series_versions "$key")"
+  if [ -z "$versions" ]; then
+    err "The registry has no version of $C_LABEL in the series $series."
+    return 1
   fi
+  resolved="$(upd_current "$key" "$tag")"
   cur_major="$(version_major "${resolved:-$tag}")"
-  if [ "$key" = "mongo" ]; then
-    list="$(pick_list "$versions" "$cur_major" x.0)"
-  else
-    list="$(pick_list "$versions" "$cur_major")"
-  fi
+  rec="${versions%%$'\n'*}"
+  list="$(pick_list "$versions" "${resolved:-$tag}")"
   count="$(count_lines "$list")"
+  note="$(newer_series_note "$key")"
+  box=("Current: $C_BLD$(ui_current "$tag" "$resolved")$C_RST   $C_DIM$UI_SEP images: $C_IMAGES$C_RST")
+  if [ -n "$series" ]; then
+    box+=("${C_DIM}Series $series: the versions Raynet runs with the Catalog$C_RST")
+    if ! in_series "$key" "${resolved:-$tag}"; then
+      box+=("$C_YLW$(version_core "${resolved:-$tag}") is outside the series$C_RST")
+    fi
+  fi
 
   while [ -z "$selected" ]; do
     echo
-    ui_box "$(ui_width)" "$C_LABEL" "Current: $C_BLD$(ui_current "$tag" "$resolved")$C_RST   $C_DIM$UI_SEP images: $C_IMAGES$C_RST"
+    ui_box "$(ui_width)" "$C_LABEL" "${box[@]}"
     i=0
     while IFS= read -r v; do
       i=$((i + 1))
       marker=""
       if [ "$v" = "$resolved" ]; then
         marker="  $C_GRN$UI_DOT current$C_RST"
-      elif [ "$C_KIND" != "minio" ] && [[ "$cur_major" =~ ^[0-9]+$ ]] && [ "$(version_major "$v")" -gt "$cur_major" ]; then
-        marker="  $C_MAG$UI_MAJOR major update$C_RST"
+      elif [ "$v" = "$rec" ]; then
+        marker="  $C_GRN$UI_OK recommended$C_RST"
+      fi
+      if [ "$v" != "$resolved" ] && [ "$C_KIND" != "minio" ] && [[ "$cur_major" =~ ^[0-9]+$ ]] && [ "$(version_major "$v")" -gt "$cur_major" ]; then
+        marker="$marker  $C_MAG$UI_MAJOR major update$C_RST"
       fi
       if [ "$key" = "mongo" ] && [ "$(version_major "$v")" -ge 8 ] && kernel_blocks_mongo8; then
         marker="$marker  ${C_DIM}with the kernel workaround$C_RST"
       fi
       printf '   %s  %s%s\n' "$C_BLD$i$C_RST" "$(ui_pad "$(version_core "$v")" 30)" "$marker"
     done <<< "$list"
+    if [ -n "$note" ]; then
+      printf '      %s\n' "$C_DIM$note$C_RST"
+    fi
     printf '   %s  %s\n' "${C_BLD}0$C_RST" "${C_DIM}cancel$C_RST"
     echo
     ui_ask choice "Select a version [0]:" || choice="0"
@@ -1896,15 +3139,20 @@ pick_component() {
       return 0
     elif [[ "$choice" =~ ^[0-9]+$ ]] && [ "$choice" -ge 1 ] && [ "$choice" -le "$count" ]; then
       selected="$(sed -n "${choice}p" <<< "$list")"
-    elif grep -qxF -- "$choice" <<< "$versions"; then
-      selected="$choice"
     else
-      warn "Invalid choice: $choice"
+      v="$(list_tag "$versions" "$choice")"
+      if [ -n "$v" ]; then
+        selected="$v"
+      elif [ -n "$(list_tag "${UPD_VERSIONS[$key]}" "$choice")" ]; then
+        warn "$choice is outside the series $series Raynet runs with the Catalog - it is not offered."
+      else
+        warn "Invalid choice: $choice"
+      fi
     fi
   done
 
   if [ "$selected" = "$tag" ]; then
-    info "$selected is already selected."
+    info "$(version_core "$selected") is already selected."
     return 0
   fi
   sel_major="$(version_major "$selected")"
@@ -1919,19 +3167,21 @@ pick_component() {
       opensearch) warn "OpenSearch $cur_major.x -> $sel_major.x is a major upgrade: take a snapshot first, there is no way back." ;;
       mongo)
         warn "MongoDB upgrades one release series at a time (e.g. 7.0 -> 8.0); upgraded data cannot be downgraded."
-        last_series="$(grep -E "^$cur_major\." <<< "$versions" | head -n 1 | cut -d. -f1-2)" || last_series=""
+        last_series="$(grep -E "^$cur_major\." <<< "${UPD_VERSIONS[$key]}" | head -n 1 | cut -d. -f1-2)" || last_series=""
         case "$(cut -d. -f1-2 <<< "$resolved")" in
           "$cur_major.0"|"$last_series"|"") ;;
-          *) warn "MongoDB $sel_major.0 can only be reached from $cur_major.0 or $last_series - upgrade to $(grep -F "$last_series." <<< "$versions" | head -n 1) first." ;;
+          *) warn "MongoDB $sel_major.0 can only be reached from $cur_major.0 or $last_series - upgrade to $(grep -F "$last_series." <<< "${UPD_VERSIONS[$key]}" | head -n 1) first." ;;
         esac
         ;;
-      rabbitmq) warn "Before RabbitMQ $cur_major.x -> $sel_major.x enable all feature flags (with the stack running): podman exec rabbitmq rabbitmqctl enable_feature_flag all" ;;
+      rabbitmq) warn "$(rabbitmq_flags_hint "$cur_major.x" "$sel_major.x")" ;;
       *) warn "$C_LABEL $cur_major.x -> $sel_major.x is a major upgrade - check its release notes." ;;
     esac
     if ! confirm "Select $(version_core "$selected")?" n; then
       info "Cancelled - nothing was changed."
       return 0
     fi
+  elif [ "$key" = "rabbitmq" ] && [ -n "$resolved" ] && [ "$resolved" != "$selected" ]; then
+    warn "$(rabbitmq_flags_hint "$(version_core "$resolved")" "$(version_core "$selected")")"
   fi
   if [ "$key" = "mongo" ] && [[ "$sel_major" =~ ^[0-9]+$ ]] && [ "$sel_major" -ge 8 ] && kernel_blocks_mongo8; then
     info "MongoDB $sel_major on this kernel ($(engine_kernel)) starts with GLIBC_TUNABLES=glibc.pthread.rseq=1 (SERVER-121912);"
@@ -1950,14 +3200,16 @@ pin_floating_tags() {
     component_info "$key"
     first="${C_SETTINGS%% *}"
     tag="${!first}"
-    resolved="${UPD_RESOLVED[$key]-}"
     if is_exact_tag "$tag"; then
       continue
     fi
+    resolved="$(upd_current "$key" "$tag")"
     if [ -z "$resolved" ]; then
       warn "$C_LABEL: the version behind \"$tag\" is unknown - not pinned."
     elif ! grep -qxF -- "$resolved" <<< "${UPD_VERSIONS[$key]-}"; then
       warn "$C_LABEL: $resolved is not available for all images ($C_IMAGES) - not pinned."
+    elif ! in_series "$key" "$resolved"; then
+      warn "$C_LABEL: \"$tag\" points to $(version_core "$resolved"), outside the series ${SERIES_ALLOWED[$key]} Raynet runs - not pinned; pick a version of the series instead."
     else
       for setting in $C_SETTINGS; do
         set_setting "$setting" "$resolved"
@@ -1995,6 +3247,9 @@ reload_settings() {
       CATALOG_VERSION|OPENSEARCH_TAG|OPENSEARCH_DASHBOARDS_TAG|MONGO_TAG|RABBITMQ_TAG|MINIO_TAG|NGINX_PROXY_MANAGER_TAG|TZ|AUTOSYNC_CRON|VULNERABILITIES_CACHING_CRON)
         printf -v "$name" '%s' "$value"
         ;;
+      CATALOG_DOMAIN|NPM_ADMIN_EMAIL|INSTALL_NGINX_PROXY_MANAGER|BASEURL)
+        printf -v "$name" '%s' "$value"
+        ;;
     esac
   done < <(settings_pairs "$SCRIPT_PATH")
 }
@@ -2005,7 +3260,7 @@ do_updates() {
     err "curl is needed to check for updates ($(pkg_hint curl))."
     return 1
   fi
-  collect_updates
+  collect_updates || return $?
   while true; do
     show_updates
     echo
@@ -2015,7 +3270,7 @@ do_updates() {
       1) run_action select_version no-apply; reload_settings; ui_pause_tty ;;
       [2-6]) run_action pick_component "${UPD_KEYS[$((choice - 2))]}"; reload_settings; ui_pause_tty ;;
       p|P) run_action pin_floating_tags; reload_settings; ui_pause_tty ;;
-      r|R) collect_updates ;;
+      r|R) collect_updates || return $? ;;
       s|S) run_action apply_updates; reload_settings; ui_pause_tty ;;
       d|D) run_action download_bundle; reload_settings; ui_pause_tty ;;
       0|"") return 0 ;;
@@ -2029,15 +3284,363 @@ show_updates_cli() {
     err "curl is needed to check for updates ($(pkg_hint curl))."
     return 1
   fi
-  collect_updates
+  collect_updates || return $?
   show_updates
+}
+
+# set_settings_atomic NAME|VALUE... -> writes the settings into this script all at once (into a copy
+# first, then over the script): either all of them change or none
+set_settings_atomic() {
+  local spec copy backup
+  if [ "$#" -eq 0 ]; then
+    return 0
+  fi
+  if [ -z "$SCRIPT_PATH" ] || [ ! -w "$SCRIPT_PATH" ]; then
+    err "${SCRIPT_PATH:-This installer} cannot be changed (not a writable file) - nothing was changed."
+    return 1
+  fi
+  copy="$(mktemp)" || return 1
+  if ! cp -- "$SCRIPT_PATH" "$copy"; then
+    rm -f -- "$copy"
+    err "Nothing was changed."
+    return 1
+  fi
+  for spec in "$@"; do
+    if ! set_setting "${spec%%|*}" "${spec#*|}" "$copy"; then
+      rm -f -- "$copy"
+      err "Nothing was changed."
+      return 1
+    fi
+  done
+  if ! backup="$(script_backup)"; then
+    rm -f -- "$copy"
+    err "Cannot write next to $SCRIPT_PATH - nothing was changed."
+    return 1
+  fi
+  if ! cat -- "$copy" > "$SCRIPT_PATH"; then
+    rm -f -- "$copy"
+    cat -- "$backup" > "$SCRIPT_PATH" 2>/dev/null || true
+    err "Cannot write $SCRIPT_PATH. If it is damaged, the previous version is $backup."
+    return 1
+  fi
+  rm -f -- "$copy" "$backup"
+  for spec in "$@"; do
+    printf -v "${spec%%|*}" '%s' "${spec#*|}"
+  done
+}
+
+VERSION_PICKED=""
+
+# One row of the versions screen: another version for KEY (the Catalog: any of its versions; the
+# others: only inside their series). Sets VERSION_PICKED; returns 1 for back, 2 at the end of input.
+# choose_versions_row KEY CURRENT SELECTED INSTALLED(yes|no)
+choose_versions_row() {
+  local key="$1" resolved="$2" selected="$3" installed="$4" versions list rec count i v marker choice label kind series="" note=""
+  VERSION_PICKED=""
+  if [ "$key" = "catalog" ]; then
+    label="Catalog"
+    kind="catalog"
+    versions="$HUB_VERSIONS"
+    list="$(sed -n '1,4p' <<< "$versions")"
+    rec="$(recommended_catalog)"
+  else
+    component_info "$key"
+    label="$C_LABEL"
+    kind="$C_KIND"
+    series="${SERIES_ALLOWED[$key]-}"
+    versions="$(series_versions "$key")"
+    list="$(pick_list "$versions" "$resolved")"
+    rec="${versions%%$'\n'*}"
+    note="$(newer_series_note "$key")"
+  fi
+  if [ -z "$versions" ]; then
+    warn "No versions known for $label (registry not reachable)."
+    return 1
+  fi
+  count="$(count_lines "$list")"
+  while true; do
+    echo
+    if [ -n "$series" ]; then
+      printf '  %s   %s\n' "$C_BLD$label$C_RST" "${C_DIM}series $series: the versions Raynet runs with the Catalog$C_RST"
+    else
+      printf '  %s\n' "$C_BLD$label$C_RST"
+    fi
+    i=0
+    while IFS= read -r v; do
+      i=$((i + 1))
+      marker=""
+      if [ "$key" = "catalog" ] && [ -n "$HUB_STABLE" ] && [ "$v" = "$HUB_STABLE" ]; then
+        marker="  $C_YLW$UI_STAR stable$C_RST"
+      fi
+      if [ "$v" = "$rec" ]; then
+        marker="$marker  $C_GRN$UI_OK recommended$C_RST"
+      fi
+      if [ "$v" = "$selected" ]; then
+        marker="$marker  $C_CYN$UI_DOT selected$C_RST"
+      fi
+      if [ "$installed" = "yes" ] && [ "$v" = "$resolved" ]; then
+        marker="$marker  ${C_DIM}installed$C_RST"
+      fi
+      printf '   %s  %s%s\n' "$C_BLD$i$C_RST" "$(ui_pad "$(version_core "$v")" 30)" "$marker"
+    done <<< "$list"
+    if [ -n "$note" ]; then
+      printf '      %s\n' "$C_DIM$note$C_RST"
+    fi
+    printf '   %s  %s\n' "${C_BLD}0$C_RST" "${C_DIM}back$C_RST"
+    echo
+    ui_ask choice "Select a version, or type one [0]:" || return 2
+    choice="${choice:-0}"
+    if [ "$choice" = "0" ]; then
+      return 1
+    elif [[ "$choice" =~ ^[0-9]+$ ]] && [ "$choice" -ge 1 ] && [ "$choice" -le "$count" ]; then
+      VERSION_PICKED="$(sed -n "${choice}p" <<< "$list")"
+    else
+      VERSION_PICKED="$(list_tag "$versions" "$choice")"
+      if [ -z "$VERSION_PICKED" ]; then
+        if [ "$key" != "catalog" ] && [ -n "$(list_tag "${UPD_VERSIONS[$key]-}" "$choice")" ]; then
+          warn "$choice is outside the series $series Raynet runs with the Catalog - it is not offered."
+        else
+          warn "Invalid choice: $choice"
+        fi
+        continue
+      fi
+    fi
+    if [ "$key" = "catalog" ] && [ "$installed" = "yes" ] && [ "$VERSION_PICKED" != "$selected" ] \
+      && { [ -z "$resolved" ] || kind_newer catalog "$VERSION_PICKED" "$resolved"; }; then
+      warn "U or option 21 upgrades the Catalog of an installation (MongoDB backup, health check, rollback) - not this screen."
+      continue
+    fi
+    if [ "$installed" = "yes" ] && [ -n "$resolved" ] && kind_newer "$kind" "$resolved" "$VERSION_PICKED"; then
+      warn "$(version_core "$VERSION_PICKED") is OLDER than the installed $(version_core "$resolved") - downgrades can fail with existing data."
+    fi
+    return 0
+  done
+}
+
+# The versions step of the install wizard: one row per component with its current value and the
+# recommended version (the Catalog: the newest; the others: the newest of their allowed series).
+# Enter takes the table, a row number picks another version of that row; then the exact tags are
+# written all at once. In a folder that is installed already, the Catalog and versions outside the
+# series are kept (U and option 8 change them). Returns 1 when cancelled or at the end of input:
+# nothing was changed then.
+choose_versions() {
+  local -a keys=(catalog mongo opensearch rabbitmq minio) cur=() res=() sel=() marks=() recs=() specs=()
+  local key i choice first tag resolved rec installed="no" hub_down="no" reg_down="" note spec label curtext seltext mark rc row
+  local w_cur=0 w_sel=30
+  if [ "$INSTALL_NGINX_PROXY_MANAGER" = "true" ]; then
+    keys+=(npm)
+  fi
+  if [ -z "$SCRIPT_PATH" ] || [ ! -w "$SCRIPT_PATH" ]; then
+    err "The installer must be a writable file (it keeps the versions)."
+    return 1
+  fi
+  if wiz_installed; then
+    installed="yes"
+  fi
+  if ! collect_updates; then
+    echo
+    info "Cancelled - nothing was changed."
+    return 1
+  fi
+  for i in "${!keys[@]}"; do
+    key="${keys[i]}"
+    if [ "$key" = "catalog" ]; then
+      cur[i]="$CATALOG_VERSION"
+      res[i]=""
+      tag="$(env_value CATALOG_IMAGE)"
+      tag="${tag##*:}"
+      if [ "$installed" = "yes" ] && is_version "$tag"; then
+        res[i]="$tag"
+      elif is_version "$CATALOG_VERSION"; then
+        res[i]="$CATALOG_VERSION"
+      fi
+      rec="$(recommended_catalog)"
+      recs[i]="$rec"
+      if [ -z "$rec" ]; then
+        hub_down="yes"
+        sel[i]="$CATALOG_VERSION"
+        marks[i]="kept"
+      elif [ "$installed" = "yes" ] && [ "$rec" != "$CATALOG_VERSION" ]; then
+        sel[i]="$CATALOG_VERSION"
+        marks[i]="kept"
+        info "The Catalog stays $CATALOG_VERSION in this installation - U upgrades it with backup and rollback."
+      else
+        sel[i]="$rec"
+        marks[i]="recommended"
+      fi
+      continue
+    fi
+    component_info "$key"
+    first="${C_SETTINGS%% *}"
+    tag="${!first}"
+    resolved="$(upd_current "$key" "$tag")"
+    cur[i]="$tag"
+    res[i]="$resolved"
+    rec="$(recommended_version "$key")"
+    recs[i]="$rec"
+    if [ -z "$rec" ]; then
+      # without the registry: an exact version inside the series stays, other tags become the moving
+      # tag of the series (in an installation a tag outside the series stays)
+      reg_down="$reg_down, $(series_name "$key")"
+      sel[i]="$tag"
+      marks[i]="kept"
+      if [ -n "${SERIES_TAG[$key]-}" ] && [ "$tag" != "${SERIES_TAG[$key]}" ]; then
+        if { in_series "$key" "$tag" && ! [[ "$tag" =~ $(kind_regex "$C_KIND") ]]; } || { ! in_series "$key" "$tag" && [ "$installed" = "no" ]; }; then
+          sel[i]="${SERIES_TAG[$key]}"
+          marks[i]="series tag"
+        fi
+      fi
+    elif [ "$installed" = "yes" ] && ! in_series "$key" "${resolved:-$tag}"; then
+      sel[i]="$tag"
+      marks[i]="kept"
+      if [ -n "$resolved" ] && kind_newer "$C_KIND" "$resolved" "$rec"; then
+        warn "$C_LABEL $(version_core "$resolved") is outside the series ${SERIES_ALLOWED[$key]} Raynet runs with the Catalog - kept: it is never downgraded automatically."
+      else
+        warn "$C_LABEL $(version_core "${resolved:-$tag}") is outside the series ${SERIES_ALLOWED[$key]} Raynet runs with the Catalog - kept here; option 8 changes it."
+      fi
+    else
+      sel[i]="$rec"
+      marks[i]="recommended"
+      if [ "$installed" = "yes" ] && [ "$key" = "rabbitmq" ] && [ -n "$resolved" ] && [ "$resolved" != "$rec" ]; then
+        warn "$(rabbitmq_flags_hint "$(version_core "$resolved")" "$(version_core "$rec")")"
+      fi
+    fi
+  done
+  if [ "$hub_down" = "yes" ]; then
+    warn "Docker Hub could not be read (no internet access, or a proxy is needed): the Catalog stays $CATALOG_VERSION."
+  fi
+  if [ -n "$reg_down" ]; then
+    reg_down="${reg_down#, }"
+    if [[ "$reg_down" == *", "* ]]; then
+      reg_down="${reg_down%, *} and ${reg_down##*, }"
+    fi
+    warn "The versions of $reg_down could not be read:"
+    warn "    an exact version inside the series stays, other tags become the moving tag of the series."
+  fi
+  if [ "$(ui_width)" -ge 112 ]; then
+    w_cur=35
+    w_sel=35
+  elif [ "$(ui_width)" -ge 100 ]; then
+    w_cur=29
+    w_sel=29
+  fi
+  note="$(newer_series_note "${keys[@]:1}")"
+
+  while true; do
+    echo
+    ui_box "$(ui_width)" "Versions" \
+      "Recommended: the newest Catalog, and for the other components the newest" \
+      "version of the series Raynet runs with the Catalog."
+    if [ "$w_cur" -gt 0 ]; then
+      printf '  %s\n' "$C_DIM$(ui_pad "#" 3)$(ui_pad "COMPONENT" 24)$(ui_pad "CURRENT" "$w_cur")SELECTED$C_RST"
+    else
+      printf '  %s\n' "$C_DIM$(ui_pad "#" 3)$(ui_pad "COMPONENT" 24)SELECTED$C_RST"
+    fi
+    for i in "${!keys[@]}"; do
+      key="${keys[i]}"
+      if [ "$key" = "catalog" ]; then
+        label="Catalog + 4 workers"
+        curtext="${cur[i]}"
+        seltext="$(ui_version "${sel[i]}")"
+      else
+        component_info "$key"
+        label="$C_LABEL"
+        curtext="$(ui_current "$(version_core "${cur[i]}")" "$(version_core "${res[i]}")")"
+        seltext="$(version_core "${sel[i]}")"
+      fi
+      case "${marks[i]}" in
+        recommended) mark="$C_GRN$UI_OK recommended$C_RST" ;;
+        kept) mark="${C_DIM}kept$C_RST" ;;
+        "series tag") mark="$C_YLW${UI_DOT} series tag$C_RST" ;;
+        *) mark="$C_CYN$UI_DOT your choice$C_RST" ;;
+      esac
+      row="$(ui_pad "$C_BLD$((i + 1))$C_RST" 3)$(ui_pad "$label" 24)"
+      if [ "$w_cur" -gt 0 ]; then
+        row="$row$(ui_pad "$curtext" $((w_cur - 1))) "
+      fi
+      printf '  %s\n' "$row$(ui_pad "$seltext" $((w_sel - 1))) $mark"
+      # narrow terminals: the current value of an installation on a line of its own
+      if [ "$w_cur" -eq 0 ] && [ "$installed" = "yes" ] && [ "${cur[i]}" != "${sel[i]}" ]; then
+        printf '  %s\n' "$(ui_pad "" 27)${C_DIM}now ${curtext//$C_RST/$C_RST$C_DIM}$C_RST"
+      fi
+    done
+    if [ -n "$note" ] && [ "${#note}" -gt $(($(ui_width) - 4)) ]; then
+      printf '  %s\n' "$C_DIM${note%% - *}$C_RST" "$C_DIM- ${note#* - }$C_RST"
+    elif [ -n "$note" ]; then
+      printf '  %s\n' "$C_DIM$note$C_RST"
+    fi
+    echo
+    ui_keys "Enter|use the selected versions" "1-${#keys[@]}|another version for that row" "0|cancel"
+    if ! ui_ask choice "Enter, or a row:"; then
+      echo
+      info "No answer - nothing was changed."
+      return 1
+    fi
+    case "$choice" in
+      "") break ;;
+      0)
+        info "Cancelled - nothing was changed."
+        return 1
+        ;;
+    esac
+    if ! [[ "$choice" =~ ^[0-9]+$ ]] || [ "$choice" -lt 1 ] || [ "$choice" -gt "${#keys[@]}" ]; then
+      warn "Invalid choice: $choice"
+      continue
+    fi
+    i=$((choice - 1))
+    rc=0
+    choose_versions_row "${keys[i]}" "${res[i]}" "${sel[i]}" "$installed" || rc=$?
+    case "$rc" in
+      0)
+        sel[i]="$VERSION_PICKED"
+        if [ "$VERSION_PICKED" = "${recs[i]}" ]; then
+          marks[i]="recommended"
+        elif [ "$VERSION_PICKED" = "${cur[i]}" ]; then
+          marks[i]="kept"
+        else
+          marks[i]="chosen"
+        fi
+        ;;
+      2)
+        echo
+        info "No answer - nothing was changed."
+        return 1
+        ;;
+    esac
+  done
+
+  for i in "${!keys[@]}"; do
+    key="${keys[i]}"
+    if [ "$key" = "catalog" ]; then
+      if [ "${sel[i]}" != "$CATALOG_VERSION" ]; then
+        specs+=("CATALOG_VERSION|${sel[i]}")
+      fi
+      continue
+    fi
+    component_info "$key"
+    for first in $C_SETTINGS; do
+      if [ "${!first}" != "${sel[i]}" ]; then
+        specs+=("$first|${sel[i]}")
+      fi
+    done
+  done
+  if [ "${#specs[@]}" -eq 0 ]; then
+    ok "The versions stay as they are."
+    return 0
+  fi
+  if ! set_settings_atomic "${specs[@]}"; then
+    return 1
+  fi
+  for spec in "${specs[@]}"; do
+    ok "${spec%%|*} = \"${spec#*|}\""
+  done
 }
 
 # Offline bundle
 
 container_engine() {
-  if command -v podman >/dev/null 2>&1 && podman info >/dev/null 2>&1; then
-    printf 'podman'
+  if engine_cli && "$ENGINE" info >/dev/null 2>&1; then
+    printf '%s' "$ENGINE"
   else
     return 1
   fi
@@ -2078,10 +3681,19 @@ progress_bar() {
   printf '\r       %-5s [%s%s] %3d%%  %s / %s    ' "$label" "${bar// /#}" "${pad// /-}" "$pct" "$(human_size "$cur")" "$(human_size "$total")"
 }
 
-# save_image ENGINE REF FILE EXPECTED_BYTES [LABEL]
+# save_image ENGINE REF FILE EXPECTED_BYTES [LABEL] - Podman writes a docker-archive; Docker saves the
+# amd64 image only, where it can choose (the containerd image store keeps more than one platform)
 save_image() {
-  local engine="$1" ref="$2" out="$3" total="$4" label="${5:-Saving}" pid cur
-  podman save --format docker-archive -o "$out" "$ref" &
+  local engine="$1" ref="$2" out="$3" total="$4" label="${5:-Saving}" pid cur help
+  local -a cmd=(podman save --format docker-archive)
+  if [ "$engine" = "docker" ]; then
+    cmd=(docker save)
+    help="$(docker save --help 2>&1)" || help=""
+    if [[ "$help" == *--platform* ]]; then
+      cmd+=(--platform linux/amd64)
+    fi
+  fi
+  "${cmd[@]}" -o "$out" "$ref" &
   pid=$!
   if [ -n "$JOB_DIR" ]; then
     job_watch_bytes "$pid" "$out" "$total" "$label"
@@ -2120,18 +3732,44 @@ fi
 set -euo pipefail
 cd -- "$(dirname -- "$(readlink -f -- "$0")")"
 
-engine="podman"
-if ! command -v podman >/dev/null 2>&1; then
+# the engine of the installer next to this script (CONTAINER_ENGINE), else the one installed here
+is_podman_shim() {
+  case "$(docker --version 2>/dev/null)" in
+    *[Pp]odman*) return 0 ;;
+  esac
+  return 1
+}
+engine="$(sed -n 's/^CONTAINER_ENGINE="\([a-z]*\)"$/\1/p' ./@INSTALLER@ 2>/dev/null)" || engine=""
+engine="${engine%%$'\n'*}"
+case "$engine" in
+  podman|docker) ;;
+  colima) engine="docker" ;;
+  *)
+    if command -v podman >/dev/null 2>&1; then
+      engine="podman"
+    elif command -v docker >/dev/null 2>&1 && ! is_podman_shim; then
+      engine="docker"
+    else
+      echo "ERROR Neither Podman nor Docker is installed on this machine - the installer sets one up (install-engine)." >&2
+      exit 1
+    fi
+    ;;
+esac
+if [ "$engine" = "podman" ] && ! command -v podman >/dev/null 2>&1; then
   echo "ERROR Podman is not installed on this machine - the installer sets it up (install-podman)." >&2
   exit 1
 fi
-if [ "$(uname -s)" = "Linux" ] && [ "$(id -u)" -ne 0 ]; then
+if [ "$engine" = "docker" ] && { ! command -v docker >/dev/null 2>&1 || is_podman_shim; }; then
+  echo "ERROR Docker is not installed on this machine - the installer sets it up (install-docker)." >&2
+  exit 1
+fi
+if [ "$engine" = "podman" ] && [ "$(uname -s)" = "Linux" ] && [ "$(id -u)" -ne 0 ]; then
   echo "ERROR Run it as root (sudo ./import-images.sh): the Catalog runs in the Podman of root, which does not see images loaded by $(id -un)." >&2
   exit 1
 fi
 echo "==> Container engine: $engine"
 
-# Docker Hub names as Podman stores them (podman tag with a short name would create localhost/...)
+# Docker Hub names as the engine stores them (podman tag with a short name would create localhost/...)
 qualify() {
   local first="${1%%/*}"
   if [[ "$1" == */* ]] && { [[ "$first" == *.* ]] || [[ "$first" == *:* ]] || [ "$first" = "localhost" ]; }; then
@@ -2183,18 +3821,42 @@ done < images.txt
 
 echo
 echo "$loaded image(s) loaded, $failed failed."
-# the API socket "podman compose" needs, and the restart of the containers after a reboot
+# Podman: the API socket "podman compose" needs, and the restart of the containers after a reboot;
+# Docker: its daemon (it restarts the containers itself)
 if [ "$(uname -s)" = "Linux" ] && command -v systemctl >/dev/null 2>&1 && [ -d "${RN1_SYSTEMD_DIR:-/run/systemd/system}" ]; then
-  systemctl enable --now podman.socket >/dev/null 2>&1 || echo "WARNING podman.socket could not be started: systemctl enable --now podman.socket" >&2
-  systemctl enable podman-restart.service >/dev/null 2>&1 || true
+  if [ "$engine" = "podman" ]; then
+    systemctl enable --now podman.socket >/dev/null 2>&1 || echo "WARNING podman.socket could not be started: systemctl enable --now podman.socket" >&2
+    systemctl enable podman-restart.service >/dev/null 2>&1 || true
+  elif [ "$(id -u)" -eq 0 ]; then
+    systemctl enable --now docker >/dev/null 2>&1 || echo "WARNING Docker could not be started: systemctl enable --now docker" >&2
+  fi
 fi
-# Docker Compose (the engine behind "podman compose") from the bundle, when this server has none or
-# another one - the installed one stays when the bundled one does not work with this Podman
+# compose_works FILE -> true when the Docker Compose FILE works with the engine here
+compose_works() {
+  if [ "$engine" = "docker" ]; then
+    "$1" ls -q >/dev/null 2>&1
+  else
+    PODMAN_COMPOSE_PROVIDER="$1" PODMAN_COMPOSE_WARNING_LOGS=false podman compose ls -q >/dev/null 2>&1
+  fi
+}
+# Docker Compose from the bundle, when this server has none or another one: the engine behind "podman
+# compose", or the Compose plugin of a Docker that has none - the installed one stays when the bundled
+# one does not work with this engine
 if [ -f compose/docker-compose-linux-x86_64 ] && [ "$(id -u)" -eq 0 ]; then
   target="${RN1_COMPOSE_TARGET:-/usr/local/lib/docker/cli-plugins/docker-compose}"
-  if [ ! -x "$target" ] || ! cmp -s compose/docker-compose-linux-x86_64 "$target"; then
-    if [ -x "$target" ] && ! PODMAN_COMPOSE_PROVIDER="$PWD/compose/docker-compose-linux-x86_64" PODMAN_COMPOSE_WARNING_LOGS=false podman compose ls -q >/dev/null 2>&1; then
-      echo "WARNING The Docker Compose of the bundle does not work with this Podman - the installed one stays." >&2
+  wanted="yes"
+  if [ "$engine" = "docker" ] && [ ! -f "$target" ]; then
+    # Docker's own Compose 2 or newer (v2.40.3, or 2.40.3+ds1-... in the packages of the distributions)
+    v="$(docker compose version 2>/dev/null | head -n 1)" || v=""
+    v="${v#Docker Compose version }"
+    v="${v#v}"
+    if [[ "${v%%.*}" =~ ^[0-9]+$ ]] && [ "${v%%.*}" -ge 2 ]; then
+      wanted="no"
+    fi
+  fi
+  if [ "$wanted" = "yes" ] && { [ ! -x "$target" ] || ! cmp -s compose/docker-compose-linux-x86_64 "$target"; }; then
+    if [ -x "$target" ] && ! compose_works "$PWD/compose/docker-compose-linux-x86_64"; then
+      echo "WARNING The Docker Compose of the bundle does not work with this $(if [ "$engine" = "podman" ]; then echo Podman; else echo Docker; fi) - the installed one stays." >&2
     else
       mkdir -p "${target%/*}"
       if [ -x "$target" ]; then
@@ -2215,7 +3877,8 @@ IMPORT_EOF
 }
 
 # bundle_compose DIR -> DIR/compose/docker-compose-linux-x86_64: the newest Docker Compose for the
-# offline server (the engine behind "podman compose"); import-images.sh installs it there
+# offline server (the engine behind "podman compose", or Docker's Compose plugin); import-images.sh
+# installs it there
 bundle_compose() {
   local dir="$1" tag url exp got
   if ! command -v curl >/dev/null 2>&1; then
@@ -2531,7 +4194,7 @@ download_bundle() {
   local mode="${1:-interactive}" engine ref choice tok base name dir count=0 i floating=0 archive_wanted="no" scp_wanted="no" scp_rc
   local -a images=() picked=() toks=() refs=()
   if ! engine="$(container_engine)"; then
-    err "Downloading needs Podman on this machine ('./$SCRIPT_NAME install-podman' sets it up)."
+    err "Downloading needs $ENGINE_NAME on this machine ('./$SCRIPT_NAME $(engine_install_cmd)' sets it up)."
     return 1
   fi
   while IFS= read -r ref; do
@@ -2728,6 +4391,8 @@ bundle_build() {
     cp -- "$SCRIPT_PATH" "$dir/$installer"
     chmod u+w "$dir/$installer"
     set_setting CHECK_FOR_UPDATES false "$dir/$installer"
+    # the engine of this machine is not the one of the target: there the installer finds it
+    set_setting CONTAINER_ENGINE "" "$dir/$installer"
     chmod +x "$dir/$installer"
   fi
   write_import_script "$dir/import-images.sh" "${installer:-rn1-technology-catalog-installer.sh}"
@@ -3619,7 +5284,7 @@ catalog_fixed_upload_limit() {
 upload_limit() {
   local version value num unit
   version=""
-  if command -v podman >/dev/null 2>&1 && detect_compose 2>/dev/null; then
+  if engine_cli && detect_compose 2>/dev/null; then
     version="$(running_tag catalog-web 2>/dev/null)" || version=""
   fi
   if ! [[ "$version" =~ ^[0-9]+\. ]]; then
@@ -3942,7 +5607,7 @@ running_tag() {
   if [ -z "$id" ]; then
     return 0
   fi
-  image="$(podman container inspect --format '{{.Config.Image}}' "$id" 2>/dev/null)" || image=""
+  image="$("$ENGINE" container inspect --format '{{.Config.Image}}' "$id" 2>/dev/null)" || image=""
   printf '%s' "${image##*:}"
 }
 
@@ -3950,12 +5615,12 @@ mongo_running_version() {
   local id
   id="$(compose ps -q mongo 2>/dev/null | head -n 1)" || id=""
   if [ -n "$id" ]; then
-    podman exec "$id" mongod --version 2>/dev/null | sed -n 's/^db version v//p' | head -n 1 || true
+    "$ENGINE" exec "$id" mongod --version 2>/dev/null | sed -n 's/^db version v//p' | head -n 1 || true
   fi
 }
 
 # Waits until every service runs (and is healthy where it has a healthcheck) and Catalog Web answers.
-# The timeout is wall-clock time: each round also spends time in podman and curl.
+# The timeout is wall-clock time: each round also spends time in the engine and curl.
 stack_health() {
   local timeout="${1:-$HEALTH_TIMEOUT}" start="$SECONDS" waited=0 shown=0 svc id state health restarts bad code warned i
   local -a services=() ids=() seen=()
@@ -3981,7 +5646,7 @@ stack_health() {
         bad="$bad $svc(missing)"
         continue
       fi
-      IFS='|' read -r state health restarts <<< "$(podman container inspect --format '{{.State.Status}}|{{with .State.Health}}{{or .Status "none"}}{{else}}none{{end}}|{{.RestartCount}}' "$id" 2>/dev/null)" || true
+      IFS='|' read -r state health restarts <<< "$("$ENGINE" container inspect --format '{{.State.Status}}|{{with .State.Health}}{{or .Status "none"}}{{else}}none{{end}}|{{.RestartCount}}' "$id" 2>/dev/null)" || true
       if [ -z "${state:-}" ]; then
         ids[$i]=""
       fi
@@ -4035,7 +5700,7 @@ mongo_backup() {
   job_step "MongoDB backup"
   BACKUP_PARTIAL="$file"
   id="$(compose ps -q mongo 2>/dev/null | head -n 1)" || id=""
-  if [ -n "$id" ] && (umask 077 && podman exec "$id" sh -c '
+  if [ -n "$id" ] && (umask 077 && "$ENGINE" exec "$id" sh -c '
       umask 077
       printf "password: \"%s\"\n" "$MONGO_INITDB_ROOT_PASSWORD" > /tmp/.rvc-dump.yml
       mongodump --quiet --archive --gzip --config=/tmp/.rvc-dump.yml \
@@ -4055,23 +5720,17 @@ mongo_backup() {
   fi
 }
 
-# Series of a version for patch updates: MongoDB, OpenSearch and RabbitMQ X.Y, Nginx Proxy Manager X.
-version_series() {
-  local key="$1" core
-  core="$(version_core "$2")"
-  case "$key" in
-    npm) printf '%s' "${core%%.*}" ;;
-    minio) printf 'RELEASE' ;;
-    *) printf '%s' "$(cut -d. -f1-2 <<< "$core")" ;;
-  esac
-}
-
-# Same-series updates of the infrastructure components (MongoDB 8.0.4 -> 8.0.32 and so on).
+# Updates of the infrastructure components inside their allowed series: patch and minor steps
+# (MongoDB 8.0.4 -> 8.0.32, OpenSearch 2.17 -> 2.19, RabbitMQ 3.12 -> 3.13). A version outside the
+# series is only named, never changed here.
 offer_patch_updates() {
-  local key first tag current series newest v count=0 i choice tok mongo_running
+  local key first tag current rec count=0 i choice tok mongo_running
   local -a keys=() froms=() tos=() picked=() toks=() specs=()
   mongo_running="$(mongo_running_version)"
   for key in "${UPD_KEYS[@]}"; do
+    if [ "$key" = "npm" ] && [ "$INSTALL_NGINX_PROXY_MANAGER" != "true" ]; then
+      continue
+    fi
     component_info "$key"
     first="${C_SETTINGS%% *}"
     tag="${!first}"
@@ -4082,37 +5741,43 @@ offer_patch_updates() {
     else
       current="${UPD_RESOLVED[$key]-}"
     fi
-    if [ -z "$current" ] || [ -z "${UPD_VERSIONS[$key]-}" ]; then
+    rec="$(recommended_version "$key")"
+    if [ -z "$current" ] || [ -z "$rec" ]; then
       continue
     fi
-    series="$(version_series "$key" "$current")"
-    newest=""
-    while IFS= read -r v; do
-      if [ "$(version_series "$key" "$v")" = "$series" ]; then
-        newest="$v"
-        break
+    if ! in_series "$key" "$current"; then
+      if kind_newer "$C_KIND" "$current" "$rec"; then
+        warn "$C_LABEL $(version_core "$current") runs here, outside the series ${SERIES_ALLOWED[$key]} Raynet runs with the Catalog - it is kept (never downgraded automatically)."
+      else
+        info "$C_LABEL $(version_core "$current") runs here. $(version_core "$rec") of the series ${SERIES_ALLOWED[$key]} is an upgrade for option 8 (Updates)."
       fi
-    done <<< "${UPD_VERSIONS[$key]}"
-    if [ -n "$newest" ] && kind_newer "$C_KIND" "$newest" "$current"; then
+      continue
+    fi
+    if kind_newer "$C_KIND" "$rec" "$current"; then
       keys+=("$key")
       froms+=("$current")
-      tos+=("$newest")
+      tos+=("$rec")
       picked+=(1)
+      if ! is_exact_tag "$tag" && ! in_series "$key" "$tag"; then
+        warn "$C_LABEL uses the moving tag \"$tag\", which can leave the series ${SERIES_ALLOWED[$key]} with a later pull - the update below pins $(version_core "$rec")."
+      fi
+    elif ! is_exact_tag "$tag" && ! in_series "$key" "$tag"; then
+      warn "$C_LABEL uses the moving tag \"$tag\", which can leave the series ${SERIES_ALLOWED[$key]} with a later pull - option 8 sets a version of the series."
     fi
   done
-  if [ "$mongo_running" != "" ] && [ "${mongo_running%%.*}" -lt 8 ] 2>/dev/null; then
-    info "MongoDB ${mongo_running%%.*}.x runs here. MongoDB 8.0 is a major upgrade (Updates, option 8)."
-  fi
   if [ "${#keys[@]}" -eq 0 ]; then
-    ok "MongoDB, OpenSearch, RabbitMQ, MinIO and Nginx Proxy Manager have the newest patch versions of their series."
+    ok "No updates of MongoDB, OpenSearch, RabbitMQ, MinIO or Nginx Proxy Manager inside their series."
     return 0
   fi
   while true; do
     echo
-    ui_box "$(ui_width)" "Patch updates" "Same release series: bug and security fixes, no data migration"
+    ui_box "$(ui_width)" "Patch updates" "Inside the series Raynet runs: fixes and minor steps, no major versions"
     for i in "${!keys[@]}"; do
       component_info "${keys[i]}"
       printf '   %s %s  %s %s -> %s\n' "$(if [ "${picked[i]}" = 1 ]; then printf '%s' "$C_GRN$UI_ON$C_RST"; else printf '%s' "$C_DIM$UI_OFF$C_RST"; fi)" "$C_BLD$((i + 1))$C_RST" "$(ui_pad "$C_LABEL" 26)" "$(version_core "${froms[i]}")" "$C_GRN$(version_core "${tos[i]}")$C_RST"
+      if [ "${keys[i]}" = "rabbitmq" ]; then
+        printf '         %s\n' "$C_YLW$(rabbitmq_flags_hint "$(version_core "${froms[i]}")" "$(version_core "${tos[i]}")")$C_RST"
+      fi
     done
     echo
     ui_keys "1-${#keys[@]}|toggle" "Enter|apply the selected ones" "0|skip"
@@ -4150,10 +5815,24 @@ offer_patch_updates() {
 PATCH_CHANGES=()
 PATCH_STAGE=""
 
-# Worker: patch_apply NAME|OLD|NEW... - a cancel or an error before the services run goes back
+setting_service() {
+  case "$1" in
+    OPENSEARCH_TAG) printf 'opensearch' ;;
+    OPENSEARCH_DASHBOARDS_TAG) printf 'opensearch-dashboards' ;;
+    MONGO_TAG) printf 'mongo' ;;
+    RABBITMQ_TAG) printf 'rabbitmq' ;;
+    MINIO_TAG) printf 'minio' ;;
+    NGINX_PROXY_MANAGER_TAG) printf 'nginx-proxy-manager' ;;
+  esac
+}
+
+# Worker: patch_apply NAME|OLD|NEW... - a cancel or an error before the services run goes back. Only
+# the changed services are pulled: the moving tag of another one (MongoDB "8") must not move with it.
 patch_apply() {
-  local spec name old new
-  require_podman || return 1
+  local spec name old new svc
+  local -a services=()
+  require_engine || return 1
+  engine_guard || return 1
   PATCH_CHANGES=("$@")
   JOB_CLEANUP="patch_cleanup"
   PATCH_STAGE="pull"
@@ -4161,11 +5840,15 @@ patch_apply() {
     IFS='|' read -r name old new <<< "$spec"
     set_setting "$name" "$new"
     printf -v "$name" '%s' "$new"
+    svc="$(setting_service "$name")"
+    if [ -n "$svc" ]; then
+      services+=("$svc")
+    fi
   done
   do_generate keep no-next
   job_step "Pulling the new images"
   info "Pulling the new images"
-  compose pull
+  compose pull ${services[@]+"${services[@]}"}
   PATCH_STAGE="switch"
   job_step "Recreating the changed services"
   info "Recreating the changed services"
@@ -4216,20 +5899,21 @@ upgrade_offer_rollback() {
 do_upgrade() {
   local installed target backup="no" rc
   require_files || return 1
-  require_podman || return 1
+  require_engine || return 1
+  engine_guard || return 1
   sibling_guard || return 1
   upgrade_offer_rollback || return 0
   if ! command -v curl >/dev/null 2>&1; then
     err "curl is needed ($(pkg_hint curl))."
     return 1
   fi
-  collect_updates
+  collect_updates || return $?
   installed="$(running_tag catalog-web)"
   if [ -z "$installed" ]; then
     installed="$(env_value CATALOG_IMAGE)"
     installed="${installed##*:}"
   fi
-  target="${HUB_STABLE:-${HUB_VERSIONS%%$'\n'*}}"
+  target="$(recommended_catalog)"
   if [ -z "$target" ]; then
     err "The available Catalog versions could not be read from Docker Hub."
     return 1
@@ -4246,9 +5930,9 @@ do_upgrade() {
  Upgrade plan
    1. MongoDB backup (recommended; the new version may migrate the database)
    2. Pull the images of $target while the old version still runs
-   3. podman compose down (data volumes are kept)
+   3. $ENGINE compose down (data volumes are kept)
    4. CATALOG_VERSION $installed -> $target, regenerate the files (passwords are kept)
-   5. podman compose up -d
+   5. $ENGINE compose up -d
    6. Health check of all services and Catalog Web
  It runs as a background job: closing the SSH session does not stop it, and a cancel
  before step 3 changes nothing while a cancel after it goes back to $installed.
@@ -4312,7 +5996,7 @@ upgrade_cleanup() {
 # Worker: upgrade_run TARGET INSTALLED BACKUP(yes|no)
 upgrade_run() {
   local target="$1" installed="$2" backup="$3"
-  require_podman || return 1
+  require_engine || return 1
   UPG_OLD="$CATALOG_VERSION"
   JOB_CLEANUP="upgrade_cleanup"
   rm -f -- "$UPGRADE_FAILED_FILE"
@@ -4338,11 +6022,11 @@ upgrade_run() {
     return 1
   fi
   UPG_STAGE="switch"
-  job_step "podman compose down"
-  info "Stopping the stack (podman compose down)"
+  job_step "$ENGINE compose down"
+  info "Stopping the stack ($ENGINE compose down)"
   compose down --remove-orphans
   job_step "Starting $target"
-  info "Starting $target (podman compose up -d)"
+  info "Starting $target ($ENGINE compose up -d)"
   compose up -d --remove-orphans
   if stack_health && [ "$(running_tag catalog-web)" = "$target" ]; then
     UPG_STAGE=""
@@ -4361,7 +6045,8 @@ upgrade_run() {
 # Worker: upgrade_rollback OLD TARGET BACKUP
 upgrade_rollback() {
   local old="$1" target="$2" backup="$3"
-  require_podman || return 1
+  require_engine || return 1
+  engine_guard || return 1
   rm -f -- "$UPGRADE_FAILED_FILE"
   UPG_OLD="$old"
   upgrade_revert_settings
@@ -4370,7 +6055,7 @@ upgrade_rollback() {
   stack_health || true
   if [ -n "$backup" ]; then
     warn "If $target already migrated the database, restore the backup:"
-    echo "      podman exec -i \"\$(podman compose ps -q mongo)\" sh -c 'mongorestore --drop --archive --gzip -u \"\$MONGO_INITDB_ROOT_USERNAME\" -p \"\$MONGO_INITDB_ROOT_PASSWORD\" --authenticationDatabase admin' < $backup"
+    echo "      $ENGINE exec -i \"\$($ENGINE compose ps -q mongo)\" sh -c 'mongorestore --drop --archive --gzip -u \"\$MONGO_INITDB_ROOT_USERNAME\" -p \"\$MONGO_INITDB_ROOT_PASSWORD\" --authenticationDatabase admin' < $backup"
   fi
 }
 
@@ -4485,17 +6170,18 @@ project_name_of() {
 # catalog_web_containers TEMPLATE -> the catalog-web containers of all projects, formatted
 catalog_web_containers() {
   local ids
-  ids="$(podman ps -aq --filter "label=com.docker.compose.service=catalog-web" 2>/dev/null)" || ids=""
+  ids="$("$ENGINE" ps -aq --filter "label=com.docker.compose.service=catalog-web" 2>/dev/null)" || ids=""
   if [ -n "$ids" ]; then
     # shellcheck disable=SC2086
-    podman container inspect --format "$1" $ids 2>/dev/null || true
+    "$ENGINE" container inspect --format "$1" $ids 2>/dev/null || true
   fi
 }
 
 # Existing Catalog installations, one per line: project|folder|compose file|env file|image|status
+# (the containers of the engine this folder uses, and compose files in the usual places)
 find_installations() {
   local project dir cfg envf image status f d seen=" "
-  if command -v podman >/dev/null 2>&1; then
+  if engine_cli; then
     while IFS='|' read -r project dir cfg envf image status; do
       if [ -z "$dir" ] || { [ "$dir" = "$WORK_DIR" ] || [ "$dir" -ef "$WORK_DIR" ]; } || [[ "$seen" == *" $dir "* ]]; then
         continue
@@ -4527,7 +6213,7 @@ find_compose_files() {
     -o \( -name docker-compose.yml -o -name docker-compose.yaml -o -name compose.yml -o -name compose.yaml \) -print 2>/dev/null || true
 }
 
-# A value of an env file as Docker Compose (behind podman compose) reads it: the text inside single or double quotes, or
+# A value of an env file as Docker Compose reads it: the text inside single or double quotes, or
 # the text before an inline " #" comment.
 env_unquote() {
   local v="$1" rest
@@ -5407,7 +7093,7 @@ job_busy() {
       printf '%s' "$id"
       return 0
     fi
-  done < <(job_running_ids)
+  done <<< "$(job_running_ids)"
 }
 
 # Keeps the newest 25 finished jobs.
@@ -6065,32 +7751,34 @@ cron_label() {
   esac
 }
 
-# Offers TZ = time zone of this server and converts the cron settings, so that the jobs keep
-# running at the same moments. "force" asks again after an earlier "no".
+# tz_offer_alignment [force|wizard] -> offers TZ = time zone of this server and converts the cron settings,
+# so that the jobs keep running at the same moments. "force" asks again after an earlier "no"; in a guided
+# task (wizard) 0 stops it. TZ_STOPPED: stopped, or the input ended (nothing was changed).
 tz_offer_alignment() {
-  local force="${1:-}" host from name value newval spec question copy answer backup sib default="y" hint="[Y/n]"
+  local mode="${1:-}" host from name value newval spec question copy answer backup sib default="y" hint="[Y/n]"
   local -a changes=()
   TZ_CHANGED="false"
+  TZ_STOPPED="false"
   reload_settings
   host="$(host_timezone)"
   if [ -z "$host" ]; then
-    if [ "$force" = "force" ]; then
+    if [ "$mode" = "force" ]; then
       warn "The time zone of this server could not be read (timedatectl, /etc/localtime, /etc/timezone)."
     fi
     return 0
   fi
   if tz_same "$host" "$TZ"; then
-    if [ "$force" = "force" ]; then
+    if [ "$mode" = "force" ]; then
       ok "TZ (${TZ:-empty, UTC}) is the time zone of this server."
     fi
     return 0
   fi
-  if [ "$force" != "force" ] && [ -f "$TZ_KEEP_FILE" ] && [ "$(cat -- "$TZ_KEEP_FILE")" = "$TZ|$host" ]; then
+  if [ "$mode" != "force" ] && [ -f "$TZ_KEEP_FILE" ] && [ "$(cat -- "$TZ_KEEP_FILE")" = "$TZ|$host" ]; then
     return 0
   fi
   sib="$(conflicting_sibling)"
   if [ -n "$sib" ]; then
-    if [ "$force" = "force" ]; then
+    if [ "$mode" = "force" ]; then
       warn "$(basename -- "$sib") in this folder has other settings than $SCRIPT_NAME - settle that first. $(sibling_advice "$sib")"
     fi
     return 0
@@ -6136,6 +7824,11 @@ tz_offer_alignment() {
   if ! read -r -p "$question? $hint " answer; then
     echo
     info "No answer - nothing was changed."
+    TZ_STOPPED="true"
+    return 0
+  fi
+  if [ "$mode" = "wizard" ] && [ "$answer" = "0" ]; then
+    TZ_STOPPED="true"
     return 0
   fi
   case "${answer:-$default}" in
@@ -6219,6 +7912,953 @@ timezone_cli() {
 }
 
 ###############################################################################
+# Domain and Nginx Proxy Manager
+###############################################################################
+
+# Nginx Proxy Manager 2.13 and newer has no default user: on its first start it creates the admin from
+# INITIAL_ADMIN_EMAIL (this address when NPM_ADMIN_EMAIL is empty) and INITIAL_ADMIN_PASSWORD.
+NPM_DEFAULT_EMAIL="admin@example.com"
+NPM_MIN_VERSION="2.13.0"
+# the domain whose proxy host has a certificate (written by npm_setup_domain)
+NPM_CERT_FILE="$WORK_DIR/.domain-certificate"
+# the login of the Nginx Proxy Manager admin: the address it was created with or last signed in with,
+# "-" when its admin was not created from .env (no file: it is created from .env on its first start)
+NPM_LOGIN_FILE="$WORK_DIR/.npm-login"
+NPM_TOKEN=""
+NPM_LOGIN=""
+NPM_VERSION=""
+NPM_SETUP=""
+NPM_OUTCOME=""
+NPM_CERT_ID=""
+NPM_CERT_ERROR=""
+DOMAIN_CHANGED="false"
+DOMAIN_DNS=""
+DOMAIN_DNS_NAME=""
+
+# domain_normalize TEXT -> the host name in TEXT in lower case, without scheme, user, port, path and final dot
+domain_normalize() {
+  local d="$1" port_re='^(.*[^:]):[0-9]*$'
+  d="${d//[[:space:]]/}"
+  d="${d#*://}"
+  d="${d%%[/?#]*}"
+  d="${d##*@}"
+  if [[ "$d" =~ $port_re ]]; then
+    d="${BASH_REMATCH[1]}"
+  fi
+  d="${d%.}"
+  printf '%s' "${d,,}"
+}
+
+# domain_valid NAME -> true for a host name in lower case: labels of 1 to 63 letters, digits and hyphens
+# (no hyphen at either end), at least one dot, at most 253 characters
+domain_valid() {
+  local l='[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?' re
+  re="^(${l}\\.)+${l}\$"
+  [ "${#1}" -le 253 ] && [[ "$1" =~ $re ]]
+}
+
+ip_address() {
+  local v4='^[0-9.]+$' v6='^\[?[0-9A-Fa-f:.]+\]?$'
+  [[ "$1" =~ $v4 ]] || { [[ "$1" == *:* ]] && [[ "$1" =~ $v6 ]]; }
+}
+
+email_valid() {
+  local re='^[A-Za-z0-9._%+-]+@[A-Za-z0-9-]+(\.[A-Za-z0-9-]+)*\.[A-Za-z]{2,}$'
+  [[ "$1" =~ $re ]]
+}
+
+# True for names Let's Encrypt gives no certificate for (special-use and private suffixes)
+domain_private() {
+  case "$1" in
+    localhost|*.local|*.lan|*.internal|*.localhost|*.test|*.example|*.invalid) return 0 ;;
+  esac
+  return 1
+}
+
+# True when Let's Encrypt takes EMAIL as contact address: not at example.com, example.net or example.org
+# (it refuses exactly these three), not at a local name
+npm_email_ok() {
+  local d="${1##*@}"
+  d="${d,,}"
+  if ! email_valid "$1" || domain_private "$d"; then
+    return 1
+  fi
+  case "$d" in
+    example.com|example.net|example.org) return 1 ;;
+  esac
+}
+
+# The login Nginx Proxy Manager creates its admin with on its first start (INITIAL_ADMIN_EMAIL of .env)
+npm_login_email() {
+  local e
+  e="$(env_value NPM_ADMIN_EMAIL)"
+  printf '%s' "${e:-$NPM_DEFAULT_EMAIL}"
+}
+
+# The login of the Nginx Proxy Manager admin as far as the installer knows it: the address it was created
+# with or last signed in with (before generating: the one of the settings); empty when its admin was not
+# created from .env (or .env has no password)
+npm_known_login() {
+  local m=""
+  if [ ! -f "$ENV_FILE" ]; then
+    printf '%s' "${NPM_ADMIN_EMAIL:-$NPM_DEFAULT_EMAIL}"
+    return 0
+  fi
+  if [ -z "$(env_value NPM_ADMIN_PASSWORD)" ]; then
+    return 0
+  fi
+  m="$(cat -- "$NPM_LOGIN_FILE" 2>/dev/null)" || m=""
+  case "$m" in
+    -) ;;
+    "") npm_login_email ;;
+    *) printf '%s' "$m" ;;
+  esac
+}
+
+# npm_login_note ADDRESS|-|start|reset -> the login marker. ADDRESS: signed in with it; -: the admin is not
+# the one of .env; start (after compose up): a new Nginx Proxy Manager has created its admin from
+# .env; reset (a new NPM password in .env): an existing admin keeps its old password, a new one gets the new
+npm_login_note() {
+  local vols
+  case "$1" in
+    start)
+      if [ ! -f "$NPM_LOGIN_FILE" ] && [ "$(env_value INSTALL_NGINX_PROXY_MANAGER)" = "true" ] && [ -n "$(env_value NPM_ADMIN_PASSWORD)" ] \
+        && grep -qF 'INITIAL_ADMIN_PASSWORD: "${NPM_ADMIN_PASSWORD}"' "$COMPOSE_FILE" 2>/dev/null; then
+        printf '%s\n' "$(npm_login_email)" > "$NPM_LOGIN_FILE" 2>/dev/null || true
+      fi
+      ;;
+    reset)
+      vols="$(project_volumes)"
+      if grep -q '_npm_data$' <<< "$vols"; then
+        printf '%s\n' "-" > "$NPM_LOGIN_FILE" 2>/dev/null || true
+      else
+        rm -f -- "$NPM_LOGIN_FILE"
+      fi
+      ;;
+    *) printf '%s\n' "$1" > "$NPM_LOGIN_FILE" 2>/dev/null || true ;;
+  esac
+}
+
+# domain_resolve NAME -> the addresses of NAME in DNS (A and AAAA records), one per line
+domain_resolve() {
+  if [ "$OS_KIND" = "Darwin" ]; then
+    dscacheutil -q host -a name "$1" 2>/dev/null | awk '$1 == "ip_address:" || $1 == "ipv6_address:" { print $2 }' | sort -u || true
+    return 0
+  fi
+  # ahostsv6 also lists the IPv4 addresses as ::ffff:a.b.c.d
+  {
+    getent ahostsv4 "$1" 2>/dev/null || true
+    getent ahostsv6 "$1" 2>/dev/null || true
+  } | awk '$1 !~ /^::ffff:/ { print $1 }' | sort -u
+}
+
+# The addresses of this server, one per line
+local_addresses() {
+  if [ "$OS_KIND" = "Darwin" ]; then
+    ifconfig 2>/dev/null | awk '$1 == "inet" || $1 == "inet6" { sub(/%.*/, "", $2); print $2 }' | sort -u || true
+    return 0
+  fi
+  {
+    hostname -I 2>/dev/null || true
+    ip -o addr show 2>/dev/null || true
+  } | awk '/^[0-9]+: / { sub(/\/.*/, "", $4); print $4; next } { for (i = 1; i <= NF; i++) print $i }' | sort -u
+}
+
+# domain_checks NAME -> says whether Let's Encrypt can give NAME a certificate and where its DNS records
+# point; never fails. DOMAIN_DNS: ok (an address of this server), other (another address, fine behind
+# NAT), missing, loopback (only in /etc/hosts of this server) or unknown.
+domain_checks() {
+  local d="$1" addrs mine a here="" other="" loop="" v6=""
+  DOMAIN_DNS="unknown"
+  DOMAIN_DNS_NAME="$d"
+  if domain_private "$d"; then
+    warn "Let's Encrypt gives no certificates for names ending in .${d##*.}: the Catalog"
+    echo "  answers over HTTP there (or with an own certificate in Nginx Proxy Manager)."
+  fi
+  if [ "$OS_KIND" != "Darwin" ] && ! command -v getent >/dev/null 2>&1; then
+    warn "The DNS records of $d cannot be checked here (getent is missing)."
+    return 0
+  fi
+  addrs="$(domain_resolve "$d")"
+  if [ -z "$addrs" ]; then
+    DOMAIN_DNS="missing"
+    warn "$d is not in DNS yet (no A or AAAA record)."
+    echo "  Point it to the public address of this server - Let's Encrypt needs that."
+    return 0
+  fi
+  mine="$(local_addresses)"
+  while IFS= read -r a; do
+    case "$a" in
+      "") ;;
+      127.*|::1) loop="$loop $a" ;;
+      *)
+        if grep -qxF -- "$a" <<< "$mine"; then
+          here="$here $a"
+        else
+          other="$other $a"
+          if [[ "$a" == *:* ]]; then
+            v6="$v6 $a"
+          fi
+        fi
+        ;;
+    esac
+  done <<< "$addrs"
+  if [ -n "$here" ]; then
+    DOMAIN_DNS="ok"
+    ok "$d points to this server (${here# })."
+    if [ -n "$v6" ]; then
+      warn "It also has the IPv6 address${v6} (AAAA record), which is not on this server:"
+      echo "  Let's Encrypt tries IPv6 first - correct or remove that record."
+    fi
+  elif [ -n "$other" ]; then
+    DOMAIN_DNS="other"
+    info "$d points to ${other# } - not an address of this server, which is fine behind NAT"
+    echo "  (a public address that forwards ports 80 and 443 here)."
+  else
+    DOMAIN_DNS="loopback"
+    warn "$d points to${loop} only on this server (/etc/hosts):"
+    echo "  its public DNS record cannot be checked from here."
+  fi
+}
+
+# domain_baseurl DOMAIN true|false -> BASEURL of catalog-web: https behind Nginx Proxy Manager (http for a
+# name Let's Encrypt gives no certificate), otherwise http on the port of Catalog Web
+domain_baseurl() {
+  if [ "$2" = "true" ] && domain_private "$1"; then
+    printf 'http://%s' "$1"
+  elif [ "$2" = "true" ]; then
+    printf 'https://%s' "$1"
+  elif [ "$CATALOG_WEB_PORT" = "80" ]; then
+    printf 'http://%s' "$1"
+  else
+    printf 'http://%s:%s' "$1" "$CATALOG_WEB_PORT"
+  fi
+}
+
+# domain_apply DOMAIN true|false EMAIL -> writes CATALOG_DOMAIN, INSTALL_NGINX_PROXY_MANAGER, NPM_ADMIN_EMAIL
+# and the BASEURL that follows from them into this script in one go (all or nothing), after checking them
+# together (EMAIL in lower case). Without a domain BASEURL stays, unless it came from the old domain.
+# DOMAIN_CHANGED: true when a setting changed.
+domain_apply() {
+  local domain="$1" npm="$2" email="${3,,}" base="$BASEURL" problem dir copy backup spec name out=""
+  local -a changes=()
+  DOMAIN_CHANGED="false"
+  case "$npm" in
+    true|false) ;;
+    *)
+      err "INSTALL_NGINX_PROXY_MANAGER is \"true\" or \"false\" (is \"$npm\") - nothing was changed."
+      return 1
+      ;;
+  esac
+  for spec in "CATALOG_DOMAIN|$domain" "NPM_ADMIN_EMAIL|$email"; do
+    if [ -n "${spec#*|}" ] && ! problem="$(settings_check "${spec%%|*}" "${spec#*|}" "")"; then
+      err "${spec%%|*}: $problem"
+      return 1
+    fi
+  done
+  if [ -n "$domain" ]; then
+    base="$(domain_baseurl "$domain" "$npm")"
+  elif [ -n "$CATALOG_DOMAIN" ]; then
+    case "$BASEURL" in
+      "https://$CATALOG_DOMAIN"|"http://$CATALOG_DOMAIN"|"http://$CATALOG_DOMAIN:"*) base="http://catalog-web" ;;
+    esac
+  fi
+  for spec in "CATALOG_DOMAIN|$domain" "INSTALL_NGINX_PROXY_MANAGER|$npm" "NPM_ADMIN_EMAIL|$email" "BASEURL|$base"; do
+    name="${spec%%|*}"
+    if [ "${!name}" != "${spec#*|}" ]; then
+      changes+=("$spec")
+    fi
+  done
+  if [ "${#changes[@]}" -eq 0 ]; then
+    return 0
+  fi
+  if [ -z "$SCRIPT_PATH" ] || [ ! -w "$SCRIPT_PATH" ]; then
+    err "${SCRIPT_PATH:-This installer} cannot be changed (not a writable file) - nothing was changed."
+    return 1
+  fi
+  if ! dir="$(mktemp -d)" || [ ! -d "$dir" ]; then
+    err "Cannot create a temporary folder (TMPDIR) - nothing was changed."
+    return 1
+  fi
+  copy="$dir/$SCRIPT_NAME"
+  if ! cp -p -- "$SCRIPT_PATH" "$copy"; then
+    rm -rf -- "$dir"
+    err "Cannot copy $SCRIPT_NAME - nothing was changed."
+    return 1
+  fi
+  for spec in "${changes[@]}"; do
+    if ! set_setting "${spec%%|*}" "${spec#*|}" "$copy"; then
+      rm -rf -- "$dir"
+      err "Nothing was changed."
+      return 1
+    fi
+  done
+  if ! "$BASH" -n "$copy" 2>/dev/null || ! out="$("$BASH" "$copy" check-settings 2>&1)"; then
+    rm -rf -- "$dir"
+    err "Nothing was changed - the settings do not work together:"
+    if [ -n "$out" ]; then
+      printf '%s\n' "$out" | sed 's/^/    /'
+    fi
+    return 1
+  fi
+  if ! backup="$(script_backup)"; then
+    rm -rf -- "$dir"
+    err "Cannot write next to $SCRIPT_PATH - nothing was changed."
+    return 1
+  fi
+  if ! cat -- "$copy" > "$SCRIPT_PATH"; then
+    rm -rf -- "$dir"
+    cat -- "$backup" > "$SCRIPT_PATH" 2>/dev/null || true
+    err "Cannot write $SCRIPT_PATH. If it is damaged, the previous version is $backup."
+    return 1
+  fi
+  rm -rf -- "$dir"
+  rm -f -- "$backup"
+  for spec in "${changes[@]}"; do
+    printf -v "${spec%%|*}" '%s' "${spec#*|}"
+    ok "${spec%%|*} = \"${spec#*|}\""
+  done
+  if [ -f "$NPM_CERT_FILE" ] && [ "$(cat -- "$NPM_CERT_FILE" 2>/dev/null)" != "$CATALOG_DOMAIN" ]; then
+    rm -f -- "$NPM_CERT_FILE"
+  fi
+  DOMAIN_CHANGED="true"
+}
+
+# The API of Nginx Proxy Manager on this server
+npm_api() {
+  printf 'http://127.0.0.1:%s/api' "$(setting NPM_ADMIN_PORT)"
+}
+
+# npm_call METHOD PATH OUTFILE [BODYFILE [SECONDS]] -> HTTP status of the Nginx Proxy Manager API ("000"
+# when it does not answer). The token goes to curl through its stdin config.
+npm_call() {
+  local method="$1" path="$2" out="$3" body="${4:-}" max="${5:-60}" code=""
+  local -a data=()
+  if [ -n "$body" ]; then
+    data=(-H 'Content-Type: application/json' --data-binary "@$body")
+  fi
+  code="$(if [ -n "$NPM_TOKEN" ]; then
+      printf 'header = "Authorization: Bearer %s"\n' "$NPM_TOKEN"
+    fi | curl -sS -K - -X "$method" -H 'Accept: application/json' --connect-timeout 5 --max-time "$max" \
+      -o "$out" -w '%{http_code}' ${data[@]+"${data[@]}"} "$(npm_api)$path" 2>/dev/null)" || true
+  printf '%s' "${code:-000}"
+}
+
+# npm_json QUERY FILE [DOMAIN] -> a value of an answer of the Nginx Proxy Manager API (with jq or python3):
+#   ready  VERSION|SETUP when its status is OK     token  the token ("2fa" for a two-factor challenge)
+#   id     the id                                  error  the error message
+#   reason why a certificate failed (the Detail lines of certbot, else the first lines)
+#   host DOMAIN  ID|CERTIFICATE_ID|FORWARD_HOST|FORWARD_PORT of the first proxy host of DOMAIN
+#   cert DOMAIN  ID|EXPIRES_ON of every Let's Encrypt certificate of DOMAIN
+npm_json() {
+  local q="$1" f="$2" d="${3:-}"
+  if command -v jq >/dev/null 2>&1; then
+    case "$q" in
+      ready) jq -r 'if type == "object" and .status == "OK" then "\(.version.major // 0).\(.version.minor // 0).\(.version.revision // 0)|\(.setup)" else empty end' "$f" ;;
+      token) jq -r 'if type != "object" then empty elif .requires_2fa == true then "2fa" else (.token // empty) end' "$f" ;;
+      id) jq -r 'if type == "object" then (.id // empty | tostring) else empty end' "$f" ;;
+      error) jq -r 'if type == "object" then (.error.message // empty) else empty end' "$f" ;;
+      reason)
+        jq -r 'if type == "object" then
+            ([.error.message // empty | select(. != "Internal Error")]
+              + [(.debug.stack // [])[]? | strings | select(test("^\\s+at ") | not) | select(test("\\S")) | sub("^[A-Za-z]*Error: "; "")])
+            | ((map(select(test("Detail:"))) | if length > 0 then . else empty end) // .[0:3])
+            | .[] | sub("^\\s+"; "")
+          else empty end' "$f"
+        ;;
+      host)
+        jq -r --arg d "$d" 'if type == "array" then
+            ([.[] | select((.domain_names // []) | map(ascii_downcase == $d) | any)] | .[0] // empty
+              | [.id, (.certificate_id // 0), (.forward_host // ""), (.forward_port // "")] | map(tostring) | join("|"))
+          else empty end' "$f"
+        ;;
+      cert)
+        jq -r --arg d "$d" 'if type == "array" then
+            (.[] | select(.provider == "letsencrypt" and ((.domain_names // []) | map(ascii_downcase == $d) | any))
+              | [.id, (.expires_on // "")] | map(tostring) | join("|"))
+          else empty end' "$f"
+        ;;
+    esac 2>/dev/null || true
+  elif command -v python3 >/dev/null 2>&1; then
+    python3 -c '
+import json, re, sys
+q, d = sys.argv[1], sys.argv[3]
+try:
+    data = json.load(open(sys.argv[2]))
+except Exception:
+    sys.exit(0)
+obj = isinstance(data, dict)
+def text(v):
+    if v is None:
+        return ""
+    if isinstance(v, bool):
+        return "true" if v else "false"
+    return str(v)
+def has(h):
+    return d in [str(n).lower() for n in (h.get("domain_names") or [])]
+out = []
+if q == "ready" and obj and data.get("status") == "OK":
+    v = data.get("version") or {}
+    out.append("%s.%s.%s|%s" % (v.get("major", 0), v.get("minor", 0), v.get("revision", 0), text(data.get("setup"))))
+elif q == "token" and obj:
+    out.append("2fa" if data.get("requires_2fa") is True else text(data.get("token")))
+elif q == "id" and obj:
+    out.append(text(data.get("id")))
+elif q == "error" and obj:
+    out.append(text((data.get("error") or {}).get("message")))
+elif q == "reason" and obj:
+    msg = text((data.get("error") or {}).get("message"))
+    lines = [msg] if msg and msg != "Internal Error" else []
+    for l in (data.get("debug") or {}).get("stack") or []:
+        if isinstance(l, str) and l.strip() and not re.match(r"\s+at ", l):
+            lines.append(re.sub(r"^[A-Za-z]*Error: ", "", l))
+    detail = [l for l in lines if "Detail:" in l]
+    out = [l.strip() for l in (detail or lines[:3])]
+elif q == "host" and isinstance(data, list):
+    for h in data:
+        if isinstance(h, dict) and has(h):
+            out.append("|".join(text(v) for v in (h.get("id"), h.get("certificate_id") or 0, h.get("forward_host") or "", h.get("forward_port") or "")))
+            break
+elif q == "cert" and isinstance(data, list):
+    for c in data:
+        if isinstance(c, dict) and c.get("provider") == "letsencrypt" and has(c):
+            out.append("%s|%s" % (text(c.get("id")), text(c.get("expires_on"))))
+for l in out:
+    if l:
+        print(l)
+' "$q" "$f" "$d" 2>/dev/null | tr -d '\r' || true
+  else
+    return 2
+  fi
+}
+
+# npm_wait_ready [SECONDS] -> waits until Nginx Proxy Manager answers on its API. NPM_VERSION: its version,
+# NPM_SETUP: true when it has a user. Fails when it does not run or answer, or is older than 2.13.0.
+npm_wait_ready() {
+  local timeout="${1:-180}" start="$SECONDS" out code="" ready="" id
+  NPM_VERSION=""
+  NPM_SETUP=""
+  id="$(compose ps -q nginx-proxy-manager 2>/dev/null | head -n 1)" || id=""
+  if [ -z "$id" ]; then
+    err "Nginx Proxy Manager does not run - start the stack first ($(hint 6 up))."
+    return 1
+  fi
+  out="$(mktemp)"
+  while true; do
+    code="$(npm_call GET / "$out" "" 10)"
+    if [ "$code" = "200" ]; then
+      ready="$(npm_json ready "$out")"
+    fi
+    if [ -n "$ready" ] || [ $((SECONDS - start)) -ge "$timeout" ]; then
+      break
+    fi
+    sleep 3
+  done
+  rm -f -- "$out"
+  if [ -z "$ready" ]; then
+    err "Nginx Proxy Manager does not answer on $(npm_api)/ (HTTP $code after ${timeout}s) - see its log ($(hint 10 "logs nginx-proxy-manager"))."
+    return 1
+  fi
+  NPM_VERSION="${ready%%|*}"
+  NPM_SETUP="${ready#*|}"
+  if version_gt "$NPM_MIN_VERSION" "$NPM_VERSION"; then
+    err "Nginx Proxy Manager $NPM_VERSION is too old: the automatic setup needs $NPM_MIN_VERSION or newer (its API changed in 2.13)."
+    echo "  Use a newer image (NGINX_PROXY_MANAGER_TAG \"2\" or \"latest\"; $(hint 8 updates) shows the versions), write the files and start"
+    echo "  the stack again - or set up the proxy host by hand in Nginx Proxy Manager (http://$(host_ip):$(setting NPM_ADMIN_PORT))."
+    return 1
+  fi
+}
+
+# npm_token -> NPM_TOKEN and NPM_LOGIN: logs in as the admin user of .env (NPM_ADMIN_EMAIL, NPM_ADMIN_PASSWORD),
+# trying the login it last had first. A user created while NPM_ADMIN_EMAIL was empty has the address
+# admin@example.com. The login marker records the result.
+npm_token() {
+  local pw id="" tried="" body out code="" t="" known=""
+  NPM_TOKEN=""
+  NPM_LOGIN=""
+  pw="$(env_value NPM_ADMIN_PASSWORD)"
+  if [ -z "$pw" ]; then
+    err "$ENV_FILE has no NPM_ADMIN_PASSWORD - write the files ($(hint 2 generate)) and apply them ($(hint 6 up)) first."
+    return 1
+  fi
+  known="$(cat -- "$NPM_LOGIN_FILE" 2>/dev/null)" || known=""
+  body="$(mktemp)"
+  out="$(mktemp)"
+  for id in "${known#-}" "$(env_value NPM_ADMIN_EMAIL)" "$NPM_ADMIN_EMAIL" "$NPM_DEFAULT_EMAIL"; do
+    id="${id,,}"
+    if [ -z "$id" ] || [[ " $tried " == *" $id "* ]]; then
+      continue
+    fi
+    tried="$tried $id"
+    (umask 077 && printf '{"identity":"%s","secret":"%s"}' "$(json_escape "$id")" "$(json_escape "$pw")" > "$body")
+    code="$(npm_call POST /tokens "$out" "$body")"
+    t=""
+    if [ "$code" = "200" ]; then
+      t="$(npm_json token "$out")"
+    fi
+    if [ -n "$t" ] || [ "$code" = "000" ]; then
+      break
+    fi
+  done
+  rm -f -- "$body" "$out"
+  pw=""
+  if [ "$t" = "2fa" ]; then
+    err "The Nginx Proxy Manager user $id has two-factor authentication - set up the proxy host by hand ($(hint 15 info) shows how)."
+    return 1
+  fi
+  if [ -z "$t" ]; then
+    if [ "$code" = "000" ]; then
+      err "Nginx Proxy Manager does not answer on $(npm_api)/tokens."
+    else
+      err "Nginx Proxy Manager refused the login of $ENV_FILE (${tried# }; HTTP $code)."
+      echo "  Its admin user was not created by this installer (it was set up on its own page or before the password"
+      echo "  was in $ENV_FILE), or its password was changed there. Sign in at http://$(host_ip):$(setting NPM_ADMIN_PORT)"
+      echo "  and set up the proxy host by hand ($(hint 15 info) shows how)."
+      case "$code" in
+        400|401|403) npm_login_note - ;;
+      esac
+    fi
+    return 1
+  fi
+  NPM_TOKEN="$t"
+  NPM_LOGIN="$id"
+  npm_login_note "$id"
+}
+
+# npm_set_email ADDRESS -> gives the logged-in Nginx Proxy Manager user this address: its login and the
+# contact address of Let's Encrypt
+npm_set_email() {
+  local body out code msg
+  body="$(mktemp)"
+  out="$(mktemp)"
+  printf '{"email":"%s"}' "$(json_escape "$1")" > "$body"
+  code="$(npm_call PUT /users/me "$out" "$body")"
+  msg="$(npm_json error "$out")"
+  rm -f -- "$body" "$out"
+  if [ "$code" != "200" ]; then
+    warn "The Nginx Proxy Manager login stays $NPM_LOGIN: changing it to $1 failed (HTTP $code${msg:+: $msg})."
+    return 1
+  fi
+  ok "The Nginx Proxy Manager login is now $1 (was $NPM_LOGIN)."
+  NPM_LOGIN="$1"
+  npm_login_note "$1"
+}
+
+# npm_existing_certificate DOMAIN -> the id of a Let's Encrypt certificate of DOMAIN in Nginx Proxy Manager
+# that is valid for at least one more day (empty when there is none)
+npm_existing_certificate() {
+  local out code id exp t now best=""
+  out="$(mktemp)"
+  code="$(npm_call GET /nginx/certificates "$out")"
+  if [ "$code" = "200" ]; then
+    now="$(date +%s)"
+    while IFS='|' read -r id exp; do
+      if [ -z "$id" ]; then
+        continue
+      fi
+      t="$(date -d "$exp" +%s 2>/dev/null)" || t=""
+      if [ -z "$t" ] || [ "$t" -gt $((now + 86400)) ]; then
+        best="$id"
+      fi
+    done < <(npm_json cert "$out" "$1")
+  fi
+  rm -f -- "$out"
+  printf '%s' "$best"
+}
+
+# npm_request_certificate DOMAIN -> NPM_CERT_ID of a new Let's Encrypt certificate (HTTP challenge on port
+# 80), or NPM_CERT_ERROR and the likely cause. One attempt: Let's Encrypt allows 5 failures per hour.
+npm_request_certificate() {
+  local d="$1" body out code
+  NPM_CERT_ID=""
+  NPM_CERT_ERROR=""
+  body="$(mktemp)"
+  out="$(mktemp)"
+  printf '{"provider":"letsencrypt","domain_names":["%s"],"meta":{"dns_challenge":false}}' "$(json_escape "$d")" > "$body"
+  info "Requesting a Let's Encrypt certificate for $d (Let's Encrypt checks http://$d/; this can take a minute)..."
+  code="$(npm_call POST /nginx/certificates "$out" "$body" 600)"
+  if [[ "$code" == 20[01] ]]; then
+    NPM_CERT_ID="$(npm_json id "$out")"
+  fi
+  if [ -z "$NPM_CERT_ID" ] || ! [[ "$NPM_CERT_ID" =~ ^[0-9]+$ ]]; then
+    NPM_CERT_ID=""
+    NPM_CERT_ERROR="$(npm_json reason "$out")"
+  fi
+  rm -f -- "$body" "$out"
+  if [ -n "$NPM_CERT_ID" ]; then
+    ok "Let's Encrypt certificate #$NPM_CERT_ID for $d."
+    return 0
+  fi
+  err "Let's Encrypt gave no certificate for $d (HTTP $code)."
+  if [ -n "$NPM_CERT_ERROR" ]; then
+    printf '%s\n' "$NPM_CERT_ERROR" | sed 's/^/    /'
+  fi
+  case "$NPM_CERT_ERROR" in
+    *NXDOMAIN*|*"DNS problem"*|*"no valid A records"*)
+      echo "  DNS: $d has no A/AAAA record yet, or a wrong one - point it to the public address of this server." ;;
+    *[Tt]imeout*|*[Cc]onnection\ refused*|*"Fetching http"*)
+      echo "  Port 80: Let's Encrypt could not reach http://$d/ - open port 80 in the firewall or security group, or forward it here." ;;
+    *[Uu]nauthorized*|*"Invalid response"*|*" 404"*)
+      echo "  Another server answered for http://$d/ - $d points elsewhere, or port 80 is forwarded to another machine." ;;
+    *"too many"*|*[Rr]ate*[Ll]imit*)
+      echo "  Let's Encrypt limits failed attempts (5 per hour) - wait an hour before the next try." ;;
+    *[Ee]mail*|*invalidContact*)
+      echo "  Let's Encrypt refused the e-mail address $NPM_LOGIN - set a real one ($(hint 24 domain))." ;;
+    *)
+      echo "  Usual causes: $d does not point to this server yet (DNS), or port 80 is not reachable from the internet." ;;
+  esac
+  return 1
+}
+
+# npm_host_body DOMAIN CERTIFICATE_ID -> the proxy host to Catalog Web; HTTPS forced only with a
+# certificate (id 0: none). No size limit and long timeouts for uploads and the hubs of the Catalog.
+npm_host_body() {
+  local forced="false"
+  if [ "$2" != "0" ]; then
+    forced="true"
+  fi
+  printf '{"domain_names":["%s"],"forward_scheme":"http","forward_host":"catalog-web","forward_port":80,"certificate_id":%s,"ssl_forced":%s,"http2_support":true,"block_exploits":true,"allow_websocket_upgrade":true,"access_list_id":0,"advanced_config":"%s"}' \
+    "$(json_escape "$1")" "$2" "$forced" 'client_max_body_size 0;\nproxy_request_buffering off;\nproxy_read_timeout 3600s;\nproxy_send_timeout 3600s;'
+}
+
+# npm_probe DOMAIN https|http -> says whether Nginx Proxy Manager answers for DOMAIN (asked on 127.0.0.1,
+# so DNS and NAT play no part)
+npm_probe() {
+  local d="$1" scheme="$2" port url code="" i
+  if [ "$scheme" = "https" ]; then
+    port="$(setting NPM_HTTPS_PORT)"
+  else
+    port="$(setting NPM_HTTP_PORT)"
+  fi
+  url="$scheme://$d"
+  if { [ "$scheme" = "https" ] && [ "$port" != "443" ]; } || { [ "$scheme" = "http" ] && [ "$port" != "80" ]; }; then
+    url="$url:$port"
+  fi
+  for i in 1 2 3; do
+    code="$(curl -s -o /dev/null -w '%{http_code}' --connect-timeout 5 --max-time 20 --resolve "$d:$port:127.0.0.1" "$url/" 2>/dev/null)" || true
+    if [ "$code" = "200" ]; then
+      ok "$url/ answers through Nginx Proxy Manager (checked on this server)."
+      return 0
+    fi
+    if [ "$i" -lt 3 ]; then
+      sleep 2
+    fi
+  done
+  warn "$url/ does not answer through Nginx Proxy Manager on this server yet (HTTP ${code:-000}) - check its proxy host (http://$(host_ip):$(setting NPM_ADMIN_PORT))."
+}
+
+# npm_outcome DOMAIN https|http [WHY] -> NPM_OUTCOME, the certificate marker and the closing lines
+npm_outcome() {
+  if [ "$2" = "https" ]; then
+    printf '%s\n' "$1" > "$NPM_CERT_FILE" || true
+    NPM_OUTCOME="https"
+    npm_probe "$1" https
+    ok "The Catalog: https://$1 - Nginx Proxy Manager renews the certificate (port 80 must stay open for that)."
+  else
+    rm -f -- "$NPM_CERT_FILE"
+    NPM_OUTCOME="http"
+    npm_probe "$1" http
+    warn "The Catalog: http://$1 - no certificate yet: ${3:-not requested}."
+    if domain_private "$1"; then
+      echo "  HTTPS needs an own certificate, added in the admin page of Nginx Proxy Manager."
+    else
+      echo "  When $1 points to this server and port 80 is open, $(hint 24 domain) requests it (Let's Encrypt allows 5 failed attempts per hour)."
+    fi
+  fi
+}
+
+# npm_setup_domain [ask|yes] -> sets up Nginx Proxy Manager for CATALOG_DOMAIN over its API on this server:
+# login with NPM_ADMIN_EMAIL / NPM_ADMIN_PASSWORD of .env, a Let's Encrypt certificate first (ask: after a
+# question; one attempt), then the proxy host to catalog-web - with the certificate, or for HTTP only when
+# there is none. Running it again reuses the host and the certificate and adds only what is missing; a
+# proxy host of the domain to another target is not touched (failed).
+# NPM_OUTCOME: https, http (proxy host without certificate) or failed (then it returns 1).
+npm_setup_domain() {
+  local mode="${1:-yes}" d="${CATALOG_DOMAIN:-}" email host="" hid="0" hcert="0" fhost="" fport="" cert="" why="" out body code msg default
+  NPM_OUTCOME="failed"
+  if [ "$INSTALL_NGINX_PROXY_MANAGER" != "true" ] || [ -z "$d" ]; then
+    NPM_OUTCOME=""
+    info "Nothing to set up in Nginx Proxy Manager (it is off, or CATALOG_DOMAIN is empty)."
+    return 0
+  fi
+  require_files || return 1
+  require_engine || return 1
+  if ! command -v jq >/dev/null 2>&1 && ! command -v python3 >/dev/null 2>&1; then
+    err "Setting up Nginx Proxy Manager needs jq or python3 ($(pkg_hint jq))."
+    return 1
+  fi
+  info "Setting up Nginx Proxy Manager for $d..."
+  npm_wait_ready || return 1
+  if [ "$NPM_SETUP" = "false" ]; then
+    err "Nginx Proxy Manager $NPM_VERSION has no admin user yet: its container started without INITIAL_ADMIN_EMAIL and INITIAL_ADMIN_PASSWORD."
+    echo "  Write the files again ($(hint 2 generate)) and apply them ($(hint 6 up)) - it then creates the user of $ENV_FILE."
+    return 1
+  fi
+  npm_token || return 1
+  ok "Logged in to Nginx Proxy Manager $NPM_VERSION as $NPM_LOGIN."
+  if email_valid "$NPM_ADMIN_EMAIL" && [ "${NPM_ADMIN_EMAIL,,}" != "${NPM_LOGIN,,}" ]; then
+    npm_set_email "${NPM_ADMIN_EMAIL,,}" || true
+  fi
+  email="$NPM_LOGIN"
+
+  out="$(mktemp)"
+  code="$(npm_call GET /nginx/proxy-hosts "$out")"
+  if [ "$code" = "200" ]; then
+    host="$(npm_json host "$out" "$d")"
+  fi
+  msg="$(npm_json error "$out")"
+  rm -f -- "$out"
+  if [ "$code" != "200" ]; then
+    err "Nginx Proxy Manager did not list its proxy hosts (HTTP $code${msg:+: $msg})."
+    return 1
+  fi
+  if [ -n "$host" ]; then
+    IFS='|' read -r hid hcert fhost fport <<< "$host"
+    if [ "$fhost" != "catalog-web" ] || [ "$fport" != "80" ]; then
+      err "The proxy host of $d (#$hid) in Nginx Proxy Manager forwards to $fhost:$fport, not to catalog-web:80 - it is left as it is."
+      echo "  Point it to catalog-web, port 80, or delete it there (http://$(host_ip):$(setting NPM_ADMIN_PORT)); then $(hint 24 domain) sets it up."
+      return 1
+    fi
+    if [ "${hcert:-0}" != "0" ]; then
+      ok "The proxy host of $d (#$hid) has a certificate already."
+      npm_outcome "$d" https
+      return 0
+    fi
+  fi
+
+  cert="$(npm_existing_certificate "$d")"
+  if [ -n "$cert" ]; then
+    ok "Nginx Proxy Manager has a Let's Encrypt certificate for $d already (#$cert) - it is used."
+  elif domain_private "$d"; then
+    why="Let's Encrypt gives no certificates for names ending in .${d##*.}"
+  elif ! npm_email_ok "$email"; then
+    why="Let's Encrypt needs a real e-mail address, the Nginx Proxy Manager login is $email ($(hint 24 domain) asks for one)"
+  else
+    if [ "$DOMAIN_DNS_NAME" != "$d" ]; then
+      domain_checks "$d"
+    fi
+    if [ "$(setting NPM_HTTP_PORT)" != "80" ]; then
+      warn "Let's Encrypt checks http://$d/ on port 80, and Nginx Proxy Manager uses port $(setting NPM_HTTP_PORT) - port 80 must be forwarded to it."
+    fi
+    if [ "$mode" = "ask" ]; then
+      default="y"
+      if [ "$DOMAIN_DNS" = "missing" ]; then
+        default="n"
+      fi
+      if ! confirm "Request a Let's Encrypt certificate for $d now? It must point to this server, with port 80 open from the internet." "$default"; then
+        why="not requested"
+      fi
+    elif [ "$DOMAIN_DNS" = "missing" ]; then
+      why="$d is not in DNS yet"
+    fi
+    if [ -z "$why" ]; then
+      if npm_request_certificate "$d"; then
+        cert="$NPM_CERT_ID"
+      else
+        why="Let's Encrypt refused it (see above)"
+      fi
+    fi
+  fi
+
+  body="$(mktemp)"
+  out="$(mktemp)"
+  if [ "${hid:-0}" = "0" ]; then
+    npm_host_body "$d" "${cert:-0}" > "$body"
+    code="$(npm_call POST /nginx/proxy-hosts "$out" "$body" 120)"
+    hid="$(npm_json id "$out")"
+    msg="$(npm_json error "$out")"
+    rm -f -- "$body" "$out"
+    if [[ "$code" != 20[01] ]] || [ -z "$hid" ]; then
+      err "Nginx Proxy Manager did not create the proxy host of $d (HTTP $code${msg:+: $msg})."
+      if [ -n "$cert" ]; then
+        echo "  The certificate #$cert stays in Nginx Proxy Manager; the next try ($(hint 24 domain)) uses it."
+      fi
+      return 1
+    fi
+    if [ -n "$cert" ]; then
+      ok "Proxy host #$hid: $d to catalog-web:80, certificate #$cert, HTTPS forced."
+    else
+      ok "Proxy host #$hid: $d to catalog-web:80, HTTP only."
+    fi
+  elif [ -n "$cert" ]; then
+    printf '{"certificate_id":%s,"ssl_forced":true,"http2_support":true}' "$cert" > "$body"
+    code="$(npm_call PUT "/nginx/proxy-hosts/$hid" "$out" "$body" 120)"
+    msg="$(npm_json error "$out")"
+    rm -f -- "$body" "$out"
+    if [ "$code" != "200" ]; then
+      err "Nginx Proxy Manager did not add certificate #$cert to the proxy host of $d (HTTP $code${msg:+: $msg})."
+      echo "  The certificate stays in Nginx Proxy Manager; the next try ($(hint 24 domain)) uses it."
+      return 1
+    fi
+    ok "Proxy host #$hid of $d: certificate #$cert added, HTTPS forced."
+  else
+    rm -f -- "$body" "$out"
+    ok "The proxy host of $d exists (#$hid, HTTP only)."
+  fi
+  if [ -n "$cert" ]; then
+    npm_outcome "$d" https
+  else
+    npm_outcome "$d" http "$why"
+  fi
+}
+
+# Option 24 and 'domain [NAME]': the domain name of the Catalog and HTTPS. Asks for the domain (Enter keeps
+# it, - removes it), for Nginx Proxy Manager when it is off, and for the e-mail address when Let's Encrypt
+# has none; checks the DNS records and saves the settings. An installation gets new files and a restart
+# when they changed (files that differ for another reason only after a question, never without a
+# terminal); then Nginx Proxy Manager is set up (proxy host, certificate).
+domain_menu() {
+  local given="${1:-}" cur="$CATALOG_DOMAIN" d="" npm="$INSTALL_NGINX_PROXY_MANAGER" email="$NPM_ADMIN_EMAIL" input prompt problem="" rc mode="yes"
+  local login="" busy="" p yn="y" apply="false"
+  echo "${C_BLD}Domain and HTTPS${C_RST}"
+  printf '  %-7s %s\n' "Domain" "${cur:-none - the Catalog answers on the address of this server}"
+  if [ "$npm" = "true" ]; then
+    login="$(npm_known_login)"
+    printf '  %-7s %s\n' "Proxy" "Nginx Proxy Manager (HTTPS with Let's Encrypt), login ${login:-as set up in it}"
+  else
+    printf '  %-7s %s\n' "Proxy" "none - Catalog Web answers on port $CATALOG_WEB_PORT"
+  fi
+  echo
+  if [ -n "$cur" ]; then
+    prompt="Domain name (Enter keeps $cur, - removes it): "
+  else
+    prompt="Domain name, e.g. catalog.example.com (Enter: none, the address of the server is used): "
+  fi
+  while true; do
+    if [ -n "$given" ]; then
+      input="$given"
+    elif ! read -r -p "$prompt" input; then
+      echo
+      info "Cancelled - nothing was changed."
+      return 0
+    fi
+    problem=""
+    case "$input" in
+      "") d="$cur" ;;
+      -) d="" ;;
+      *)
+        d="$(domain_normalize "$input")"
+        if [ -z "$d" ]; then
+          problem="Give a host name, e.g. catalog.example.com (- removes the domain)."
+        fi
+        ;;
+    esac
+    if [ -z "$problem" ] && { [ -z "$d" ] || problem="$(settings_check CATALOG_DOMAIN "$d" "")"; }; then
+      break
+    fi
+    err "$problem"
+    if [ -n "$given" ]; then
+      return 1
+    fi
+  done
+  if [ -n "$d" ] && [ "$npm" != "true" ]; then
+    for p in "$NPM_HTTP_PORT" "$NPM_HTTPS_PORT" "$NPM_ADMIN_PORT"; do
+      if wiz_port_used "$p"; then
+        busy="$busy, $p"
+      fi
+    done
+    if [ -n "$busy" ]; then
+      warn "In use on this server: port ${busy#, } - Nginx Proxy Manager cannot start while another program listens there."
+      echo "  Stop that program, or give Nginx Proxy Manager other ports (menu option 1: NPM_HTTP_PORT, NPM_HTTPS_PORT,"
+      echo "  NPM_ADMIN_PORT; Let's Encrypt then needs port 80 forwarded to NPM_HTTP_PORT)."
+      yn="n"
+    fi
+    if confirm "Put Nginx Proxy Manager in front, for HTTPS with a Let's Encrypt certificate (ports $NPM_HTTP_PORT, $NPM_HTTPS_PORT and $NPM_ADMIN_PORT)?" "$yn"; then
+      npm="true"
+    fi
+  fi
+  if [ -n "$d" ] && [ "$npm" = "true" ] && ! npm_email_ok "$email"; then
+    if [ -n "$email" ]; then
+      warn "Let's Encrypt does not take $email as contact address."
+    fi
+    while true; do
+      if ! read -r -p "E-mail address for Let's Encrypt and the Nginx Proxy Manager login (Enter: none, no certificate): " input; then
+        echo
+        input=""
+      fi
+      input="${input//[[:space:]]/}"
+      input="${input,,}"
+      if [ -z "$input" ]; then
+        warn "Without an e-mail address Let's Encrypt gives no certificate - $d gets HTTP only for now."
+        break
+      fi
+      if ! problem="$(settings_check NPM_ADMIN_EMAIL "$input" "")"; then
+        err "$problem"
+      elif ! npm_email_ok "$input"; then
+        err "Let's Encrypt does not take addresses at ${input##*@} - give a real one."
+      else
+        email="$input"
+        break
+      fi
+    done
+  fi
+  if [ -n "$d" ]; then
+    echo
+    domain_checks "$d"
+  fi
+  echo
+  domain_apply "$d" "$npm" "$email" || return 1
+  if [ "$DOMAIN_CHANGED" != "true" ]; then
+    info "The settings stay as they are."
+  fi
+  if [ -n "$cur" ] && [ "$cur" != "$d" ] && [ "$npm" = "true" ]; then
+    info "The proxy host of $cur stays in Nginx Proxy Manager - delete it there if it is no longer needed."
+  fi
+  if [ ! -f "$ENV_FILE" ]; then
+    if [ -n "$d" ] && [ "$npm" = "true" ]; then
+      info "Nothing is installed here yet: the installation uses these settings, then $(hint 24 domain) sets up Nginx Proxy Manager."
+    else
+      info "Nothing is installed here yet: the installation uses these settings."
+    fi
+    return 0
+  fi
+  if [ "$DOMAIN_CHANGED" = "true" ]; then
+    apply="true"
+  elif settings_stale; then
+    echo
+    info "$ENV_FILE and $COMPOSE_FILE do not match the settings (changed settings or manual edits)."
+    if { [ "$INTERACTIVE" = "true" ] || [ -t 0 ]; } && confirm "Write them again (passwords kept, backups made) and apply them?" y; then
+      apply="true"
+    else
+      info "The files stay as they are - $(hint 2 generate) writes them again, $(hint 6 up) applies them."
+    fi
+  fi
+  if [ "$apply" = "true" ]; then
+    echo
+    do_generate keep no-next || return 1
+    if [ "$GENERATE_CANCELLED" = "true" ]; then
+      return 0
+    fi
+    echo
+    if [ "$INTERACTIVE" = "true" ]; then
+      rc=0
+      WIZ_QUIET_ACCESS="yes" run_job "Start / apply changes" -- do_up || rc=$?
+      if [ "$rc" -eq 3 ]; then
+        info "When the job has finished, $(hint 24 domain) sets up Nginx Proxy Manager."
+        return 0
+      fi
+      if [ "$rc" -ne 0 ]; then
+        err "The stack did not start (see above) - Nginx Proxy Manager was not set up."
+        return 1
+      fi
+    else
+      WIZ_QUIET_ACCESS="yes" do_up
+    fi
+  fi
+  if [ -n "$d" ] && [ "$npm" = "true" ]; then
+    echo
+    if [ "$INTERACTIVE" = "true" ] || [ -t 0 ]; then
+      mode="ask"
+    fi
+    npm_setup_domain "$mode" || return 1
+  elif [ -n "$d" ]; then
+    ok "The Catalog answers on $(domain_baseurl "$d" false) once $d points to this server."
+  else
+    ok "The Catalog answers on http://$(host_ip):$(setting CATALOG_WEB_PORT)."
+  fi
+}
+
+###############################################################################
 # Generate .env and docker-compose.yml
 ###############################################################################
 
@@ -6231,6 +8871,10 @@ check_settings() {
       problems=$((problems + 1))
       ;;
   esac
+  if ! engine_setting_ok; then
+    err "CONTAINER_ENGINE must be \"podman\", \"docker\", \"colima\" (only on macOS) or empty (is \"$CONTAINER_ENGINE\")."
+    problems=$((problems + 1))
+  fi
   for name in $(port_settings); do
     value="${!name}"
     if ! [[ "$value" =~ ^[1-9][0-9]{0,4}$ ]] || [ "$value" -gt 65535 ]; then
@@ -6246,6 +8890,12 @@ check_settings() {
     err "COMPOSE_PROJECT_NAME may only contain lower-case letters, digits, - and _ (is \"$COMPOSE_PROJECT_NAME\")."
     problems=$((problems + 1))
   fi
+  for name in CATALOG_DOMAIN NPM_ADMIN_EMAIL; do
+    if [ -n "${!name:-}" ] && ! value="$(settings_check "$name" "${!name}" "")"; then
+      err "$name: $value"
+      problems=$((problems + 1))
+    fi
+  done
   if [ -z "$CATALOG_VERSION" ]; then
     err "CATALOG_VERSION must not be empty."
     problems=$((problems + 1))
@@ -6279,6 +8929,7 @@ write_env_file() {
 # General
 TZ=${TZ}
 BASEURL=${BASEURL}
+CATALOG_DOMAIN=${CATALOG_DOMAIN}
 
 # Enable / Disable optional services
 INSTALL_NGINX_PROXY_MANAGER=${INSTALL_NGINX_PROXY_MANAGER}
@@ -6326,6 +8977,8 @@ OPENSEARCH_DASHBOARDS_PORT=${OPENSEARCH_DASHBOARDS_PORT}
 NPM_HTTP_PORT=${NPM_HTTP_PORT}
 NPM_HTTPS_PORT=${NPM_HTTPS_PORT}
 NPM_ADMIN_PORT=${NPM_ADMIN_PORT}
+NPM_ADMIN_EMAIL=${NPM_ADMIN_EMAIL}
+NPM_ADMIN_PASSWORD=${NPM_ADMIN_PASSWORD}
 X_FRAME_OPTIONS=${X_FRAME_OPTIONS}
 DISABLE_IPV6=${DISABLE_IPV6}
 
@@ -6365,6 +9018,8 @@ write_compose_file() {
     environment:
       X_FRAME_OPTIONS: "${X_FRAME_OPTIONS}"
       DISABLE_IPV6: "${DISABLE_IPV6}"
+      INITIAL_ADMIN_EMAIL: "${NPM_ADMIN_EMAIL:-admin@example.com}"
+      INITIAL_ADMIN_PASSWORD: "${NPM_ADMIN_PASSWORD}"
     volumes:
       - npm_data:/data
       - npm_letsencrypt:/etc/letsencrypt
@@ -6505,6 +9160,17 @@ EOF
     cat <<'EOF'
       OpenSearch__Urls: '["${OPENSEARCH_URL}"]'
       Vulnerabilities__CachingJobCronExpression: "${VULNERABILITIES_CACHING_CRON}"
+EOF
+    # X-Forwarded-Proto of Nginx Proxy Manager counts only from these networks; without the setting only
+    # 172.16.0.0/12, and Podman gives compose networks 10.89.x.x
+    if [ "${INSTALL_NGINX_PROXY_MANAGER}" = "true" ]; then
+      cat <<'EOF'
+      ForwardedHeaders__KnownNetworks__0: "10.0.0.0/8"
+      ForwardedHeaders__KnownNetworks__1: "172.16.0.0/12"
+      ForwardedHeaders__KnownNetworks__2: "192.168.0.0/16"
+EOF
+    fi
+    cat <<'EOF'
 
   worker-recognition-1:
     image: ${CATALOG_WORKER_IMAGE}
@@ -6656,7 +9322,7 @@ EOF
 #   keep : keep the passwords of the existing env file (or of its newest backup)
 #   new  : always generate new passwords
 do_generate() {
-  local mode="${1:-ask}" next="${2:-show-next}" choice var value pw_file="" volumes sib
+  local mode="${1:-ask}" next="${2:-show-next}" choice var value pw_file="" volumes sib npm_new="false"
   GENERATE_CANCELLED="false"
   reload_settings
   tz_name_warning
@@ -6676,7 +9342,7 @@ do_generate() {
       case "${choice:-1}" in
         1) mode="keep" ;;
         2)
-          warn "MongoDB and RabbitMQ store their passwords in their data volumes on the first start."
+          warn "MongoDB, RabbitMQ and Nginx Proxy Manager store their passwords in their data volumes on the first start."
           warn "New passwords will NOT work with existing data unless the volumes are removed (menu option 99)."
           if confirm "Generate new passwords anyway?" n; then
             mode="new"
@@ -6692,8 +9358,8 @@ do_generate() {
         return 0
       fi
     elif [ "$mode" = "new" ]; then
-      warn "Generating NEW passwords. MongoDB and RabbitMQ keep the original ones in their data volumes,"
-      warn "so the new passwords only work after those volumes are removed (podman compose down -v)."
+      warn "Generating NEW passwords. MongoDB, RabbitMQ and Nginx Proxy Manager keep the original ones in their data volumes,"
+      warn "so the new passwords only work after those volumes are removed ($ENGINE compose down -v)."
     fi
     if [ "$mode" = "keep" ]; then
       pw_file="$ENV_FILE"
@@ -6709,10 +9375,10 @@ do_generate() {
     else
       volumes="$(project_volumes)"
       if [ -n "$volumes" ]; then
-        warn "There is no $ENV_FILE (and no backup of it), but Podman volumes of this stack already exist."
-        warn "MongoDB keeps its original password in these volumes - NEW passwords will not work with them."
+        warn "There is no $ENV_FILE (and no backup of it), but $ENGINE_NAME volumes of this stack already exist."
+        warn "MongoDB, RabbitMQ and Nginx Proxy Manager keep their original passwords in these volumes - NEW passwords will not work with them."
         warn "Restore the old $ENV_FILE, or remove the volumes if the old data is not needed:"
-        warn "  podman volume rm ${volumes//$'\n'/ }"
+        warn "  $ENGINE volume rm ${volumes//$'\n'/ }"
         if [ "$mode" = "new" ]; then
           : # explicitly requested with --new-passwords
         elif [ "$INTERACTIVE" = "true" ] && confirm "Generate new passwords anyway?" n; then
@@ -6756,7 +9422,7 @@ do_generate() {
   else
     echo "Generating passwords..."
   fi
-  for var in MONGO_INITDB_ROOT_PASSWORD MINIO_ROOT_PASSWORD RABBITMQ_DEFAULT_PASS; do
+  for var in MONGO_INITDB_ROOT_PASSWORD MINIO_ROOT_PASSWORD RABBITMQ_DEFAULT_PASS NPM_ADMIN_PASSWORD; do
     value=""
     if [ "$mode" = "keep" ]; then
       value="$(ENV_FILE="$pw_file" env_value "$var")"
@@ -6766,6 +9432,9 @@ do_generate() {
     fi
     if [ -z "$value" ]; then
       value="$(rand32)"
+      if [ "$var" = "NPM_ADMIN_PASSWORD" ]; then
+        npm_new="true"
+      fi
     fi
     printf -v "$var" '%s' "$value"
   done
@@ -6774,6 +9443,9 @@ do_generate() {
   write_env_file
   echo "Writing ${COMPOSE_FILE}..."
   write_compose_file
+  if [ "$npm_new" = "true" ]; then
+    npm_login_note reset
+  fi
   chmod 600 "$ENV_FILE"
 
   echo "Created $ENV_FILE and $COMPOSE_FILE in $WORK_DIR"
@@ -6787,8 +9459,8 @@ do_generate() {
       echo "Next steps: 3/4) review the files (optional), 5) validate, 6) start the stack."
     else
       echo "Next steps:"
-      echo "  $0 validate    (podman compose config)"
-      echo "  $0 up          (podman compose up -d)"
+      echo "  $0 validate    ($ENGINE compose config)"
+      echo "  $0 up          ($ENGINE compose up -d)"
     fi
   fi
 }
@@ -6798,6 +9470,7 @@ do_generate() {
 ###############################################################################
 
 show_credentials() {
+  local login
   if [ ! -f "$ENV_FILE" ]; then
     err "$ENV_FILE not found - generate it first ($(hint 2 generate))."
     return 1
@@ -6809,44 +9482,79 @@ show_credentials() {
   echo "  MinIO password : $(env_value MINIO_ROOT_PASSWORD)"
   echo "  RabbitMQ user  : $(env_value RABBITMQ_DEFAULT_USER)"
   echo "  RabbitMQ pass  : $(env_value RABBITMQ_DEFAULT_PASS)"
+  if [ "$(env_value INSTALL_NGINX_PROXY_MANAGER)" = "true" ]; then
+    login="$(npm_known_login)"
+    if [ -n "$login" ]; then
+      echo "  NPM login      : $login"
+      echo "  NPM password   : $(env_value NPM_ADMIN_PASSWORD)"
+    else
+      echo "  NPM login      : as set up in Nginx Proxy Manager (its admin was not created from $ENV_FILE)"
+    fi
+  fi
 }
 
 show_access_info() {
-  local addr npm
+  local addr npm domain main="" login
   addr="$(host_ip)"
   npm="$(setting INSTALL_NGINX_PROXY_MANAGER)"
+  domain="$(setting CATALOG_DOMAIN)"
 
   echo "${C_BLD}URLs${C_RST}"
+  if [ -n "$domain" ]; then
+    if [ "$npm" = "true" ]; then
+      if [ "$(cat -- "$NPM_CERT_FILE" 2>/dev/null)" = "$domain" ]; then
+        main="https://$domain"
+      elif domain_private "$domain"; then
+        main="http://$domain   (no Let's Encrypt for .${domain##*.} names)"
+      else
+        main="http://$domain   (no certificate yet - $(hint 24 domain))"
+      fi
+    elif [ "$(setting CATALOG_WEB_PORT)" = "80" ]; then
+      main="http://$domain"
+    else
+      main="http://$domain:$(setting CATALOG_WEB_PORT)"
+    fi
+    printf '  %-24s %s\n' "Catalog Web" "$main"
+  fi
   printf '  %-24s http://%s:%s\n' "Catalog Web (direct)" "$addr" "$(setting CATALOG_WEB_PORT)"
   if [ "$npm" = "true" ]; then
-    printf '  %-24s http://%s:%s\n' "Nginx Proxy Manager" "$addr" "$(setting NPM_ADMIN_PORT)"
+    login="$(npm_known_login)"
+    if [ -n "$login" ]; then
+      printf '  %-24s http://%s:%s   login %s, password: %s\n' "Nginx Proxy Manager" "$addr" "$(setting NPM_ADMIN_PORT)" \
+        "$login" "$(hint 14 credentials)"
+    else
+      printf '  %-24s http://%s:%s   login as set up in Nginx Proxy Manager\n' "Nginx Proxy Manager" "$addr" "$(setting NPM_ADMIN_PORT)"
+    fi
   fi
   printf '  %-24s http://%s:%s\n' "RabbitMQ management" "$addr" "$(setting RABBITMQ_UI_PORT)"
   printf '  %-24s http://%s:%s\n' "MinIO console" "$addr" "$(setting MINIO_CONSOLE_PORT_HOST)"
   printf '  %-24s http://%s:%s\n' "OpenSearch Dashboards" "$addr" "$(setting OPENSEARCH_DASHBOARDS_PORT)"
-  echo "Note: these ports are published on all network interfaces, and Podman forwards them before"
-  echo "      ufw/firewalld see them. OpenSearch Dashboards has no login - restrict access to it"
-  echo "      (network firewall)."
+  if [ "$ENGINE" = "docker" ]; then
+    echo "Note: these ports are published on all network interfaces, and Docker-published ports are"
+    echo "      NOT filtered by ufw/firewalld. OpenSearch Dashboards has no login - restrict access to it"
+    echo "      (network firewall or the DOCKER-USER iptables chain)."
+  else
+    echo "Note: these ports are published on all network interfaces, and Podman forwards them before"
+    echo "      ufw/firewalld see them. OpenSearch Dashboards has no login - restrict access to it"
+    echo "      (network firewall)."
+  fi
   echo
 
   if [ "$npm" = "true" ]; then
-    echo "Nginx Proxy Manager is enabled."
-    echo "After the stack is up, create a Proxy Host in Nginx Proxy Manager and point your domain to catalog-web on port 80."
-    echo "Target in Nginx Proxy Manager:"
-    echo "  Forward Hostname / IP : catalog-web"
-    echo "  Forward Port          : 80"
-    echo "Recommended Nginx Proxy Manager settings:"
-    echo "  - Enable Block Common Exploits"
-    echo "  - Enable Websockets if needed"
-    echo "  - Enable SSL"
-    echo "  - Request a new Let's Encrypt certificate"
-    echo "  - Enable Force SSL"
-    echo "  - Enable HTTP/2 Support"
-    echo "If your domain already points to this server, Let's Encrypt can generate the SSL certificate automatically."
+    if [ "$main" = "https://$domain" ]; then
+      echo "Nginx Proxy Manager forwards $domain to Catalog Web and renews its certificate."
+    elif [ -n "$domain" ]; then
+      echo "Nginx Proxy Manager forwards $domain to Catalog Web; $(hint 24 domain) sets up the proxy host and the certificate."
+    else
+      echo "Nginx Proxy Manager is enabled, but no domain is set - $(hint 24 domain) sets the domain, the proxy host and"
+      echo "a Let's Encrypt certificate."
+    fi
+    echo "By hand in Nginx Proxy Manager: a Proxy Host to catalog-web, port 80, with Websockets Support and"
+    echo "Block Common Exploits; SSL: a Let's Encrypt certificate, Force SSL, HTTP/2."
   else
     echo "Nginx Proxy Manager is disabled."
     echo "Catalog Web can be reached directly over:"
-    echo "  http://${addr}:$(setting CATALOG_WEB_PORT)"
+    echo "  ${main:-http://${addr}:$(setting CATALOG_WEB_PORT)}"
   fi
 }
 
@@ -6857,7 +9565,7 @@ edit_generated() {
     return 1
   fi
   if [ "$file" = "$ENV_FILE" ]; then
-    warn "Do not change the passwords here after the first start - MongoDB and RabbitMQ keep the original ones."
+    warn "Do not change the passwords here after the first start - MongoDB, RabbitMQ and Nginx Proxy Manager keep the original ones."
   fi
   warn "Manual changes are overwritten the next time the files are generated (option 2)."
   echo "In vi: ':q' closes without changes, ':wq' saves and closes, ':q!' discards changes."
@@ -6871,7 +9579,7 @@ edit_generated() {
 
 do_validate() {
   require_files || return 1
-  require_podman || return 1
+  require_engine || return 1
   info "Running: ${COMPOSE[*]} config"
   if ! compose config --quiet; then
     err "Docker Compose reported a problem in $COMPOSE_FILE / $ENV_FILE (see above)."
@@ -6887,7 +9595,8 @@ do_validate() {
 
 do_up() {
   require_files || return 1
-  require_podman || return 1
+  require_engine || return 1
+  engine_guard || return 1
   if mongo_kernel_problem; then
     warn "MongoDB $(setting MONGO_TAG) refuses to start on kernel $(engine_kernel) without a workaround (SERVER-121912)."
     warn "Regenerate the files ($(hint 2 generate)): MongoDB then starts with GLIBC_TUNABLES=glibc.pthread.rseq=1."
@@ -6909,8 +9618,9 @@ do_up() {
   ok "Configuration is valid."
   # --remove-orphans also removes services that are no longer in the file
   # (e.g. Nginx Proxy Manager after INSTALL_NGINX_PROXY_MANAGER="false").
-  info "Starting the stack (podman compose up -d --remove-orphans)..."
+  info "Starting the stack ($ENGINE compose up -d --remove-orphans)..."
   compose up -d --remove-orphans
+  npm_login_note start
   echo
   ok "Stack is up."
   compose ps
@@ -6921,6 +9631,7 @@ do_up() {
 }
 
 do_full_setup() {
+  engine_guard || return 1
   do_generate ask no-next
   if [ "$GENERATE_CANCELLED" = "true" ]; then
     return 0
@@ -6931,14 +9642,14 @@ do_full_setup() {
 
 do_status() {
   require_files || return 1
-  require_podman || return 1
+  require_engine || return 1
   compose ps
 }
 
 do_logs() {
   local service="${1:-}" services=() list line i choice
   require_files || return 1
-  require_podman || return 1
+  require_engine || return 1
   if ! list="$(compose config --services)"; then
     err "Could not read the services from $COMPOSE_FILE (see above)."
     return 1
@@ -6974,21 +9685,21 @@ do_logs() {
 
 do_pull() {
   require_files || return 1
-  require_podman || return 1
+  require_engine || return 1
   compose pull
   ok "Images pulled. Apply them with $(hint 6 up)."
 }
 
 do_restart() {
   require_files || return 1
-  require_podman || return 1
+  require_engine || return 1
   compose restart -t 30
   ok "Stack restarted."
 }
 
 do_down() {
   require_files || return 1
-  require_podman || return 1
+  require_engine || return 1
   if [ "$INTERACTIVE" = "true" ]; then
     if ! confirm "Stop and remove all containers of this stack? (data volumes are kept)" n; then
       info "Cancelled."
@@ -7002,7 +9713,7 @@ do_down() {
 do_reset() {
   local answer
   require_files || return 1
-  require_podman || return 1
+  require_engine || return 1
   warn "This removes ALL containers AND ALL data volumes of this stack:"
   warn "  MongoDB data, MinIO files, RabbitMQ data, OpenSearch index, license volume,"
   warn "  worker tokens and Nginx Proxy Manager data / certificates."
@@ -7015,15 +9726,67 @@ do_reset() {
     fi
   fi
   compose down -v --remove-orphans
+  # the proxy hosts, certificates and the admin of Nginx Proxy Manager are gone with its volumes
+  rm -f -- "$NPM_CERT_FILE" "$NPM_LOGIN_FILE"
   ok "Containers and data volumes removed."
   echo "Optionally generate new passwords (option 2), then start again (option 6)."
 }
 
 do_check() {
-  local problems=0 name port mmc host_tz v
+  local problems=0 name port mmc host_tz v where=""
   info "Checking prerequisites..."
+  echo "  Container engine: $ENGINE_NAME$(if [ -z "$CONTAINER_ENGINE" ]; then printf ' (CONTAINER_ENGINE is empty: the one found on this server)'; fi)"
 
-  if ! command -v podman >/dev/null 2>&1; then
+  if [ "$ENGINE" = "docker" ]; then
+    if ! command -v docker >/dev/null 2>&1; then
+      err "$ENGINE_NAME is not installed. './$SCRIPT_NAME $(engine_install_cmd)' sets it up (I - Install asks first):"
+      case "$OS_KIND:$ENGINE_KIND" in
+        Darwin:colima) echo "      brew install colima docker, the newest Docker Compose, and a Colima VM with Rosetta" ;;
+        Darwin:*)
+          echo "      Docker Desktop with Homebrew (brew install --cask docker-desktop)"
+          mac_docker_license
+          ;;
+        *)
+          if v="$(docker_install_plan 2>&1)"; then
+            printf '      %s\n' $(printf '%s\n' "$v" | tr ' ' '\001') | tr '\001' ' '
+            docker_service_plan | sed 's/^/      /'
+          else
+            echo "      $v"
+          fi
+          ;;
+      esac
+      problems=$((problems + 1))
+    elif docker_is_podman; then
+      err "'docker' on this machine is Podman (podman-docker), not Docker - './$SCRIPT_NAME $(engine_install_cmd)' installs Docker, or use CONTAINER_ENGINE=\"podman\"."
+      problems=$((problems + 1))
+    elif docker_is_snap; then
+      err "$(docker_snap_problem)"
+      problems=$((problems + 1))
+    else
+      ok "Docker $(engine_version)"
+      if docker info >/dev/null 2>&1; then
+        if [ "$(engine_rootless)" = "true" ]; then
+          err "Docker runs rootless here - the Catalog needs the rootful Docker daemon (ports 80 and 443, the memory lock of OpenSearch)."
+          problems=$((problems + 1))
+        else
+          ok "The Docker daemon answers$(if [ "$ENGINE_KIND" = "colima" ]; then printf ' (Colima VM)'; fi) and runs rootful."
+        fi
+        if [ "$OS_KIND" != "Darwin" ] && command -v systemctl >/dev/null 2>&1 && [ "$(systemctl is-enabled docker.service 2>/dev/null)" != "enabled" ]; then
+          warn "docker.service is not enabled - Docker and the stack do not come back after a reboot:"
+          echo "      systemctl enable --now docker"
+        fi
+      else
+        err "$ENGINE_NAME does not answer (docker info failed) - $(engine_down_hint)."
+        problems=$((problems + 1))
+      fi
+      if detect_compose; then
+        ok "Compose: docker compose with $(docker compose version 2>/dev/null | head -n 1)"
+      else
+        err "$COMPOSE_PROBLEM"
+        problems=$((problems + 1))
+      fi
+    fi
+  elif ! command -v podman >/dev/null 2>&1; then
     err "Podman is not installed. './$SCRIPT_NAME install-podman' sets it up (I - Install asks first):"
     if [ "$OS_KIND" = "Darwin" ]; then
       echo "      brew install podman, a rootful Podman machine, and the newest Docker Compose"
@@ -7035,7 +9798,7 @@ do_check() {
     fi
     problems=$((problems + 1))
   else
-    v="$(podman_version)"
+    v="$(engine_version)"
     if [ -n "$v" ] && ! version_gt "$PODMAN_MIN" "$v"; then
       ok "Podman $v"
     else
@@ -7081,6 +9844,10 @@ do_check() {
       problems=$((problems + 1))
     fi
   fi
+  # one engine per server: the data of this project in the other engine would be left behind
+  if ! engine_guard; then
+    problems=$((problems + 1))
+  fi
 
   if check_settings; then
     ok "Settings at the top of $SCRIPT_NAME look valid."
@@ -7103,7 +9870,7 @@ do_check() {
     echo "      7.0.14 or newer; for linux-generic that is 7.0.0-31 or newer)"
   fi
 
-  if [ "$OS_KIND" = "Darwin" ]; then
+  if [ "$OS_KIND" = "Darwin" ] && [ "$ENGINE" = "podman" ]; then
     v="$(sw_vers -productVersion 2>/dev/null)" || v=""
     if [[ "${v%%.*}" =~ ^[0-9]+$ ]] && [ "${v%%.*}" -lt 26 ]; then
       err "macOS $v: the amd64 Catalog images need Rosetta in the Podman machine, which works only from macOS 26."
@@ -7117,12 +9884,38 @@ do_check() {
         problems=$((problems + 1))
       fi
     fi
+  elif [ "$OS_KIND" = "Darwin" ] && [ "$(engine_arch)" = "arm64" ] && engine_socket_ok; then
+    # Docker Desktop and Colima: Rosetta in their Linux VM, which fails with Linux 6.13 and newer before macOS 26
+    if mac_kernel_problem; then
+      mac_kernel_error
+      problems=$((problems + 1))
+    fi
+    if [ "$ENGINE_KIND" = "colima" ]; then
+      if mac_colima_rosetta_on; then
+        ok "Rosetta runs the amd64 Catalog images in the Colima VM."
+      else
+        err "Rosetta is not active in the Colima VM (colima start --vz-rosetta) - './$SCRIPT_NAME install-engine' checks it."
+        problems=$((problems + 1))
+      fi
+    elif mac_docker_rosetta_off; then
+      warn "Rosetta is off in Docker Desktop, and the Catalog images are amd64: turn on Settings > General >"
+      echo "      \"Use Rosetta for x86_64/amd64 emulation\", then Apply & restart."
+    fi
   fi
 
   mmc=""
   if [ "$OS_KIND" = "Darwin" ]; then
     if engine_socket_ok; then
-      mmc="$(podman machine ssh "$(mac_machine)" sysctl -n vm.max_map_count 2>/dev/null)" || mmc=""
+      case "$ENGINE_KIND" in
+        podman)
+          mmc="$(podman machine ssh "$(mac_machine)" sysctl -n vm.max_map_count 2>/dev/null)" || mmc=""
+          where=" (Podman machine)"
+          ;;
+        colima)
+          mmc="$(colima ssh -- sysctl -n vm.max_map_count 2>/dev/null)" || mmc=""
+          where=" (Colima VM)"
+          ;;
+      esac
       mmc="${mmc//[^0-9]/}"
     fi
   elif [ -r /proc/sys/vm/max_map_count ]; then
@@ -7130,7 +9923,10 @@ do_check() {
   fi
   if [ -n "$mmc" ]; then
     if [ "$mmc" -ge 262144 ]; then
-      ok "vm.max_map_count = $mmc$(if [ "$OS_KIND" = "Darwin" ]; then printf ' (Podman machine)'; fi)"
+      ok "vm.max_map_count = $mmc$where"
+    elif [ "$ENGINE_KIND" = "colima" ]; then
+      warn "vm.max_map_count = $mmc in the Colima VM - OpenSearch recommends at least 262144 ('./$SCRIPT_NAME install-engine' sets it):"
+      echo "      colima ssh -- sudo sysctl -w vm.max_map_count=262144"
     elif [ "$OS_KIND" = "Darwin" ]; then
       warn "vm.max_map_count = $mmc in the Podman machine - OpenSearch recommends at least 262144:"
       echo "      podman machine ssh $(mac_machine) \"sudo sh -c 'echo vm.max_map_count=262144 > /etc/sysctl.d/99-opensearch.conf && sysctl --system'\""
@@ -7298,6 +10094,9 @@ settings_hint() {
     TZ) printf 'Time zone of all containers, e.g. Europe/Berlin; the job times (*_CRON) run in it' ;;
     BASEURL) printf 'BASEURL of catalog-web' ;;
     INSTALL_NGINX_PROXY_MANAGER) printf 'true starts Nginx Proxy Manager (reverse proxy with TLS) with the stack' ;;
+    CONTAINER_ENGINE) printf 'podman, docker%s; empty: the engine that holds this installation (now %s)' "$(if [ "$OS_KIND" = "Darwin" ]; then printf ' or colima'; fi)" "$ENGINE_KIND" ;;
+    CATALOG_DOMAIN) printf 'Host name of the Catalog, e.g. catalog.example.com; empty: the address of the server (option 24)' ;;
+    NPM_ADMIN_EMAIL) printf 'Login of Nginx Proxy Manager and the e-mail address for Let'"'"'s Encrypt; the password is generated into %s' "$ENV_FILE" ;;
     CATALOG_VERSION) printf 'Version of catalog-web and all workers; option 8 picks one from Docker Hub' ;;
     CATALOG_IMAGE_REPO) printf 'Docker Hub repository of catalog-web' ;;
     CATALOG_WORKER_IMAGE_REPO) printf 'Docker Hub repository of the four workers' ;;
@@ -7331,7 +10130,7 @@ settings_hint() {
 
 # settings_empty_ok NAME SAVED -> true when NAME may be empty (it is empty now, or empty has a meaning)
 settings_empty_ok() {
-  [ -z "$2" ] || [ "$1" = "COMPOSE_PROJECT_NAME" ]
+  [ -z "$2" ] || [ "$1" = "COMPOSE_PROJECT_NAME" ] || [ "$1" = "CONTAINER_ENGINE" ] || [ "$1" = "CATALOG_DOMAIN" ] || [ "$1" = "NPM_ADMIN_EMAIL" ]
 }
 
 # settings_check NAME VALUE SAVED -> fails and prints the reason when VALUE does not fit NAME
@@ -7342,7 +10141,7 @@ settings_check() {
     echo "Control characters are not allowed."
     return 1
   fi
-  # the generated .env holds the values without quotes: podman compose would read these differently
+  # the generated .env holds the values without quotes: Docker Compose would read these differently
   if [[ "$value" == *[\"\'\\\$\`]* ]] || [[ "$value" == *" #"* ]]; then
     echo "Not allowed: \" ' \\ \$ \` and \" #\" (the generated $ENV_FILE cannot hold them)."
     return 1
@@ -7447,9 +10246,49 @@ settings_check() {
         return 1
       fi
       ;;
+    CONTAINER_ENGINE)
+      if [ "$value" = "colima" ] && [ "$OS_KIND" != "Darwin" ]; then
+        echo "Colima runs only on macOS - use podman or docker."
+        return 1
+      fi
+      case "$value" in
+        podman|docker|colima) ;;
+        *)
+          echo "Use podman, docker$(if [ "$OS_KIND" = "Darwin" ]; then printf ', colima'; fi) or \"\" (the engine that holds this installation)."
+          return 1
+          ;;
+      esac
+      if [ "$value" != "$saved" ]; then
+        f="$(engine_switch_problem "$value")"
+        if [ -n "$f" ]; then
+          echo "$f"
+          return 1
+        fi
+      fi
+      ;;
     ENV_FILE|COMPOSE_FILE)
       if [[ "$value" =~ [[:space:]/] ]] || [ "$value" = "$SCRIPT_NAME" ]; then
         echo "Give a plain file name in this folder (no spaces, no /, not $SCRIPT_NAME)."
+        return 1
+      fi
+      ;;
+    CATALOG_DOMAIN)
+      if ip_address "$value"; then
+        echo "\"$value\" is an IP address - leave it empty to use the IP address."
+        return 1
+      fi
+      if ! domain_valid "$value"; then
+        echo "Give a host name in lower case, e.g. catalog.example.com: letters, digits and -, at least one dot (no http://, port or path)."
+        return 1
+      fi
+      ;;
+    NPM_ADMIN_EMAIL)
+      if ! email_valid "$value"; then
+        echo "Give an e-mail address, e.g. it@example.com."
+        return 1
+      fi
+      if [ "$value" != "${value,,}" ]; then
+        echo "Give the e-mail address in lower case (${value,,}): Nginx Proxy Manager takes logins only in lower case."
         return 1
       fi
       ;;
@@ -8148,6 +10987,20 @@ settings_editor() {
   done
 }
 
+# True when the CONTAINER_ENGINE of this script, edited by hand, can be used in this folder
+editor_engine_ok() {
+  local new problem
+  new="$(script_setting CONTAINER_ENGINE)"
+  if [ "$new" = "$CONTAINER_ENGINE" ]; then
+    return 0
+  fi
+  problem="$(engine_switch_problem "$new")"
+  if [ -n "$problem" ]; then
+    err "CONTAINER_ENGINE \"$new\": $problem"
+    return 1
+  fi
+}
+
 # Opens the configuration section of this script in the editor, then restarts
 # the script so the new values are used. Runs in the main shell (not in a
 # subshell) because it replaces the running process.
@@ -8177,7 +11030,8 @@ edit_config() {
     fi
     # bash -n finds syntax errors; the check-settings run also catches errors
     # that only show up when the settings are executed (e.g. missing quotes).
-    if "$BASH" -n "$SCRIPT_PATH" && "$BASH" "$SCRIPT_PATH" check-settings; then
+    # A new CONTAINER_ENGINE must not leave this installation's data in the other engine.
+    if "$BASH" -n "$SCRIPT_PATH" && "$BASH" "$SCRIPT_PATH" check-settings && editor_engine_ok; then
       break
     fi
     err "The script cannot start with these settings (see above). Values that contain spaces must be in double quotes."
@@ -8229,7 +11083,7 @@ file_state() {
 stack_state() {
   local running n=0
   if [ ! -f "$ENV_FILE" ] || [ ! -f "$COMPOSE_FILE" ]; then
-    if command -v podman >/dev/null 2>&1; then
+    if engine_cli; then
       n="$(count_lines "$(here_containers 2>/dev/null)")"
     fi
     case "$n" in
@@ -8239,12 +11093,12 @@ stack_state() {
     esac
     return 0
   fi
-  if ! command -v podman >/dev/null 2>&1 || ! detect_compose; then
-    printf 'Podman / Compose not available'
+  if ! engine_cli || ! detect_compose; then
+    printf '%s / Compose not available' "$ENGINE_NAME"
     return 0
   fi
   if ! running="$(compose ps --services --filter status=running 2>/dev/null)"; then
-    printf 'unknown (cannot reach Podman)'
+    printf 'unknown (cannot reach %s)' "$ENGINE_NAME"
     return 0
   fi
   printf '%s service(s) running' "$(count_lines "$running")"
@@ -8321,6 +11175,7 @@ menu_up() {
 }
 
 menu_full_setup() {
+  engine_guard || return 1
   do_generate ask no-next
   if [ "$GENERATE_CANCELLED" = "true" ]; then
     return 0
@@ -8401,7 +11256,7 @@ wiz_run() {
   return "$rc"
 }
 
-# wiz_yes_no QUESTION DEFAULT(y|n) -> 0 yes, 1 no, 2 no answer (end of input)
+# wiz_yes_no QUESTION DEFAULT(y|n) -> 0 yes, 1 no, 2 stop (0, or the end of input)
 wiz_yes_no() {
   local hint answer
   if [ "$2" = "y" ]; then
@@ -8415,6 +11270,7 @@ wiz_yes_no() {
   fi
   case "${answer:-$2}" in
     [Yy]|[Yy][Ee][Ss]) return 0 ;;
+    0) return 2 ;;
     *) return 1 ;;
   esac
 }
@@ -8471,13 +11327,13 @@ wiz_job_since() {
 # True when this folder has an installation: its generated files, or containers of this installation
 # (volumes alone may belong to another folder with the same name).
 # The containers of this installation, listed once per menu draw (menu_scan): the cards and the stack
-# line need them, and every listing asks Podman several times. here_containers uses that list during the
-# draw and asks Podman again at any other time.
+# line need them, and every listing asks the engine several times. here_containers uses that list during
+# the draw and asks the engine again at any other time.
 MENU_HERE=""
 MENU_HERE_AT=-10
 menu_scan() {
   MENU_HERE=""
-  if command -v podman >/dev/null 2>&1 && { [ ! -f "$ENV_FILE" ] || [ ! -f "$COMPOSE_FILE" ]; }; then
+  if engine_cli && { [ ! -f "$ENV_FILE" ] || [ ! -f "$COMPOSE_FILE" ]; }; then
     MENU_HERE="$(remove_containers 2>/dev/null)" || MENU_HERE=""
   fi
   MENU_HERE_AT="$SECONDS"
@@ -8509,7 +11365,7 @@ wiz_installed() {
   if [ -f "$ENV_FILE" ]; then
     return 0
   fi
-  command -v podman >/dev/null 2>&1 && [ -n "$(here_containers)" ]
+  engine_cli && [ -n "$(here_containers)" ]
 }
 
 # Names of the running jobs ("#3 Upgrade to ..."), one per line; empty when none runs.
@@ -8559,13 +11415,17 @@ wiz_set() {
   ok "$1 = \"$2\""
 }
 
-# wiz_ask NAME QUESTION -> asks for a new value of a setting (Enter keeps it), checked like on the
-# settings screen; a port must not be taken by another setting or, on a new installation, by
-# another program. Fails at the end of input.
+# wiz_ask NAME QUESTION [new] -> asks for a new value of a setting (Enter keeps it), checked like on the
+# settings screen; a port must not be taken by another setting or, on a new installation (no data volumes
+# yet, or "new": the new installation of this folder), by another program. Fails at 0 and at the end of
+# input.
 wiz_ask() {
-  local name="$1" question="$2" value problem other ans
+  local name="$1" question="$2" new="${3:-}" value problem other ans
   while true; do
     ui_ask value "$question [${!name}]:" || return 1
+    if [ "$value" = "0" ]; then
+      return 1
+    fi
     value="${value:-${!name}}"
     if ! problem="$(settings_check "$name" "$value" "${!name}")"; then
       err "$problem"
@@ -8582,7 +11442,7 @@ wiz_ask() {
         err "$problem"
         continue
       fi
-      if [ -z "$(project_volumes)" ] && wiz_port_used "$value"; then
+      if { [ "$new" = "new" ] || [ -z "$(project_volumes)" ]; } && wiz_port_used "$value"; then
         warn "Port $value is already in use on this server."
         ans=0
         wiz_yes_no "Use it anyway?" n || ans=$?
@@ -8608,6 +11468,463 @@ wiz_port_used() {
     lsof -nP -iTCP:"$1" -sTCP:LISTEN >/dev/null 2>&1
   else
     return 1
+  fi
+}
+
+# wiz_and A B C -> "A, B and C"
+wiz_and() {
+  local out="$1"
+  shift
+  while [ $# -gt 1 ]; do
+    out="$out, $1"
+    shift
+  done
+  if [ $# -eq 1 ]; then
+    out="$out and $1"
+  fi
+  printf '%s' "$out"
+}
+
+# The marker of a first start that was put off (stopped at the first question of the new installation):
+# the menu then opens without it; I still starts it
+SETUP_LATER_FILE="$WORK_DIR/.setup-later"
+
+# True when the menu starts with the new installation: nothing is installed in this folder (no .env, no
+# compose file, no containers of this project in any engine), no other installation is on this server,
+# no job runs, and the first start was not put off (.setup-later). The engine CONTAINER_ENGINE names must
+# answer: one that does not (a stopped Docker daemon, Docker Desktop or Colima not started) may hide the
+# installation of this folder - the menu then opens, and its engine check starts it.
+wiz_first_start() {
+  local k
+  if [ -f "$SETUP_LATER_FILE" ] || [ -f "$ENV_FILE" ] || [ -f "$COMPOSE_FILE" ]; then
+    return 1
+  fi
+  if [ -z "$SCRIPT_PATH" ] || [ ! -w "$SCRIPT_PATH" ] || [ ! -w "$WORK_DIR" ] || [ -n "$(job_running_ids)" ]; then
+    return 1
+  fi
+  if [ -n "$CONTAINER_ENGINE" ] && engine_cli && [ -z "$(engine_rootless)" ]; then
+    return 1
+  fi
+  for k in $(engine_kinds); do
+    if engine_has_data "$k" containers; then
+      return 1
+    fi
+  done
+  [ -z "$(first_installation_dir)" ]
+}
+
+# wiz_engine_row NUMBER LABEL STATE REASON -> one engine of the Engine step; one that cannot be used
+# here has no number, only the reason (wrapped to the width of the terminal)
+wiz_engine_row() {
+  local text line first="yes"
+  if [ -n "$4" ]; then
+    while IFS= read -r line; do
+      if [ "$first" = "yes" ]; then
+        printf '   %s  %s %s\n' "${C_DIM}-$C_RST" "$C_DIM$(ui_pad "$2" 16)$C_RST" "$C_DIM$line$C_RST"
+        first="no"
+      else
+        printf '%23s%s\n' "" "$C_DIM$line$C_RST"
+      fi
+    done < <(printf '%s\n' "$4" | fold -s -w $(($(settings_width) - 24)) | sed 's/ *$//')
+    return 0
+  fi
+  case "$3" in
+    data) text="$C_GRN$UI_OK$C_RST holds the data of this folder" ;;
+    ready) text="$C_GRN$UI_OK$C_RST ready" ;;
+    installed) text="installed - the setup completes it" ;;
+    *) text="${C_DIM}not installed - the setup installs it$C_RST" ;;
+  esac
+  printf '   %s  %s %s\n' "$C_BLD$1$C_RST" "$(ui_pad "$2" 16)" "$text"
+}
+
+# wiz_engine_pick CHOICES [FAILED] -> the engine the Engine step takes on Enter, from the lines of
+# engine_choices: the one that holds the data of this folder, else CONTAINER_ENGINE, else one that is ready,
+# else one that is installed, else the first one the setup installs (on macOS Colima before Docker Desktop,
+# whose license comes first). FAILED, an engine whose setup did not work, only when no other one can be used.
+wiz_engine_pick() {
+  local kind label state reason rank best="" best_rank=9 pass
+  for pass in other failed; do
+    while IFS='|' read -r kind label state reason; do
+      if [ -z "$kind" ] || [ -n "$reason" ] || { [ "$pass" = "other" ] && [ "$kind" = "${2:-}" ]; }; then
+        continue
+      fi
+      case "$state" in
+        data) rank=1 ;;
+        ready) rank=3 ;;
+        installed) rank=4 ;;
+        *) rank=5 ;;
+      esac
+      if [ "$kind" = "$CONTAINER_ENGINE" ] && [ "$rank" -eq 1 ]; then
+        rank=0
+      elif [ "$kind" = "$CONTAINER_ENGINE" ]; then
+        rank=2
+      elif [ "$OS_KIND:$kind:$rank" = "Darwin:docker:5" ]; then
+        rank=6
+      fi
+      if [ "$rank" -lt "$best_rank" ]; then
+        best="$kind"
+        best_rank="$rank"
+      fi
+    done <<< "$1"
+    if [ -n "$best" ]; then
+      break
+    fi
+  done
+  printf '%s' "$best"
+}
+
+# The Engine step of the new installation: the engines of this machine and the one to use (Enter: see
+# wiz_engine_pick), then its setup when it is not ready (after showing the commands and asking).
+# 0: ready; 1: stopped; 2: stopped at the first question (the choice of the engine).
+wiz_engine() {
+  local -a kinds=() labels=() states=() reasons=()
+  local choices kind label state reason i def pick choice rc failed="" first="yes" retry
+  while true; do
+    kinds=()
+    labels=()
+    states=()
+    reasons=()
+    choices="$(engine_choices)"
+    while IFS='|' read -r kind label state reason; do
+      if [ -n "$kind" ]; then
+        kinds+=("$kind")
+        labels+=("$label")
+        states+=("$state")
+        reasons+=("$reason")
+      fi
+    done <<< "$choices"
+    if [ "${#kinds[@]}" -eq 0 ]; then
+      err "The container engines of this machine could not be listed."
+      return 1
+    fi
+    pick="$(wiz_engine_pick "$choices" "$failed")"
+    def=""
+    for i in "${!kinds[@]}"; do
+      if [ "${kinds[i]}" = "$pick" ]; then
+        def="$i"
+      fi
+    done
+    echo "  The container engine runs the containers of the Catalog - one per server:"
+    echo
+    for i in "${!kinds[@]}"; do
+      wiz_engine_row $((i + 1)) "${labels[i]}" "${states[i]}" "${reasons[i]}"
+    done
+    printf '   %s  %s\n' "${C_BLD}0$C_RST" "${C_DIM}stop$C_RST"
+    echo
+    if [ -z "$def" ]; then
+      err "None of these engines can run the Catalog here (see the reasons above)."
+      return 1
+    fi
+    if ! ui_ask choice "Select [$((def + 1))]:"; then
+      echo
+      choice="0"
+    fi
+    choice="${choice:-$((def + 1))}"
+    if [ "$choice" = "0" ]; then
+      if [ "$first" = "yes" ]; then
+        return 2
+      fi
+      return 1
+    fi
+    if ! [[ "$choice" =~ ^[0-9]+$ ]] || [ "$choice" -lt 1 ] || [ "$choice" -gt "${#kinds[@]}" ]; then
+      warn "Invalid choice: $choice"
+      echo
+      continue
+    fi
+    i=$((choice - 1))
+    if [ -n "${reasons[i]}" ]; then
+      warn "${labels[i]} cannot be used here: ${reasons[i]}"
+      echo
+      continue
+    fi
+    echo
+    first="no"
+    if ! engine_choose "${kinds[i]}"; then
+      echo
+      continue
+    fi
+    if engine_ready; then
+      ok "$ENGINE_NAME is ready."
+      return 0
+    fi
+    while true; do
+      echo
+      retry="yes"
+      if [ "$ENGINE" = "podman" ] && [ "$OS_KIND" != "Darwin" ] && [ "$(id -u)" -ne 0 ]; then
+        err "Rootful Podman needs root: start $SCRIPT_NAME again with sudo."
+        retry="no"
+      else
+        detect_compose >/dev/null 2>&1 || true
+        info "$ENGINE_NAME is not ready yet${COMPOSE_PROBLEM:+: $COMPOSE_PROBLEM}"
+        rc=0
+        CONFIRM_LAST=""
+        engine_setup ask || rc=$?
+        if [ "$rc" -eq 0 ] && engine_ready; then
+          ok "$ENGINE_NAME is ready."
+          ui_pause_tty
+          return 0
+        fi
+        if [ "$CONFIRM_LAST" = "0" ]; then
+          return 1
+        fi
+      fi
+      echo
+      warn "$ENGINE_NAME is not ready - the Catalog cannot start without it."
+      if [ "$retry" = "yes" ]; then
+        printf '   %s  %s\n' "${C_BLD}1$C_RST" "Try again"
+      fi
+      printf '   %s  %s\n' "${C_BLD}2$C_RST" "Choose another engine"
+      printf '   %s  %s\n' "${C_BLD}0$C_RST" "${C_DIM}stop$C_RST"
+      echo
+      while true; do
+        if [ "$retry" = "yes" ]; then
+          ui_ask choice "Select [1]:" || return 1
+          choice="${choice:-1}"
+        else
+          ui_ask choice "Select [2]:" || return 1
+          choice="${choice:-2}"
+        fi
+        case "$choice" in
+          0|2) break ;;
+          1)
+            if [ "$retry" = "yes" ]; then
+              break
+            fi
+            ;;
+        esac
+        warn "Invalid choice: $choice"
+      done
+      case "$choice" in
+        0) return 1 ;;
+        2)
+          failed="$ENGINE_KIND"
+          echo
+          break
+          ;;
+      esac
+    done
+  done
+}
+
+# The Domain step of the new installation: the domain name of the Catalog (Enter keeps the saved one,
+# - removes it), checked like on the settings screen, then its DNS records (a name not in DNS can be
+# typed again); saved at once. 1: stopped.
+wiz_domain() {
+  local input d problem ans
+  echo "  Domain name of the Catalog (e.g. catalog.example.com) - Enter: none, the"
+  echo "  Catalog then runs on http://$(host_ip):$CATALOG_WEB_PORT."
+  echo "  The DNS record of the name must point to this server."
+  echo
+  while true; do
+    if [ -n "$CATALOG_DOMAIN" ]; then
+      ui_ask input "Domain name [$CATALOG_DOMAIN, - removes it]:" || return 1
+    else
+      ui_ask input "Domain name [none]:" || return 1
+    fi
+    case "$input" in
+      0) return 1 ;;
+      "") d="$CATALOG_DOMAIN" ;;
+      -) d="" ;;
+      *)
+        d="$(domain_normalize "$input")"
+        if [ -z "$d" ]; then
+          err "Give a host name, e.g. catalog.example.com (- removes the domain)."
+          continue
+        fi
+        ;;
+    esac
+    if [ -n "$d" ]; then
+      if ! problem="$(settings_check CATALOG_DOMAIN "$d" "")"; then
+        err "$problem"
+        continue
+      fi
+      echo
+      domain_checks "$d"
+      if [ "$DOMAIN_DNS" = "missing" ]; then
+        ans=0
+        wiz_yes_no "Keep $d? (n: type another name)" y || ans=$?
+        case "$ans" in
+          0) ;;
+          1) echo; continue ;;
+          *) return 1 ;;
+        esac
+      fi
+    fi
+    if domain_apply "$d" "$INSTALL_NGINX_PROXY_MANAGER" "$NPM_ADMIN_EMAIL"; then
+      return 0
+    fi
+  done
+}
+
+# Why the domain gets no Let's Encrypt certificate at the start (empty: it gets one): a name Let's Encrypt
+# refuses, no e-mail address it takes, or no DNS record yet (domain_checks)
+wiz_no_https() {
+  if domain_private "$CATALOG_DOMAIN"; then
+    printf "no Let's Encrypt for .%s names" "${CATALOG_DOMAIN##*.}"
+  elif ! npm_email_ok "$NPM_ADMIN_EMAIL"; then
+    printf 'no e-mail address'
+  elif [ "$DOMAIN_DNS_NAME" = "$CATALOG_DOMAIN" ] && [ "$DOMAIN_DNS" = "missing" ]; then
+    printf 'not in DNS yet'
+  fi
+}
+
+# The address of the Catalog under its domain with the saved settings (empty without a domain): https with
+# Nginx Proxy Manager and a certificate at the start, otherwise http
+wiz_domain_url() {
+  if [ -z "$CATALOG_DOMAIN" ]; then
+    return 0
+  fi
+  if [ "$INSTALL_NGINX_PROXY_MANAGER" != "true" ] || domain_private "$CATALOG_DOMAIN"; then
+    domain_baseurl "$CATALOG_DOMAIN" "$INSTALL_NGINX_PROXY_MANAGER"
+  elif [ -z "$(wiz_no_https)" ]; then
+    printf 'https://%s' "$CATALOG_DOMAIN"
+  else
+    printf 'http://%s (HTTPS: option 24)' "$CATALOG_DOMAIN"
+  fi
+}
+
+# The addresses of the Catalog with the saved settings, in one line: the domain, and Catalog Web on the
+# address of this server
+wiz_addresses() {
+  local direct
+  direct="http://$(host_ip):$CATALOG_WEB_PORT"
+  if [ -n "$CATALOG_DOMAIN" ]; then
+    printf '%s %s %s' "$(wiz_domain_url)" "$UI_SEP" "$direct"
+  else
+    printf '%s' "$direct"
+  fi
+}
+
+# The summary of the new installation before the start, one value per row: the engine, the addresses,
+# Nginx Proxy Manager and HTTPS, the versions and the folder
+wiz_summary() {
+  local -a rows=()
+  local why
+  rows+=("$(ui_pad "Engine" 10) $ENGINE_NAME")
+  if [ -n "$CATALOG_DOMAIN" ]; then
+    rows+=("$(ui_pad "Address" 10) $(wiz_domain_url)")
+    rows+=("$(ui_pad "Direct" 10) http://$(host_ip):$CATALOG_WEB_PORT")
+  else
+    rows+=("$(ui_pad "Address" 10) http://$(host_ip):$CATALOG_WEB_PORT")
+  fi
+  if [ "$INSTALL_NGINX_PROXY_MANAGER" = "true" ]; then
+    rows+=("$(ui_pad "Proxy" 10) Nginx Proxy Manager $NGINX_PROXY_MANAGER_TAG (admin page: port $NPM_ADMIN_PORT)")
+    why="$(wiz_no_https)"
+    if [ -z "$CATALOG_DOMAIN" ]; then
+      rows+=("$(ui_pad "HTTPS" 10) none - no domain name (option 24 adds one)")
+    elif [ -z "$why" ]; then
+      rows+=("$(ui_pad "HTTPS" 10) Let's Encrypt certificate at the start ($NPM_ADMIN_EMAIL)")
+    elif domain_private "$CATALOG_DOMAIN"; then
+      rows+=("$(ui_pad "HTTPS" 10) HTTP only - $why")
+    else
+      rows+=("$(ui_pad "HTTPS" 10) HTTP for now: $why - option 24 adds HTTPS")
+    fi
+  else
+    rows+=("$(ui_pad "Proxy" 10) none - Catalog Web answers directly")
+  fi
+  rows+=("$(ui_pad "Versions" 10) Catalog $CATALOG_VERSION $UI_SEP MongoDB $(version_core "$MONGO_TAG") $UI_SEP OpenSearch $(version_core "$OPENSEARCH_TAG")")
+  rows+=("$(ui_pad "" 10) RabbitMQ $(version_core "$RABBITMQ_TAG") $UI_SEP MinIO $MINIO_TAG")
+  rows+=("$(ui_pad "Folder" 10) $WORK_DIR")
+  ui_box "$(settings_width)" "Summary" "${rows[@]}"
+}
+
+# The Proxy step of the new installation: Nginx Proxy Manager or not, then with a domain the e-mail address
+# for Let's Encrypt and the login of Nginx Proxy Manager, and another port for Catalog Web when its port is
+# in use; saved at once. The default is yes with a domain (a saved no counts while the domain is the one
+# saved before this run: wiz_proxy DOMAIN-BEFORE), no without one or when its ports are in use. 1: stopped.
+wiz_proxy() {
+  local d="$CATALOG_DOMAIN" before="${1:-}" p busy="" def="n" ans npm email cur input problem
+  if [ -n "$d" ]; then
+    domain_checks "$d"
+    echo
+  fi
+  echo "  Nginx Proxy Manager is a reverse proxy in front of the Catalog. It listens on"
+  echo "  ports $NPM_HTTP_PORT and $NPM_HTTPS_PORT; its admin page is on port $NPM_ADMIN_PORT."
+  if [ -z "$d" ]; then
+    echo "  Without a domain name it only forwards http://$(host_ip) to the Catalog:"
+    echo "  no HTTPS, and the forwarding is set up by hand in its admin page."
+    echo "  Option 24 adds a domain name later."
+  elif domain_private "$d"; then
+    echo "  With it the Catalog answers on http://$d."
+    echo "  Let's Encrypt gives no certificates for .${d##*.} names - HTTPS needs an own"
+    echo "  certificate, added in its admin page."
+  elif [ "$DOMAIN_DNS" = "missing" ]; then
+    echo "  With it the Catalog answers on https://$d with a free"
+    echo "  Let's Encrypt certificate once the name points to this server - until then on"
+    echo "  http://$d (option 24 requests the certificate later)."
+  else
+    echo "  With it the Catalog answers on https://$d with a free"
+    echo "  Let's Encrypt certificate, set up automatically."
+  fi
+  if [ -n "$d" ] && { [ "$d" != "$before" ] || [ "$INSTALL_NGINX_PROXY_MANAGER" = "true" ]; }; then
+    def="y"
+  fi
+  for p in "$NPM_HTTP_PORT" "$NPM_HTTPS_PORT" "$NPM_ADMIN_PORT"; do
+    if wiz_port_used "$p"; then
+      busy="$busy $p"
+    fi
+  done
+  if [ -n "$busy" ]; then
+    echo
+    if [[ "${busy# }" == *" "* ]]; then
+      warn "Ports $(wiz_and $busy) are in use on this server: Nginx Proxy Manager"
+    else
+      warn "Port ${busy# } is in use on this server: Nginx Proxy Manager"
+    fi
+    echo "  cannot start while another program listens there."
+    def="n"
+  fi
+  while true; do
+    echo
+    ans=0
+    wiz_yes_no "Install Nginx Proxy Manager?" "$def" || ans=$?
+    case "$ans" in
+      0) npm="true" ;;
+      1) npm="false" ;;
+      *) return 1 ;;
+    esac
+    email="$NPM_ADMIN_EMAIL"
+    if [ -n "$d" ] && [ "$npm" = "true" ] && ! domain_private "$d"; then
+      cur=""
+      if npm_email_ok "$NPM_ADMIN_EMAIL"; then
+        cur="$NPM_ADMIN_EMAIL"
+      fi
+      echo
+      echo "  Let's Encrypt needs a real e-mail address for its expiry notices; it is also"
+      echo "  the login of Nginx Proxy Manager. Enter: none - no certificate now, option 24"
+      echo "  adds HTTPS later."
+      while true; do
+        ui_ask input "E-mail address [${cur:-none}${cur:+, - none}]:" || return 1
+        input="${input//[[:space:]]/}"
+        input="${input,,}"
+        case "$input" in
+          0) return 1 ;;
+          "") email="$cur"; break ;;
+          -) email=""; break ;;
+        esac
+        if ! problem="$(settings_check NPM_ADMIN_EMAIL "$input" "")"; then
+          err "$problem"
+        elif ! npm_email_ok "$input"; then
+          err "Let's Encrypt does not take addresses at ${input##*@} - give a real one."
+        else
+          email="$input"
+          break
+        fi
+      done
+      if [ -z "$email" ]; then
+        warn "No e-mail address: HTTP only for now - option 24 adds HTTPS later."
+      fi
+    fi
+    echo
+    if domain_apply "$d" "$npm" "$email"; then
+      break
+    fi
+  done
+  if wiz_port_used "$CATALOG_WEB_PORT"; then
+    echo
+    warn "Port $CATALOG_WEB_PORT (Catalog Web) is in use on this server - choose another."
+    wiz_ask CATALOG_WEB_PORT "Port of Catalog Web on this server" new || return 1
+    domain_apply "$CATALOG_DOMAIN" "$INSTALL_NGINX_PROXY_MANAGER" "$NPM_ADMIN_EMAIL" || return 1
   fi
 }
 
@@ -8637,11 +11954,12 @@ install_snapshots() {
   download_snapshot
 }
 
-# I: a new installation, step by step - check, main settings, files, start, catalog data, done.
-# In a folder that is installed already: repair, continue with the data, update or remove.
+# I: in a folder without an installation the new installation (install_new; first: the menu starts with
+# it on the first start here). In a folder that is installed already: repair (check, settings, files,
+# start), continue with the data, update or remove. install_wizard [first]
 install_wizard() {
   local -a steps=(Check Settings Files Start Data Done)
-  local jobs found choice rc ans fresh="yes" step=1 installed="" data="no" since
+  local jobs found choice rc ans step=1 installed="" npm
   jobs="$(wiz_running_jobs)"
   if [ -n "$jobs" ]; then
     warn "A background job is running - wait for it or follow it with J first:"
@@ -8657,69 +11975,71 @@ install_wizard() {
     return 0
   fi
 
-  wiz_head "Install" 1 "${steps[@]}"
-  if wiz_installed; then
-    fresh="no"
-    installed="$(wiz_installed_version)"
-    warn "This folder already has an installation (Catalog ${installed:-$CATALOG_VERSION}, stack: $(stack_state))."
-    local repair="Repair: check it, write the files again and start it (passwords, data and version are kept)"
-    if [ ! -f "$ENV_FILE" ]; then
-      found="$(newest_env_backup)"
-      if [ -n "$found" ]; then
-        echo "  $ENV_FILE is missing: a repair takes the passwords from its newest backup $found."
-        repair="Repair: check it, write the files again with the passwords of that backup, and start it"
-      else
-        warn "$ENV_FILE is missing and has no backup. It holds the passwords of MongoDB and RabbitMQ:"
-        echo "  new passwords would not open the existing data. Put the old $ENV_FILE back first if you have it."
-        repair="Repair: check it and write the files again - needs the old $ENV_FILE first (see above)"
-      fi
-    fi
-    echo
-    printf '   %s  %s\n' "${C_BLD}1$C_RST" "$repair"
-    printf '   %s  %s\n' "${C_BLD}2$C_RST" "Continue with the catalog data (step 5)"
-    printf '   %s  %s\n' "${C_BLD}3$C_RST" "Update it instead (U)"
-    printf '   %s  %s\n' "${C_BLD}4$C_RST" "Remove it first (R), then install from scratch"
-    printf '   %s  %s\n' "${C_BLD}0$C_RST" "${C_DIM}cancel$C_RST"
-    echo
-    ui_ask choice "Select [0]:" || choice="0"
-    case "$choice" in
-      1) wiz_head "Install" 1 "${steps[@]}" ;;
-      2) step=5 ;;
-      3) update_wizard; return 0 ;;
-      4) remove_wizard; return 0 ;;
-      *) info "Cancelled."; return 0 ;;
-    esac
-  else
+  if ! wiz_installed; then
     found="$(stack_foreign)" || found=""
     if [ -z "$found" ]; then
       found="$(first_installation_dir)"
     fi
-    if [ -n "$found" ]; then
-      warn "A Catalog installation already exists on this server: $found"
-      echo "  The Catalog runs once per server (its containers have fixed names), so a second one cannot start."
-      echo
-      printf '   %s  %s\n' "${C_BLD}1$C_RST" "Take it over into this folder (option 23) - keeps its settings, passwords and data"
-      printf '   %s  %s\n' "${C_BLD}0$C_RST" "${C_DIM}cancel (or remove it with R in its own folder first)$C_RST"
-      echo
-      ui_ask choice "Select [0]:" || choice="0"
-      if [ "$choice" = "1" ]; then
-        adopt_installation || true
-      else
-        info "Cancelled."
-      fi
+    if [ -z "$found" ]; then
+      install_new "${1:-}"
       return 0
     fi
+    wiz_head "Install" 1 Engine Domain Proxy Versions Install Data Done
+    warn "A Catalog installation already exists on this server: $found"
+    echo "  The Catalog runs once per server (its containers have fixed names), so a second one cannot start."
+    echo
+    printf '   %s  %s\n' "${C_BLD}1$C_RST" "Take it over into this folder (option 23) - keeps its settings, passwords and data"
+    printf '   %s  %s\n' "${C_BLD}0$C_RST" "${C_DIM}cancel (or remove it with R in its own folder first)$C_RST"
+    echo
+    ui_ask choice "Select [0]:" || choice="0"
+    if [ "$choice" = "1" ]; then
+      adopt_installation || true
+    else
+      info "Cancelled."
+    fi
+    return 0
   fi
 
+  wiz_head "Install" 1 "${steps[@]}"
+  installed="$(wiz_installed_version)"
+  warn "This folder already has an installation (Catalog ${installed:-$CATALOG_VERSION}, stack: $(stack_state))."
+  local repair="Repair: check it, write the files again and start it (passwords, data and version are kept)"
+  if [ ! -f "$ENV_FILE" ]; then
+    found="$(newest_env_backup)"
+    if [ -n "$found" ]; then
+      echo "  $ENV_FILE is missing: a repair takes the passwords from its newest backup $found."
+      repair="Repair: check it, write the files again with the passwords of that backup, and start it"
+    else
+      warn "$ENV_FILE is missing and has no backup. It holds the passwords of MongoDB and RabbitMQ:"
+      echo "  new passwords would not open the existing data. Put the old $ENV_FILE back first if you have it."
+      repair="Repair: check it and write the files again - needs the old $ENV_FILE first (see above)"
+    fi
+  fi
+  echo
+  printf '   %s  %s\n' "${C_BLD}1$C_RST" "$repair"
+  printf '   %s  %s\n' "${C_BLD}2$C_RST" "Continue with the catalog data (step 5)"
+  printf '   %s  %s\n' "${C_BLD}3$C_RST" "Update it instead (U)"
+  printf '   %s  %s\n' "${C_BLD}4$C_RST" "Remove it first (R), then install from scratch"
+  printf '   %s  %s\n' "${C_BLD}0$C_RST" "${C_DIM}cancel$C_RST"
+  echo
+  ui_ask choice "Select [0]:" || choice="0"
+  case "$choice" in
+    1) wiz_head "Install" 1 "${steps[@]}" ;;
+    2) step=5 ;;
+    3) update_wizard; return 0 ;;
+    4) remove_wizard; return 0 ;;
+    *) info "Cancelled."; return 0 ;;
+  esac
+
   if [ "$step" -le 1 ]; then
-    # 1. Check (Podman first; MongoDB 8 on the kernels 6.19 to 7.0.x needs a workaround, which the files get)
-    podman_offer
+    # 1. Check (the engine first; MongoDB 8 on the kernels 6.19 to 7.0.x needs a workaround, which the files get)
+    engine_offer
     if mongo_rseq_workaround "$MONGO_TAG"; then
       info "MongoDB $MONGO_TAG on this kernel ($(engine_kernel)) starts with GLIBC_TUNABLES=glibc.pthread.rseq=1 (SERVER-121912)."
       echo "  The files get it by themselves. TCMalloc then uses per-thread caches: some performance cost."
       echo
     fi
-    echo "  Podman, podman compose, the kernel of the containers, ports, vm.max_map_count and the time zone:"
+    echo "  $ENGINE_NAME, $ENGINE compose, the kernel of the containers, ports, vm.max_map_count and the time zone:"
     echo
     ans=0
     if wiz_run do_check; then
@@ -8733,45 +12053,40 @@ install_wizard() {
       return 0
     fi
 
-    # 2. Settings
+    # 2. Settings (a repair keeps the running version: an upgrade needs the backup and rollback of U)
     wiz_head "Install" 2 "${steps[@]}"
     echo "  The main settings - all others are on the settings screen (option 1)."
     echo
-    if [ "$fresh" = "yes" ]; then
-      if [ "$CHECK_FOR_UPDATES" = "true" ] && [ "$HUB_STATUS" != "ok" ]; then
-        check_latest_version
-      fi
-      if [ "$HUB_STATUS" = "ok" ] && [ -n "$HUB_STABLE" ] && is_version "$CATALOG_VERSION" && version_gt "$HUB_STABLE" "$CATALOG_VERSION"; then
-        ans=0
-        wiz_yes_no "Install the newest stable Catalog $HUB_STABLE (instead of $CATALOG_VERSION)?" y || ans=$?
-        case "$ans" in
-          0) wiz_set CATALOG_VERSION "$HUB_STABLE" ;;
-          1) ;;
-          *) wiz_stop "I"; return 0 ;;
-        esac
-      else
-        echo "  Catalog version: $CATALOG_VERSION $C_DIM(option 8 picks another one)$C_RST"
-      fi
-    else
-      # a repair keeps the running version: an upgrade needs the backup and rollback of U
-      if is_version "$installed" && [ "$installed" != "$CATALOG_VERSION" ]; then
-        warn "CATALOG_VERSION is $CATALOG_VERSION, the installation has $installed - the repair keeps $installed (U upgrades with backup and rollback)."
-        wiz_set CATALOG_VERSION "$installed"
-      fi
-      echo "  Catalog version: $CATALOG_VERSION $C_DIM(kept - U updates it)$C_RST"
+    if is_version "$installed" && [ "$installed" != "$CATALOG_VERSION" ]; then
+      warn "CATALOG_VERSION is $CATALOG_VERSION, the installation has $installed - the repair keeps $installed (U upgrades with backup and rollback)."
+      wiz_set CATALOG_VERSION "$installed"
     fi
+    echo "  Catalog version: $CATALOG_VERSION $C_DIM(kept - U updates it)$C_RST"
     ans=0
     wiz_yes_no "Install Nginx Proxy Manager as reverse proxy with TLS (ports $NPM_HTTP_PORT, $NPM_HTTPS_PORT and $NPM_ADMIN_PORT)?" "$(if [ "$INSTALL_NGINX_PROXY_MANAGER" = "true" ]; then echo y; else echo n; fi)" || ans=$?
     case "$ans" in
-      0) wiz_set INSTALL_NGINX_PROXY_MANAGER true ;;
-      1) wiz_set INSTALL_NGINX_PROXY_MANAGER false ;;
+      0) npm="true" ;;
+      1) npm="false" ;;
       *) wiz_stop "I"; return 0 ;;
     esac
+    # with a domain, BASEURL follows Nginx Proxy Manager
+    if [ -n "$CATALOG_DOMAIN" ]; then
+      if ! domain_apply "$CATALOG_DOMAIN" "$npm" "$NPM_ADMIN_EMAIL"; then
+        wiz_stop "I"
+        return 0
+      fi
+    else
+      wiz_set INSTALL_NGINX_PROXY_MANAGER "$npm"
+    fi
     if ! wiz_ask CATALOG_WEB_PORT "Port of Catalog Web on this server"; then
       wiz_stop "I"
       return 0
     fi
-    tz_offer_alignment
+    tz_offer_alignment wizard
+    if [ "$TZ_STOPPED" = "true" ]; then
+      wiz_stop "I"
+      return 0
+    fi
     reload_settings
     echo
     ans=0
@@ -8823,9 +12138,169 @@ install_wizard() {
       return 0
     fi
   fi
+  install_finish 5 "${steps[@]}"
+}
 
-  # 5. Data
+# I in a folder without an installation: the engine, the domain name, Nginx Proxy Manager and the
+# versions, then the summary, the check, the files and the start (with Nginx Proxy Manager for the
+# domain), the catalog data. Every answer is saved at once, so the task starts again with them; 0 or
+# the end of input at a question stops it. install_new [first]
+install_new() {
+  local -a steps=(Engine Domain Proxy Versions Install Data Done)
+  local rc ans out k holders="" before
+  wiz_head "Install" 1 "${steps[@]}"
+  # data volumes of this project without their passwords (.env, or a backup of it): new passwords
+  # would not open them
+  if [ ! -f "$ENV_FILE" ] && [ -z "$(newest_env_backup)" ]; then
+    for k in $(engine_kinds); do
+      if engine_has_data "$k"; then
+        holders="$holders $k"
+      fi
+    done
+    if [ -n "$holders" ]; then
+      warn "Data volumes of project \"$(stack_project)\" are in $(kinds_text "${holders# }"), but this folder has no $ENV_FILE"
+      echo "  (and no backup of it). The passwords of MongoDB, RabbitMQ and Nginx Proxy"
+      echo "  Manager are in these volumes: new passwords would not open them. Put the old"
+      echo "  $ENV_FILE back into this folder, or remove the volumes with R if their data is"
+      echo "  not needed. Nothing was changed."
+      return 0
+    fi
+  fi
+  if [ "${1:-}" = "first" ]; then
+    echo "  ${C_BLD}New installation.$C_RST A few questions - engine, domain, proxy, versions - then"
+    echo "  the Catalog starts. 0 at any question opens the full menu."
+    echo
+  fi
+
+  # 1. Engine (stopped at its first question: the next start opens the menu, I starts the installation)
+  rc=0
+  wiz_engine || rc=$?
+  if [ "$rc" -ne 0 ]; then
+    wiz_stop "I"
+    if [ "$rc" -eq 2 ] && [ ! -f "$SETUP_LATER_FILE" ] && touch -- "$SETUP_LATER_FILE" 2>/dev/null; then
+      echo "  The next start opens the menu directly."
+    fi
+    return 0
+  fi
+  # an engine that did not answer before may hold the installation of this folder: then its repair
+  menu_scan_done
+  if wiz_installed; then
+    install_wizard
+    return 0
+  fi
+
+  # 2. Domain
+  before="$CATALOG_DOMAIN"
+  wiz_head "Install" 2 "${steps[@]}"
+  if ! wiz_domain; then
+    wiz_stop "I"
+    return 0
+  fi
+
+  # 3. Proxy
+  wiz_head "Install" 3 "${steps[@]}"
+  if ! wiz_proxy "$before"; then
+    wiz_stop "I"
+    return 0
+  fi
+
+  # 4. Versions (Enter takes the recommended ones); first the addresses the answers so far give
+  wiz_head "Install" 4 "${steps[@]}"
+  ok "The Catalog: $(wiz_addresses)"
+  echo
+  if ! choose_versions; then
+    wiz_stop "I"
+    return 0
+  fi
+
+  # 5. Install: the summary, the time zone, the check, then the files and the start as one answer
   wiz_head "Install" 5 "${steps[@]}"
+  reload_settings
+  wiz_summary
+  if mongo_rseq_workaround "$MONGO_TAG"; then
+    info "MongoDB $(version_core "$MONGO_TAG") on kernel $(engine_kernel) needs a workaround (SERVER-121912):"
+    echo "  it starts with GLIBC_TUNABLES=glibc.pthread.rseq=1, which the files get by"
+    echo "  themselves. TCMalloc then uses per-thread caches: some performance cost."
+  fi
+  tz_offer_alignment wizard
+  if [ "$TZ_STOPPED" = "true" ]; then
+    wiz_stop "I"
+    return 0
+  fi
+  echo
+  info "Checking the engine, Compose, the kernel, the ports and vm.max_map_count..."
+  rc=0
+  out="$(do_check 2>&1)" || rc=$?
+  ans=0
+  if [ "$rc" -eq 0 ]; then
+    # quiet: only the warnings
+    awk '/WARN/ { p = 1; print; next } p && /^      / { print; next } { p = 0 }' <<< "$out"
+    ok "All required checks passed."
+  else
+    printf '%s\n' "$out"
+    echo
+    wiz_yes_no "Some checks failed (see above). Continue anyway?" n || ans=$?
+  fi
+  if [ "$ans" -ne 0 ]; then
+    wiz_stop "I"
+    return 0
+  fi
+  echo
+  echo "  The first start pulls the images and takes a few minutes."
+  ans=0
+  wiz_yes_no "Write the files and start the Catalog?" y || ans=$?
+  if [ "$ans" -ne 0 ]; then
+    wiz_stop "I"
+    return 0
+  fi
+  echo
+  rc=0
+  wiz_run install_generate || rc=$?
+  case "$rc" in
+    0) ;;
+    4) wiz_stop "I"; return 0 ;;
+    *) err "The files could not be written (see above)."; wiz_stop "I"; return 0 ;;
+  esac
+  echo
+  rc=0
+  wiz_run run_job "Install: start the Catalog" -- install_start || rc=$?
+  case "$rc" in
+    0) ;;
+    3)
+      info "The start goes on in the background (J shows it). When it is done, I"
+      echo "  continues with the catalog data (choice 2) - or option 20, or 17 and 19."
+      if [ -n "$CATALOG_DOMAIN" ] && [ "$INSTALL_NGINX_PROXY_MANAGER" = "true" ]; then
+        echo "  Option 24 then sets up Nginx Proxy Manager for $CATALOG_DOMAIN."
+      fi
+      return 0
+      ;;
+    *)
+      err "The Catalog did not start cleanly (see above)."
+      echo "  Option 10 shows the logs, option 16 checks the server; I repairs it."
+      wiz_stop "I"
+      return 0
+      ;;
+  esac
+  # the proxy host and the certificate of the domain, through the API of Nginx Proxy Manager
+  if [ -n "$CATALOG_DOMAIN" ] && [ "$INSTALL_NGINX_PROXY_MANAGER" = "true" ]; then
+    echo
+    rc=0
+    wiz_run npm_setup_domain yes || rc=$?
+    if [ "$rc" -ne 0 ]; then
+      warn "Nginx Proxy Manager is not set up for $CATALOG_DOMAIN yet (see above)."
+      echo "  Option 24 retries it."
+    fi
+  fi
+  ui_pause_tty
+  install_finish 6 "${steps[@]}"
+}
+
+# The last steps of the install task: the catalog data (step DATA-STEP), then the summary.
+# install_finish DATA-STEP STEP-NAME...
+install_finish() {
+  local n="$1" choice since data="no"
+  shift
+  wiz_head "Install" "$n" "$@"
   echo "  The Catalog is empty until it gets its data from $CATALOG_CLOUD_URL."
   echo
   printf '   %s %s  %s\n' "${C_BLD}1$C_RST" "$(menu_icon run)" "Daily self-sync: the Catalog fetches the data itself $C_DIM(server with internet, option 20)$C_RST"
@@ -8857,26 +12332,30 @@ install_wizard() {
   esac
   ui_pause_tty
 
-  # 6. Done
-  wiz_head "Install" 6 "${steps[@]}"
+  wiz_head "Install" $((n + 1)) "$@"
   ok "The Catalog is installed: $(stack_state)."
   echo
   show_access_info
   echo
   case "$data" in
-    sync) echo "  Catalog data: the Catalog synchronizes itself every day ($AUTOSYNC_CRON in $TZ)." ;;
+    sync)
+      echo "  Catalog data: the Catalog synchronizes itself every day"
+      echo "  ($AUTOSYNC_CRON in $TZ)."
+      ;;
     snapshot) echo "  Catalog data: imported from the snapshots (option 19 imports newer ones)." ;;
     importing) echo "  Catalog data: the import runs in the background (J shows it)." ;;
     downloaded) warn "Catalog data: downloaded, not imported yet - option 19 imports it." ;;
-    downloading) echo "  Catalog data: the download runs in the background (J); option 19 imports it afterwards." ;;
-    *) warn "The Catalog has no data yet: option 20 (daily self-sync) or options 17 and 19 (snapshots)." ;;
+    downloading) echo "  Catalog data: downloading in the background (J); option 19 imports it then." ;;
+    *) warn "The Catalog has no data yet: option 20 (daily self-sync), or 17 and 19." ;;
   esac
-  echo "  Passwords: option 14 $UI_SEP Nginx Proxy Manager steps: option 15 $UI_SEP status: option 9"
+  echo "  Options: 14 passwords $UI_SEP 15 addresses $UI_SEP 24 domain and HTTPS $UI_SEP 9 status"
+  echo "  Next: the full menu - every option (H: help)."
+  rm -f -- "$SETUP_LATER_FILE"
 }
 
 # U: brings the installation up to date - the installer itself, then Docker Compose (the engine
-# behind "podman compose") and the Catalog with backup, health check and the patch updates of the
-# other components. update_wizard [STEP [NOTICE]]
+# behind "podman compose", or the installer's own Compose plugin of Docker) and the Catalog with backup,
+# health check and the patch updates of the other components. update_wizard [STEP [NOTICE]]
 update_wizard() {
   local -a steps=(Installer Catalog Done)
   local start="${1:-1}" notice="${2:-}" jobs rc ans before after target installed failed_before="no"
@@ -8918,9 +12397,9 @@ update_wizard() {
     ok "$notice"
     echo
   fi
-  # the newest Docker Compose; one that does not work with this Podman is not installed (root is
+  # the newest Docker Compose; one that does not work with this engine is not installed (root is
   # only needed to write a new one)
-  if command -v podman >/dev/null 2>&1; then
+  if engine_cli && compose_own; then
     use_sudo || SUDO=()
     install_compose_provider yes || warn "Docker Compose was not updated (see above)."
     echo
@@ -8948,10 +12427,11 @@ update_wizard() {
 
   # 3. Done (do_upgrade read Docker Hub in its subshell: this shell asks once more if it has to)
   wiz_head "Update" 3 "${steps[@]}"
-  if [ -z "$HUB_STABLE$LATEST_VERSION" ]; then
+  if [ -z "$HUB_VERSIONS$LATEST_VERSION" ]; then
     fetch_hub_versions >/dev/null 2>&1 || true
   fi
-  target="${HUB_STABLE:-${LATEST_VERSION:-${HUB_VERSIONS%%$'\n'*}}}"
+  target="$(recommended_catalog)"
+  target="${target:-$LATEST_VERSION}"
   installed="${after:-$(wiz_installed_version)}"
   if [ -f "$UPGRADE_FAILED_FILE" ]; then
     warn "The last upgrade did not become healthy - option 21 goes back. Catalog: ${installed:-unknown}."
@@ -8972,12 +12452,12 @@ update_wizard() {
     echo "  I (repair) writes them again with GLIBC_TUNABLES=glibc.pthread.rseq=1 and starts the stack."
   fi
   echo
-  echo "  Major versions of MongoDB, OpenSearch or RabbitMQ: option 8 (versions, offline bundle)."
+  echo "  Other versions of MongoDB, OpenSearch or RabbitMQ inside the series Raynet runs: option 8."
   echo "  Catalog data: the daily self-sync (option 20) keeps it current; offline servers import"
   echo "  the changes since their last snapshot with options 17 and 19."
 }
 
-# Project name of the stack, as Docker Compose (behind podman compose) names it from the folder
+# Project name of the stack, as Docker Compose names it from the folder
 # (or COMPOSE_PROJECT_NAME): lower case, a-z 0-9 _ -, without leading - and _
 stack_project() {
   local project="${COMPOSE_PROJECT_NAME:-$(basename -- "$WORK_DIR")}"
@@ -9037,7 +12517,7 @@ stack_containers() {
       services=" $(stack_compose_keys services | tr '\n' ' ') "
       repos=" $(stack_images | sed 's/:[^:/]*$//' | tr '\n' ' ') "
     fi
-    IFS='|' read -r wd svc image <<< "$(podman container inspect --format '{{index .Config.Labels "com.docker.compose.project.working_dir"}}|{{index .Config.Labels "com.docker.compose.service"}}|{{.Config.Image}}' "$id" 2>/dev/null)"
+    IFS='|' read -r wd svc image <<< "$("$ENGINE" container inspect --format '{{index .Config.Labels "com.docker.compose.project.working_dir"}}|{{index .Config.Labels "com.docker.compose.service"}}|{{.Config.Image}}' "$id" 2>/dev/null)"
     image="$(short_ref "$image")"
     if [ -n "$wd" ] && { [ "$wd" = "$WORK_DIR" ] || [ "$wd" -ef "$WORK_DIR" ]; }; then
       printf '%s|here|%s\n' "$id" "$image"
@@ -9046,7 +12526,7 @@ stack_containers() {
     else
       printf '%s|%s|%s\n' "$id" "${wd:-an unknown folder}" "$image"
     fi
-  done < <(podman ps -aq --filter "label=com.docker.compose.project=$(stack_project)" 2>/dev/null)
+  done < <("$ENGINE" ps -aq --filter "label=com.docker.compose.project=$(stack_project)" 2>/dev/null)
 }
 
 # Containers of this installation, one ID per line
@@ -9063,7 +12543,7 @@ stack_foreign() {
       printf '%s' "$owner"
       return 0
     fi
-  done < <(stack_containers)
+  done <<< "$(stack_containers)"
   return 1
 }
 
@@ -9071,7 +12551,7 @@ stack_foreign() {
 # this folder (its data volumes have the same names); fails when there is none
 stack_foreign_catalog() {
   local id owner image project dir p mine
-  if ! command -v podman >/dev/null 2>&1; then
+  if ! engine_cli; then
     return 1
   fi
   while IFS='|' read -r id owner image; do
@@ -9079,7 +12559,7 @@ stack_foreign_catalog() {
       printf '%s' "$owner"
       return 0
     fi
-  done < <(stack_containers)
+  done <<< "$(stack_containers)"
   mine="$(stack_project)"
   while IFS='|' read -r project dir _; do
     p="${project#"${project%%[!_-]*}"}"
@@ -9087,7 +12567,7 @@ stack_foreign_catalog() {
       printf '%s' "$dir"
       return 0
     fi
-  done < <(find_installations 2>/dev/null)
+  done <<< "$(find_installations 2>/dev/null)"
   return 1
 }
 
@@ -9117,7 +12597,7 @@ remove_volumes() {
   project="$(stack_project)"
   while IFS= read -r key; do
     v="${project}_$key"
-    if [ -n "$key" ] && podman volume exists "$v" 2>/dev/null; then
+    if [ -n "$key" ] && "$ENGINE" volume inspect "$v" >/dev/null 2>&1; then
       printf '%s\n' "$v"
     fi
   done < <(stack_compose_keys volumes)
@@ -9130,13 +12610,13 @@ remove_users() {
   ours=" $(remove_containers | tr '\n' ' ') "
   if [ "$2" = "ancestor" ]; then
     # Podman matches image names as a pattern: the image ID is exact
-    what="$(podman image inspect --format '{{.ID}}' "$(qualify_ref "$1")" 2>/dev/null)" || return 0
+    what="$("$ENGINE" image inspect --format '{{.ID}}' "$(qualify_ref "$1")" 2>/dev/null)" || return 0
   fi
   while IFS= read -r id; do
     if [ -n "$id" ] && [[ "$ours" != *" $id "* ]]; then
-      podman container inspect --format '{{.Name}}' "$id" 2>/dev/null | sed 's#^/##'
+      "$ENGINE" container inspect --format '{{.Name}}' "$id" 2>/dev/null | sed 's#^/##'
     fi
-  done < <(podman ps -aq --filter "$2=$what" 2>/dev/null)
+  done < <("$ENGINE" ps -aq --filter "$2=$what" 2>/dev/null)
 }
 
 # Images of this installation that are here and that no other container uses
@@ -9152,13 +12632,13 @@ remove_images() {
     short_ref "$img"
     echo
   done | sort -u | while IFS= read -r img; do
-    if [ -n "$img" ] && podman image exists "$(qualify_ref "$img")" 2>/dev/null && [ -z "$(remove_users "$img" ancestor)" ]; then
+    if [ -n "$img" ] && "$ENGINE" image inspect "$(qualify_ref "$img")" >/dev/null 2>&1 && [ -z "$(remove_users "$img" ancestor)" ]; then
       printf '%s\n' "$img"
     fi
   done
 }
 
-# True when the generated files are here and podman compose can use them
+# True when the generated files are here and the engine's compose can use them
 remove_compose_ok() {
   [ -f "$ENV_FILE" ] && [ -f "$COMPOSE_FILE" ] && detect_compose >/dev/null 2>&1
 }
@@ -9168,7 +12648,7 @@ remove_compose_ok() {
 remove_stack() {
   local volumes="$1" images="$2" ids img v out left="" kept=0 gone=0
   local -a vols=() imgs=()
-  require_podman
+  require_engine
   if [ "$volumes" = "yes" ]; then
     while IFS= read -r v; do
       if [ -n "$v" ] && [ -z "$(remove_users "$v" volume)" ]; then
@@ -9179,31 +12659,34 @@ remove_stack() {
   if [ "$images" = "yes" ]; then
     mapfile -t imgs < <(remove_images)
   fi
-  # podman compose down would also remove the containers of others with the same project name
+  # compose down would also remove the containers of others with the same project name
   if remove_compose_ok && ! stack_foreign >/dev/null; then
     job_step "Removing the containers"
     info "Removing the containers"
-    compose down --remove-orphans || warn "podman compose down reported an error - removing what is left directly."
+    compose down --remove-orphans || warn "$ENGINE compose down reported an error - removing what is left directly."
   fi
   ids="$(remove_containers | tr '\n' ' ')"
   if [ -n "${ids// /}" ]; then
     # shellcheck disable=SC2086
-    podman rm -f $ids >/dev/null 2>&1 || true
+    "$ENGINE" rm -f $ids >/dev/null 2>&1 || true
   fi
   for v in ${vols[@]+"${vols[@]}"}; do
     job_step "Removing the data volumes"
-    if podman volume exists "$v" 2>/dev/null; then
-      podman volume rm "$v" >/dev/null 2>&1 || true
+    if "$ENGINE" volume inspect "$v" >/dev/null 2>&1 && "$ENGINE" volume rm "$v" >/dev/null 2>&1; then
+      case "$v" in
+        *_npm_data|*_npm_letsencrypt) rm -f -- "$NPM_CERT_FILE" "$NPM_LOGIN_FILE" ;;
+      esac
     fi
   done
+  # Docker lists network IDs, Podman names: rm takes both
   while IFS= read -r v; do
     if [ -n "$v" ]; then
-      podman network rm "$v" >/dev/null 2>&1 || true
+      "$ENGINE" network rm "$v" >/dev/null 2>&1 || true
     fi
-  done < <(podman network ls -q --filter "label=com.docker.compose.project=$(stack_project)" 2>/dev/null)
+  done < <("$ENGINE" network ls -q --filter "label=com.docker.compose.project=$(stack_project)" 2>/dev/null)
   for img in ${imgs[@]+"${imgs[@]}"}; do
     job_step "Removing the images"
-    if out="$(podman image rm "$(qualify_ref "$img")" 2>&1)"; then
+    if out="$("$ENGINE" image rm "$(qualify_ref "$img")" 2>&1)"; then
       ok "Image removed: $img"
       gone=$((gone + 1))
     else
@@ -9217,12 +12700,12 @@ remove_stack() {
     left="$left containers: $ids;"
   fi
   for v in ${vols[@]+"${vols[@]}"}; do
-    if podman volume exists "$v" 2>/dev/null; then
+    if "$ENGINE" volume inspect "$v" >/dev/null 2>&1; then
       left="$left volume $v;"
     fi
   done
   if [ -n "$left" ]; then
-    err "Still there:${left%;} - Podman could not remove it (in use?)."
+    err "Still there:${left%;} - $ENGINE_NAME could not remove it (in use?)."
     return 1
   fi
   ok "Containers$(if [ "${#vols[@]}" -gt 0 ]; then printf ' and %s data volume(s)' "${#vols[@]}"; fi) removed$(if [ "$images" = "yes" ]; then printf ', %s image(s) removed, %s kept' "$gone" "$kept"; fi)."
@@ -9230,7 +12713,7 @@ remove_stack() {
 
 # Worker of the remove task: a last MongoDB backup
 remove_backup() {
-  require_podman
+  require_engine
   mongo_backup
 }
 
@@ -9241,7 +12724,7 @@ remove_files() {
   local -a list=()
   case "$1" in
     files) list=("$WORK_DIR/$ENV_FILE" "$WORK_DIR/$COMPOSE_FILE" "$WORK_DIR/$ENV_FILE".bak-* "$WORK_DIR/$COMPOSE_FILE".bak-*) ;;
-    jobs) list=("$JOBS_DIR" "$API_KEY_FILE" "$LOCAL_KEY_FILE" "$TZ_KEEP_FILE" "$UPGRADE_FAILED_FILE") ;;
+    jobs) list=("$JOBS_DIR" "$API_KEY_FILE" "$LOCAL_KEY_FILE" "$TZ_KEEP_FILE" "$UPGRADE_FAILED_FILE" "$NPM_CERT_FILE" "$NPM_LOGIN_FILE" "$SETUP_LATER_FILE") ;;
     snapshots) list=("$WORK_DIR"/snapshots/*.tar.gz "$WORK_DIR"/snapshots/*.tar.gz.part "$WORK_DIR"/snapshots/chain-*.tsv "$WORK_DIR"/snapshots/plan-*.tsv) ;;
     backups) list=("$WORK_DIR"/backups/mongo-*.archive.gz) ;;
     bundles) list=("$WORK_DIR"/RN1-Technology-Catalog-*) ;;
@@ -9281,7 +12764,7 @@ remove_size() {
 remove_wizard() {
   local -a steps=(Overview Choose Confirm Remove Done) keys=() labels=() picked=() toks=() failed=()
   local jobs id ncont=0 nvol=0 nimg=0 vols="" busy="" lost="" foreign="" foreign_catalog="" choice i tok answer rc ans f key v users
-  local removed="" self_gone="no" vol="no" img="no" anything="no" n files_on="no" keep_env="" since sure="yes"
+  local removed="" self_gone="no" vol="no" img="no" anything="no" n files_on="no" keep_env="" since sure="yes" hint
 
   wiz_head "Remove" 1 "${steps[@]}"
   jobs="$(wiz_running_jobs)"
@@ -9297,15 +12780,20 @@ remove_wizard() {
     done < <(job_running_ids)
   fi
 
-  # 1. Overview - without Podman nothing can be checked, so nothing is removed
-  if ! command -v podman >/dev/null 2>&1; then
+  # 1. Overview - without the engine nothing can be checked, so nothing is removed
+  case "$ENGINE_KIND:$OS_KIND" in
+    podman:Darwin) hint=" (podman machine start)" ;;
+    podman:*) hint=" as root (run as root)" ;;
+    *) hint=" ($(engine_down_hint))" ;;
+  esac
+  if ! engine_cli; then
     if [ -f "$ENV_FILE" ] || [ -f "$COMPOSE_FILE" ]; then
-      err "The podman command is not found (PATH?) - R cannot check what runs, so nothing was removed."
+      err "The $ENGINE command is not found (PATH?) - R cannot check what runs, so nothing was removed."
       return 0
     fi
-  elif ! podman info >/dev/null 2>&1 || [ "$(engine_rootless)" != "false" ]; then
-    err "Podman does not answer$(if [ "$OS_KIND" = "Darwin" ]; then printf ' (podman machine start)'; else printf ' as root (run as root)'; fi) - R cannot check what runs."
-    echo "  R needs Podman to remove the containers and data; nothing was removed."
+  elif ! "$ENGINE" info >/dev/null 2>&1 || [ "$(engine_rootless)" != "false" ]; then
+    err "$ENGINE_NAME does not answer$hint - R cannot check what runs."
+    echo "  R needs $ENGINE_NAME to remove the containers and data; nothing was removed."
     return 0
   else
     foreign_catalog="$(stack_foreign_catalog)" || foreign_catalog=""
@@ -9369,7 +12857,7 @@ remove_wizard() {
     echo
   fi
   if [ -z "$foreign_catalog" ] && [ "$nvol" -eq 0 ] && [ -z "$busy" ] && [ -n "$(project_volumes)" ]; then
-    warn "Podman volumes of project \"$(stack_project)\" exist, but nothing here shows they belong to this folder - they are kept."
+    warn "$ENGINE_NAME volumes of project \"$(stack_project)\" exist, but nothing here shows they belong to this folder - they are kept."
     echo
   fi
   for key in files jobs snapshots backups bundles installer-backups; do
@@ -9517,7 +13005,7 @@ remove_wizard() {
     return 0
   fi
 
-  # 4. Remove: Podman first; the files only when Podman removed everything chosen
+  # 4. Remove: the engine first; the files only when it removed everything chosen
   wiz_head "Remove" 4 "${steps[@]}"
   if [ "$ncont" -gt 0 ] || [ "$vol" = "yes" ] || [ "$img" = "yes" ]; then
     since="$(wiz_last_job)"
@@ -9532,7 +13020,7 @@ remove_wizard() {
       return 0
     fi
     if [ "$rc" -ne 0 ]; then
-      err "Podman could not remove everything (see above) - the files with the passwords were kept. R tries again."
+      err "$ENGINE_NAME could not remove everything (see above) - the files with the passwords were kept. R tries again."
       return 0
     fi
   fi
@@ -9645,23 +13133,23 @@ wiz_card() {
             l2="$(ui_fit "$width" "repair: check, files, start again" "repair: check, start again")"
             ;;
           unknown*)
-            l1="Podman not reachable"
+            l1="$ENGINE_NAME not reachable"
             l2="16 checks the server"
             ;;
           *)
-            l1="no Podman"
+            l1="no $ENGINE_NAME"
             l2="16 checks the server"
             ;;
         esac
         printf '%s|%s|%s|%s' "INSTALL" "$C_GRN" "$C_GRN$UI_OK$C_RST Installed $UI_SEP $l1" "$C_DIM$l2$C_RST"
       else
         l1="$(ui_fit "$width" "$C_GRN$UI_RUN$C_RST New installation, step by step" "$C_GRN$UI_RUN$C_RST New installation")"
-        l2="$(ui_fit "$width" "check $UI_SEP settings $UI_SEP start $UI_SEP data" "check $UI_SEP settings $UI_SEP start")"
+        l2="$(ui_fit "$width" "engine $UI_SEP domain $UI_SEP proxy $UI_SEP versions" "engine $UI_SEP domain $UI_SEP proxy")"
         printf '%s|%s|%s|%s' "INSTALL" "$C_GRN" "$l1" "$C_DIM$l2$C_RST"
       fi
       ;;
     U)
-      target="${HUB_STABLE:-$LATEST_VERSION}"
+      target="$LATEST_VERSION"
       if [ "$installed" = "no" ]; then
         printf '%s|%s|%s|%s' "UPDATE" "$C_YLW" "${C_DIM}Nothing installed yet$C_RST" "${C_DIM}install first (I)$C_RST"
         return 0
@@ -9766,7 +13254,7 @@ ${c}ABOUT RAYNET$r
   Raynet maintains the catalog centrally at $CATALOG_CLOUD_URL. A local Catalog gets it
   as snapshots (option 17 and 19) or synchronizes itself every day (option 20).
 
-  This installer runs the local Catalog with Podman (podman compose): catalog-web, four workers, MongoDB,
+  This installer runs the local Catalog with $ENGINE_NAME ($ENGINE compose): catalog-web, four workers, MongoDB,
   OpenSearch with Dashboards, RabbitMQ, MinIO and, optionally, Nginx Proxy Manager.
 
 ${c}THE ICONS$r
@@ -9776,13 +13264,13 @@ ${c}THE ICONS$r
   $(menu_icon del)  delete    removes data - you are asked to type DELETE first
 
 ${c}START HERE - GUIDED TASKS$r
-$(help_item I run "Install" "A new installation, step by step: checks, the main settings (version," "proxy, port, time zone), files, start with health check, catalog data.")
+$(help_item I run "Install" "New installation, step by step: engine, domain name, Nginx Proxy Manager," "versions, then start and catalog data. Runs by itself on the first start.")
 $(help_item U run "Update" "This installer first, then the Catalog: backup, new version, health" "check, patch updates of MongoDB, OpenSearch, RabbitMQ and the others.")
 $(help_item R del "Remove" "Removes the Catalog from this server: you choose data, images, files," "snapshots, backups, the installer; then type DELETE.")
 
 ${c}SETUP $UI_SEP install on this host$r
 $(help_item 7 run "Install in one go" "Generates .env and docker-compose.yml, validates them and starts the stack" "in one go; asks only about existing passwords and the time zone (I guides).")
-$(help_item 16 view "Check this server" "Podman, podman compose, kernel, ports, vm.max_map_count, time zone.")
+$(help_item 16 view "Check this server" "$ENGINE_NAME, $ENGINE compose, kernel, ports, vm.max_map_count, time zone.")
 $(help_item 23 run "Take over installation" "Takes the settings of an existing installation (another folder," "or an older installer in this folder); its passwords and data stay.")
 
 ${c}CONFIGURE $UI_SEP edit settings, 2 writes the files, 6 applies them$r
@@ -9790,19 +13278,20 @@ $(help_item 1 edit "Edit settings" "All settings on one screen, grouped by name 
 $(help_item 2 run "Generate .env + compose" "Writes .env and docker-compose.yml from the settings. Passwords are kept;" "asks to align TZ with the server's time zone.")
 $(help_item 3 edit "Edit .env" "Shows or edits the generated .env (passwords included). 2 writes it" "again from the settings, so lasting changes belong into the settings (1).")
 $(help_item 4 edit "Edit docker-compose.yml" "Shows or edits the generated compose file (2 writes it again).")
-$(help_item 5 view "Check the files" "Lets podman compose check both files (podman compose config); starts nothing.")
+$(help_item 5 view "Check the files" "Lets $ENGINE compose check both files ($ENGINE compose config); starts nothing.")
 
 ${c}ACCESS $UI_SEP addresses and logins$r
-$(help_item 14 view "User names + passwords" "User names and passwords of MongoDB, MinIO and RabbitMQ from .env.")
-$(help_item 15 view "URLs and proxy setup" "Where Catalog Web and the other services answer, and the steps for" "Nginx Proxy Manager (TLS certificate, proxy host).")
+$(help_item 14 view "User names + passwords" "User names and passwords of MongoDB, MinIO, RabbitMQ and Nginx Proxy" "Manager from .env.")
+$(help_item 15 view "URLs and proxy setup" "Where Catalog Web and the other services answer, the login of Nginx" "Proxy Manager, and in short how to set up its proxy host by hand.")
+$(help_item 24 run "Domain and HTTPS" "The domain name of the Catalog. With Nginx Proxy Manager it also sets up" "the proxy host and a Let's Encrypt certificate, through its API.")
 
 ${c}START & STOP $UI_SEP the containers$r
-$(help_item 6 run "Start / apply changes" "podman compose up -d: starts the stack or applies changed files.")
+$(help_item 6 run "Start / apply changes" "$ENGINE compose up -d: starts the stack or applies changed files.")
 $(help_item 12 run "Restart the stack" "Restarts all containers; the data is kept.")
-$(help_item 13 run "Stop (data is kept)" "podman compose down; the data volumes are kept.")
+$(help_item 13 run "Stop (data is kept)" "$ENGINE compose down; the data volumes are kept.")
 
 ${c}MONITOR $UI_SEP is it running well?$r
-$(help_item 9 view "Status and health" "podman compose ps: which containers run and their health.")
+$(help_item 9 view "Status and health" "$ENGINE compose ps: which containers run and their health.")
 $(help_item 10 view "Follow the logs" "Follow the logs of all or one service.")
 $(help_item J view "Background jobs" "Long tasks run as jobs: they continue when you leave the menu or the" "SSH session ends. Follow, cancel or read their log here.")
 
@@ -9813,7 +13302,7 @@ $(help_item 19 run "Import snapshot" "Uploads downloaded snapshots into the loca
 $(help_item 20 run "Daily self-sync" "Lets the local Catalog synchronize itself every day (servers with" "internet access).")
 
 ${c}UPDATE $UI_SEP newer versions$r
-$(help_item 8 run "Versions, offline bundle" "Newest versions of all components, version picker, and" "\"Download only\": an offline bundle for servers without internet.")
+$(help_item 8 run "Versions, offline bundle" "Recommended versions of all components, version picker, and" "\"Download only\": an offline bundle for servers without internet.")
 $(help_item 11 run "Pull images" "Downloads the images named in docker-compose.yml (2 writes it from the settings).")
 $(help_item 21 run "Upgrade the Catalog" "Backup, new Catalog version, health check, patch updates; goes back" "by itself if you cancel it after the switch.")
 $(help_item 22 run "Update this installer" "Newest $SCRIPT_NAME from GitHub; your settings are kept.")
@@ -9872,6 +13361,7 @@ menu_dispatch() {
     21) run_action do_upgrade; reload_settings ;;
     22) update_installer || true ;;
     23) adopt_installation || true ;;
+    24) run_action domain_menu ;;
     99) run_action menu_reset ;;
     j|J) run_action jobs_menu ;;
     i|I) install_wizard ;;
@@ -9891,7 +13381,7 @@ menu_items() {
   cat <<EOF
 1|-||SETUP|install on this host|check the server, then install or take over
 1|7|run|Install in one go|writes files, checks, starts|Generates both files, validates, starts
-1|16|view|Check this server|Podman, ports, kernel, TZ|Checks Podman, Compose, kernel, ports, TZ
+1|16|view|Check this server|$ENGINE_NAME, ports, kernel, TZ|Checks $ENGINE_NAME, Compose, kernel, ports, TZ
 1|23|run|Take over installation|keeps its passwords and data|Takes over an installation (copies its files)
 1|||
 1|-||CONFIGURE|settings and files|edit settings - 2 writes the files, 6 applies
@@ -9899,15 +13389,16 @@ menu_items() {
 1|2|run|Generate .env + compose|from settings; passwords kept|Writes both files; the passwords are kept
 1|3|edit|Edit .env|by hand; 2 overwrites it|Opens .env (it holds the passwords)
 1|4|edit|Edit docker-compose.yml|by hand; 2 overwrites it|Opens docker-compose.yml in the editor
-1|5|view|Check the files|podman compose config|Lets podman compose check both files
+1|5|view|Check the files|$ENGINE compose config|Lets $ENGINE compose check both files
 1|||
-1|-||ACCESS|addresses and logins|where to sign in, user names and passwords
-1|14|view|User names + passwords|MongoDB, MinIO, RabbitMQ|Logins of MongoDB, MinIO and RabbitMQ
-1|15|view|URLs and proxy setup|addresses, Nginx Proxy steps|Addresses of all services, TLS proxy steps
+1|-||ACCESS|addresses and logins|where to sign in, logins, domain and HTTPS
+1|14|view|User names + passwords|MongoDB, MinIO, RabbitMQ, NPM|Logins of MongoDB, MinIO, RabbitMQ and NPM
+1|15|view|URLs and proxy setup|addresses, NPM login|Addresses of all services, the NPM login
+1|24|run|Domain and HTTPS|domain, proxy, Let's Encrypt|Sets the domain, proxy host and certificate
 2|-||START & STOP|the containers|all containers of this stack
-2|6|run|Start / apply changes|starts, or applies new files|podman compose up -d: starts or applies
+2|6|run|Start / apply changes|starts, or applies new files|$ENGINE compose up -d: starts or applies
 2|12|run|Restart the stack|all containers, data kept|Restarts all containers; data is kept
-2|13|run|Stop (data is kept)|containers go, data stays|podman compose down - data volumes stay
+2|13|run|Stop (data is kept)|containers go, data stays|$ENGINE compose down - data volumes stay
 2|||
 2|-||MONITOR|is it running well?|status, logs and background jobs
 2|9|view|Status and health|what runs and is healthy|Which containers run, and their health
@@ -9920,7 +13411,7 @@ menu_items() {
 2|19|run|Import snapshot|full import, then delta|Imports the full snapshot, then the deltas
 2|20|run|Daily self-sync|Catalog fetches changes daily|The Catalog synchronizes itself daily
 3|-||UPDATE|newer versions|newer Catalog, components, installer
-3|8|run|Versions, offline bundle|pick versions, download only|Newest versions, picker, offline bundle
+3|8|run|Versions, offline bundle|pick versions, download only|Recommended versions, picker, offline bundle
 3|11|run|Pull images|images in docker-compose.yml|Pulls the images named in docker-compose.yml
 3|21|run|Upgrade the Catalog|backup, switch, health check|Backup, new version, health check
 3|22|run|Update this installer|from GitHub, settings kept|Newest installer; the settings are kept
@@ -9941,7 +13432,7 @@ menu_entry() {
       printf '%s|%s|%s' "$kind" "$label" "$what"
       return 0
     fi
-  done < <(menu_items)
+  done <<< "$(menu_items)"
   return 1
 }
 
@@ -10001,7 +13492,7 @@ tui_draw() {
   head2="Catalog $CATALOG_VERSION"
   if [[ "$version" == *"update available"* ]]; then
     head2="$head2   $C_YLW$UI_UP ${version#*update available: }$C_RST"
-    if [ -n "$HUB_STABLE" ] && is_version "$CATALOG_VERSION" && version_gt "$HUB_STABLE" "$CATALOG_VERSION"; then
+    if [ -n "$LATEST_VERSION" ] && is_version "$CATALOG_VERSION" && version_gt "$LATEST_VERSION" "$CATALOG_VERSION"; then
       head2="${head2%, option 8*}$C_YLW $UI_SEP U or option 21$C_RST"
     fi
   elif [[ "$version" == *"up to date"* ]]; then
@@ -10301,8 +13792,16 @@ menu() {
   unset RVC_NOTICE
   trap 'printf "\n"' INT
 
-  # prerequisites first: without Podman nothing can run (asked only in a terminal)
-  podman_offer
+  # the first start in a new folder begins with the new installation, which also sets up the engine;
+  # an installation, or a folder with its engine chosen, gets its prerequisites first: without the engine
+  # nothing can run (both only in a terminal)
+  if [ -z "$resume" ] && [ -z "$notice" ] && [ -t 0 ] && [ -t 1 ] && wiz_first_start; then
+    install_wizard first || true
+    echo
+    read -r -p "Press Enter to open the menu..." choice || true
+  elif [ -n "$CONTAINER_ENGINE" ] || [ "$(install_state)" != "no" ]; then
+    engine_offer
+  fi
 
   if [ -n "${RVC_HUB_STATUS:-}" ]; then
     HUB_STATUS="$RVC_HUB_STATUS"
@@ -10375,25 +13874,30 @@ usage() {
   cat <<EOF
 Usage: ./$SCRIPT_NAME [command]
 
-Without a command, an interactive menu is shown.
+Without a command, an interactive menu is shown. The first start in a new folder begins with the
+new installation (engine, domain, proxy, versions); 0 at any of its questions opens the menu.
 
 Commands:
   menu                        Interactive menu (default)
   generate [--new-passwords]  Write $ENV_FILE and $COMPOSE_FILE.
                               Existing passwords are kept unless --new-passwords is given.
-  validate                    Check the configuration (podman compose config)
-  up                          Validate and start / update the stack (podman compose up -d)
+  validate                    Check the configuration ($ENGINE compose config)
+  up                          Validate and start / update the stack ($ENGINE compose up -d)
   setup                       generate + validate + up
-  status                      Show container status (podman compose ps)
+  status                      Show container status ($ENGINE compose ps)
   health [SECONDS]            Wait until every service runs and Catalog Web answers
   install-podman              Install Podman and the newest Docker Compose (the engine of podman compose)
+  install-docker              Install Docker Engine with its Compose plugin (macOS: Docker Desktop)
+  install-engine              Install the engine CONTAINER_ENGINE names (Podman, Docker or Colima)
   logs [service]              Follow the logs of all services or of one service
   pull                        Pull the images
   restart                     Restart all containers
   down                        Stop and remove the containers (data volumes are kept)
   credentials                 Show the generated credentials
-  info                        Show URLs and Nginx Proxy Manager instructions
-  check                       Check prerequisites (Podman, podman compose, ports, vm.max_map_count, Docker Hub)
+  info                        Show URLs and the Nginx Proxy Manager login
+  domain [NAME|-]             Domain name and HTTPS: saves it (- removes it), applies it, sets up the
+                              proxy host and a Let's Encrypt certificate in Nginx Proxy Manager
+  check                       Check prerequisites ($ENGINE_NAME, $ENGINE compose, ports, vm.max_map_count, Docker Hub)
   timezone                    Use the time zone of this server for TZ (the job times are converted)
   updates                     Show available updates for all components
   upgrade                     Guided upgrade (asks first, then runs as a background job)
@@ -10418,6 +13922,10 @@ main() {
     shift
   fi
   cd -- "$WORK_DIR"
+  case "$cmd" in
+    check-settings|__cron_convert|__settings_groups) ;;
+    *) resolve_engine ;;
+  esac
 
   case "$cmd" in
     "")
@@ -10442,7 +13950,7 @@ main() {
       ;;
     validate|config) do_validate ;;
     up|start) do_up ;;
-    setup|install) do_generate keep no-next; echo; do_up ;;
+    setup|install) engine_guard; do_generate keep no-next; echo; do_up ;;
     status|ps) do_status ;;
     logs) do_logs "${1:-}" ;;
     pull) do_pull ;;
@@ -10450,13 +13958,23 @@ main() {
     down|stop) do_down ;;
     credentials|creds) show_credentials ;;
     info|urls) show_access_info ;;
+    domain) domain_menu "${1:-}" ;;
     check) do_check ;;
     timezone|tz) timezone_cli ;;
-    install-podman) podman_setup yes ;;
-    health) require_files && require_podman && stack_health "${1:-$HEALTH_TIMEOUT}" ;;
+    install-podman) engine_cli_setup podman ;;
+    install-docker) engine_cli_setup docker ;;
+    install-engine) engine_setup yes ;;
+    health) require_files && require_engine && stack_health "${1:-$HEALTH_TIMEOUT}" ;;
     __cron_convert) cron_convert "$@"; echo ;;
     __settings_groups) settings_grouped "$SCRIPT_PATH" ;;
     __menu_items) menu_items ;;
+    __engine) printf '%s %s %s\n' "$ENGINE" "$ENGINE_KIND" "$ENGINE_NAME" ;;
+    __engine_choices) engine_choices ;;
+    __engine_choose) engine_choose "${1:-}" ;;
+    __wiz_engine_pick) wiz_engine_pick "$(engine_choices)" "${1:-}"; echo ;;
+    __choose_versions) choose_versions ;;
+    __domain_normalize) domain_normalize "${1:-}"; echo ;;
+    __domain_checks) domain_checks "${1:-}"; echo "DOMAIN_DNS=$DOMAIN_DNS" ;;
     updates) show_updates_cli ;;
     upgrade) INTERACTIVE="true"; do_upgrade ;;
     self-update)

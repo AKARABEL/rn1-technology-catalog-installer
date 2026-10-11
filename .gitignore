@@ -10,3 +10,6 @@ backups/
 .jobs/
 .upgrade-failed
 .timezone-kept
+.domain-certificate
+.npm-login
+.setup-later

@@ -3,6 +3,8 @@ set -u
 NEW="$1"
 T="$(mktemp -d)/w"
 rm -rf "$T"; mkdir -p "$T/bin" "$T/d" "$T/home"
+# the runner's own XDG and Colima folders must not leak into the fake home (GitHub sets XDG_CONFIG_HOME)
+unset XDG_CONFIG_HOME COLIMA_HOME
 PASS=0; FAIL=0
 check() { if eval "$2"; then PASS=$((PASS+1)); echo "PASS: $1"; else FAIL=$((FAIL+1)); echo "FAIL: $1"; fi; }
 
@@ -87,16 +89,95 @@ case "$1" in
           *binfmt_misc/rosetta*) if [ -n "${SHIM_NO_ROSETTA:-}" ]; then exit 1; else echo enabled; fi ;;
         esac ;;
     esac ;;
-  volume) [ "$2" = exists ] && exit 1 ;;
+  volume) [ "$2" = inspect ] && exit 1 ;;
 esac
 exit 0
+EOF
+# Docker (Linux: from the packages; macOS: Docker Desktop or the formula of Colima), with its contexts:
+# default, desktop-linux ($T/dd.ctx, made by the first start of Docker Desktop) and colima ($T/colima.ctx,
+# made by colima start); the current one is DOCKER_CONTEXT, else the one in $T/docker.ctx. The daemon of
+# colima answers when $T/colima.running exists, the others when $T/docker.up exists. SHIM_DATA_<context>
+# (desktop_linux, colima, default): the project whose containers and volumes that daemon holds.
+# $T/docker.plugin: it has its Compose plugin; else "docker compose" runs the Docker Compose the installer
+# put at RN1_COMPOSE_PROVIDER or into ~/.docker/cli-plugins. SHIM_VM_KERNEL: the kernel of its Linux VM
+# (macOS). Calls it does not know go to $BAD. $T/ctx.log: the context of each call.
+cat > "$T/inst/docker" <<'EOF'
+#!/usr/bin/env bash
+echo "docker $*" >> "$LOG"
+bad() { echo "UNHANDLED docker $*" >> "$BAD"; echo "docker: the fake does not know: $*" >&2; exit 125; }
+known() { case "$1" in default) true ;; colima) [ -f "$T/colima.ctx" ] ;; desktop-linux) [ -f "$T/dd.ctx" ] ;; *) false ;; esac; }
+ctx="${DOCKER_CONTEXT:-$(cat "$T/docker.ctx" 2>/dev/null || echo default)}"
+if [ "${1:-}" = --context ]; then ctx="$2"; shift 2; fi
+echo "$ctx: docker $*" >> "$T/ctx.log"
+case "${1:-}" in
+  --version) echo "Docker version 29.9.0, build 1a2b3c4"; exit 0 ;;
+  context)
+    case "${2:-}" in
+      show) echo "$ctx" ;;
+      inspect) known "${3:-}" || { echo "context \"${3:-}\": context not found" >&2; exit 1; }; echo "[]" ;;
+      *) bad "$@" ;;
+    esac
+    exit 0 ;;
+  compose)
+    shift
+    for c in "${RN1_COMPOSE_PROVIDER:-}" "$HOME/.docker/cli-plugins/docker-compose"; do
+      if [ -n "$c" ] && [ -x "$c" ]; then exec "$c" "$@"; fi
+    done
+    if [ -f "$T/docker.plugin" ]; then [ "${1:-}" = version ] && echo "Docker Compose version v2.40.3"; exit 0; fi
+    echo "docker: unknown command: docker compose" >&2; exit 1 ;;
+esac
+known "$ctx" || { echo "context \"$ctx\": context not found" >&2; exit 1; }
+if [ "$ctx" = colima ]; then up="$T/colima.running"; else up="$T/docker.up"; fi
+[ -f "$up" ] || { echo "Cannot connect to the Docker daemon. Is the docker daemon running?" >&2; exit 1; }
+case "$*" in
+  info) echo "Server: Docker Engine - Community" ;;
+  "info --format {{range .SecurityOptions}}{{.}} {{end}}") echo "name=seccomp,profile=builtin name=cgroupns " ;;
+  "info --format {{.KernelVersion}}") echo "${SHIM_VM_KERNEL:-6.12.5-linuxkit}" ;;
+  "ps -aq --filter label=com.docker.compose.project="*|"volume ls -q --filter label=com.docker.compose.project="*)
+    v="SHIM_DATA_${ctx//-/_}"
+    a="$*"; if [ -n "${!v:-}" ] && [ "${a##*=}" = "${!v}" ]; then echo 0123456789ab; fi ;;
+  *) bad "$@" ;;
+esac
+exit 0
+EOF
+# Colima: its folder as Colima finds it (COLIMA_HOME, ~/.colima, $XDG_CONFIG_HOME/colima, ~/.config/colima).
+# SHIM_NO_ROSETTA, SHIM_MAPCOUNT (vm.max_map_count in its VM before the installer sets it)
+cat > "$T/inst/colima" <<'EOF'
+#!/usr/bin/env bash
+echo "colima $*" >> "$LOG"
+if [ -n "${COLIMA_HOME:-}" ] && [ -d "$COLIMA_HOME" ]; then d="$COLIMA_HOME"
+elif [ -d "$HOME/.colima" ]; then d="$HOME/.colima"
+elif [ -n "${XDG_CONFIG_HOME:-}" ]; then d="$XDG_CONFIG_HOME/colima"
+elif [ -d "$HOME/.config/colima" ]; then d="$HOME/.config/colima"
+else d="$HOME/.colima"; fi
+y="$d/default/colima.yaml"
+case "$*" in
+  status) [ -f "$T/colima.running" ] ;;
+  start|"start "*)
+    if [ ! -f "$y" ]; then mkdir -p "${y%/*}"; printf '%s\n' 'cpu: 6' 'vmType: vz' '# Default: []' 'provision: []' > "$y"; fi
+    touch "$T/colima.running" "$T/colima.ctx"; echo colima > "$T/docker.ctx" ;;
+  "ssh -- cat /proc/sys/fs/binfmt_misc/rosetta") [ -n "${SHIM_NO_ROSETTA:-}" ] && exit 1; echo enabled ;;
+  "ssh -- sysctl -n vm.max_map_count") cat "$T/colima.mapcount" 2>/dev/null || echo "${SHIM_MAPCOUNT:-65530}" ;;
+  "ssh -- sudo sysctl -w vm.max_map_count=262144") echo 262144 > "$T/colima.mapcount" ;;
+  *) echo "UNHANDLED colima $*" >> "$BAD"; echo "colima: the fake does not know: $*" >&2; exit 125 ;;
+esac
+EOF
+# Docker Desktop starts with "open -a Docker" and makes its context the current one (SHIM_DD_NEVER: it does not start)
+cat > "$T/bin/open" <<'EOF'
+#!/usr/bin/env bash
+echo "open $*" >> "$LOG"
+[ "$*" = "-a Docker" ] || { echo "UNHANDLED open $*" >> "$BAD"; exit 1; }
+[ -n "${SHIM_DD_NEVER:-}" ] || { touch "$T/docker.up" "$T/dd.ctx"; echo desktop-linux > "$T/docker.ctx"; }
 EOF
 cat > "$T/bin/sudo" <<'EOF'
 #!/usr/bin/env bash
 echo "sudo $*" >> "$SUDO_LOG"
 case "$*" in
   *"install -y podman"*|*"zypper -n install podman"*) touch "$T/podman.installed"; cp "$T/inst/podman" "$T/bin/podman" ;;
+  *"install -y docker-ce"*) cp "$T/inst/docker" "$T/bin/docker"; touch "$T/docker.up" "$T/docker.plugin" ;;
+  *"zypper -n install docker"*) cp "$T/inst/docker" "$T/bin/docker"; touch "$T/docker.up" ;;
   *apt-get*|*dnf\ *|*zypper*|*systemctl*|*containers.conf.d*) ;;
+  "sh -c "*) ;;
   *) exec "$@" ;;
 esac
 EOF
@@ -123,9 +204,25 @@ EOF
 cat > "$T/inst/brew" <<'EOF'
 #!/usr/bin/env bash
 echo "brew $*" >> "$LOG"
-case "$1" in
+case "$*" in
   --prefix) echo "$T/brew" ;;
-  install) shift; for t in "$@"; do mkdir -p "$T/brew/opt/$t"; [ "$t" = podman ] && cp "$T/inst/podman" "$T/bin/podman"; done ;;
+  "install "*)
+    shift
+    for t in "$@"; do
+      case "$t" in
+        --cask) continue ;;
+        podman) cp "$T/inst/podman" "$T/bin/podman" ;;
+        colima) cp "$T/inst/colima" "$T/bin/colima" ;;
+        docker) cp "$T/inst/docker" "$T/bin/docker" ;;
+        docker-desktop) cp "$T/inst/docker" "$T/bin/docker"; touch "$T/docker.plugin"; mkdir -p "$HOME/Applications/Docker.app" ;;
+        coreutils|gnu-sed|grep|findutils) ;;
+        *) echo "UNHANDLED brew $*" >> "$BAD"; exit 1 ;;
+      esac
+      mkdir -p "$T/brew/opt/$t"
+    done ;;
+  "services list") [ -f "$T/colima.service" ] && echo "colima started $USER ~/Library/LaunchAgents/homebrew.mxcl.colima.plist" ;;
+  "services start colima") touch "$T/colima.service" ;;
+  *) echo "UNHANDLED brew $*" >> "$BAD"; exit 1 ;;
 esac
 exit 0
 EOF
@@ -163,7 +260,8 @@ case "$url" in
 esac
 EOF
 chmod +x "$T/bin/"* "$T/inst/"*
-export LOG="$T/log" SUDO_LOG="$T/sudo.log" MSTATE="$T/machine" T
+export LOG="$T/log" SUDO_LOG="$T/sudo.log" MSTATE="$T/machine" BAD="$T/bad.log" T
+: > "$BAD"
 I="$T/d/rn1-technology-catalog-installer.sh"
 cp "$NEW" "$I"
 sed -i 's/^CHECK_FOR_UPDATES=.*/CHECK_FOR_UPDATES="false"/' "$I"
@@ -214,12 +312,97 @@ else
   out="$(SHIM_PODMAN_VERSION=4.3.1 run up)"; rc=$?
   check "Podman 4.3 (Debian 12): refused, 4.9 or newer needed" '[ "$rc" -ne 0 ] && grep -q "Podman 4.3.1 is too old: 4.9.0 or newer is needed" <<< "$out"'
 fi
+# --- Linux: Docker (CONTAINER_ENGINE=docker) for this distribution ----------------------------------------
+DI="$T/dd/rn1-technology-catalog-installer.sh"; mkdir -p "$T/dd"
+sed 's/^CONTAINER_ENGINE=.*/CONTAINER_ENGINE="docker"/; s/^CHECK_FOR_UPDATES=.*/CHECK_FOR_UPDATES="false"/' "$NEW" > "$DI"
+reset_docker() { rm -f "$T/bin/docker" "$T/bin/colima" "$T/bin/brew" "$T/docker.up" "$T/docker.plugin" "$T/colima.running" "$T/colima.service" "$T/colima.mapcount" "$T/dd.ctx" "$T/colima.ctx" "$T/docker.ctx" "$T/ctx.log"; rm -rf "$T/dcli" "$T/brew" "$T/home"; mkdir -p "$T/home"; : > "$LOG"; : > "$SUDO_LOG"; }
+drun() { (cd "${DI%/*}" && HOME="$T/home" RN1_SYSTEMD_DIR="$T" RN1_COMPOSE_PROVIDER="${PROVIDER-$T/dcli/docker-compose}" RN1_DOCKER_WAIT=0 PATH="${XPATH:-$T/bin}:$SYSPATH" bash "$DI" "$@" </dev/null 2>&1); }
+DPKGS="docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin"
+DREPO=""; DPLAN1=""; DPLAN2=""; DREFUSED=""
+case "$ID $LIKE" in
+  debian*|*" debian "*|ubuntu*|*" ubuntu "*)
+    DREPO=debian; case "$ID $LIKE" in ubuntu*|*" ubuntu "*) DREPO=ubuntu ;; esac
+    DPLAN1="curl -fsSL https://download.docker.com/linux/$DREPO/gpg -o /etc/apt/keyrings/docker.asc"
+    DPLAN2="apt-get install -y $DPKGS" ;;
+  *suse*) DPLAN1="zypper -n install docker"; DPLAN2="$DPLAN1" ;;
+  *)
+    if [ "$PM" = dnf ]; then
+      case "$ID" in fedora) DREPO=fedora ;; rhel) DREPO=rhel ;; *) DREPO=centos ;; esac
+      [ "${VER%%.*}" = 8 ] && DREPO=rhel
+      DPLAN1="curl -fsSL https://download.docker.com/linux/$DREPO/docker-ce.repo -o /etc/yum.repos.d/docker-ce.repo"
+      DPLAN2="dnf install -y $DPKGS"
+    fi ;;
+esac
+case "$ID" in
+  ubuntu) case "$VER" in 1*|20.*) DREFUSED="has no packages in Docker's repository any more" ;; esac ;;
+esac
+[ "$PM" = "yum" ] && DREFUSED="is too old for Docker's packages - use version 8 or newer."
+[ -z "$ID" ] && DREFUSED="This Linux is not covered"
+[ -z "$DPLAN1" ] && [ -z "$DREFUSED" ] && DREFUSED="This Linux is not covered"
+
+reset_docker
+# the engines the first-run wizard offers here: a reason where one cannot be installed
+out="$(drun __engine_choices)"
+if [ -n "$REFUSED" ]; then
+  check "choices: Podman not selectable here, with the reason ($ID $VER)" 'grep "^podman|Podman|" <<< "$out" | grep -qF -- "$REFUSED"'
+else
+  check "choices: Podman selectable here ($ID $VER)" 'grep -q "^podman|Podman|[a-z]*|$" <<< "$out"'
+fi
+if [ -n "$DREFUSED" ]; then
+  check "choices: Docker not selectable here, with the reason ($ID $VER)" 'grep "^docker|Docker Engine|missing|" <<< "$out" | grep -qF -- "$DREFUSED"'
+else
+  check "choices: Docker selectable here, to be installed ($ID $VER)" 'grep -q "^docker|Docker Engine|missing|$" <<< "$out"'
+fi
+out="$(drun check)"
+if [ -n "$DREFUSED" ]; then
+  check "no Docker: this system is refused with the reason ($ID $VER)" 'grep -q "Docker is not installed" <<< "$out" && grep -qF -- "$DREFUSED" <<< "$out"'
+else
+  check "no Docker: the commands of Docker's repository for this distribution ($ID $VER)" 'grep -q "Docker is not installed" <<< "$out" && grep -qF -- "$DPLAN1" <<< "$out" && grep -qF -- "$DPLAN2" <<< "$out" && grep -q "systemctl enable --now docker" <<< "$out"'
+  check "no Docker: never a fixed Docker or Compose version" '! grep -Eq "docker-(ce|ce-cli|compose-plugin|buildx-plugin)[=_-][0-9]" <<< "$out"'
+  if [ -n "$DREPO" ] && [ "$PM" = dnf ]; then
+    check "dnf family ($ID $VER): Docker's $DREPO repository (RHEL rhel; a rebuild rhel for 8, centos newer; Fedora fedora)" 'grep -qF "https://download.docker.com/linux/$DREPO/docker-ce.repo" <<< "$out" && [ "$(grep -o "download.docker.com/linux/[a-z]*/docker-ce.repo" <<< "$out" | sort -u | wc -l)" -eq 1 ]'
+  fi
+  mkdir -p "$T/pk"
+  if [ "$PM" = apt-get ]; then
+    printf '#!/usr/bin/env bash\np="${@: -1}"\ncase " ${SHIM_OLD_PKGS:-} " in *" $p "*) printf "install ok installed"; exit 0 ;; esac\nexec %s "$@"\n' "$(command -v dpkg-query)" > "$T/pk/dpkg-query"
+    OLDRM="apt-get remove -y .*podman-docker.*runc"
+  elif [ "$PM" = dnf ] && command -v rpm >/dev/null 2>&1; then
+    printf '#!/usr/bin/env bash\np="${@: -1}"\ncase " ${SHIM_OLD_PKGS:-} " in *" $p "*) exit 0 ;; esac\nexec %s "$@"\n' "$(command -v rpm)" > "$T/pk/rpm"
+    # Docker's page for RHEL takes out Podman and runc too, its pages for CentOS and Fedora do not
+    if [ "$DREPO" = rhel ]; then OLDRM="dnf remove -y .*podman-docker podman runc"; else OLDRM="dnf remove -y .*podman-docker$"; fi
+  else
+    OLDRM=""
+  fi
+  chmod +x "$T/pk/"* 2>/dev/null
+  if [ -n "$OLDRM" ]; then
+    out="$(XPATH="$T/pk:$T/bin" SHIM_OLD_PKGS="podman-docker podman runc" drun check)"
+    check "packages that conflict are removed first, without a question (-y)" 'grep -q -- "$OLDRM" <<< "$out" && [ "$(grep -n -- "$OLDRM" <<< "$out" | head -n 1 | cut -d: -f1)" -lt "$(grep -nF -- "$DPLAN2" <<< "$out" | head -n 1 | cut -d: -f1)" ]'
+    if [ "$PM" = dnf ] && [ "$DREPO" != rhel ]; then
+      check "$DREPO repository: Podman and runc stay (only Docker's page for RHEL removes them)" '! grep -Eq "remove -y .* (podman|runc)( |$)" <<< "$out"'
+    fi
+  fi
+  out="$(SHIM_UID=1000 drun install-docker)"; rc=$?
+  check "install-docker: every step with sudo, in order, then the daemon; Docker ready" '[ "$rc" -eq 0 ] && grep -qF -- "$DPLAN1" "$SUDO_LOG" && grep -qF -- "$DPLAN2" "$SUDO_LOG" && [ "$(grep -nF -- "$DPLAN2" "$SUDO_LOG" | head -n 1 | cut -d: -f1)" -lt "$(grep -n "systemctl enable --now docker" "$SUDO_LOG" | head -n 1 | cut -d: -f1)" ] && grep -q "Docker 29.9.0 is ready" <<< "$out"'
+  if [ "$DPLAN1" = "zypper -n install docker" ]; then
+    check "openSUSE: its Docker, and the newest Docker Compose as its plugin" 'grep -q "Docker Compose 5.6.0 installed ($T/dcli/docker-compose); .docker compose. runs it" <<< "$out" && [ -x "$T/dcli/docker-compose" ]'
+  else
+    check "Docker's Compose plugin is used, no extra Docker Compose" '[ ! -e "$T/dcli/docker-compose" ] && ! grep -q "releases/download" "$LOG"'
+  fi
+  out="$(drun check)"
+  check "check after install-docker: Docker, its daemon and Compose OK" 'grep -q "OK Docker 29.9.0" <<< "$out" && grep -q "The Docker daemon answers and runs rootful" <<< "$out" && grep -q "Compose: docker compose with Docker Compose version" <<< "$out"'
+fi
+reset_docker
+out="$(SHIM_ARCH=aarch64 drun check)"
+if [ -n "$ID" ]; then
+  check "ARM Linux and Docker: refused, the Catalog images are amd64 only" 'grep -q "exist only for amd64" <<< "$out"'
+fi
+
 out="$(SHIM_ARCH=aarch64 run check)"
 if [ -z "$ID" ]; then :; else
   reset_podman; out="$(SHIM_ARCH=aarch64 run check)"
   check "ARM Linux: refused, the Catalog images are amd64 only" 'grep -q "exist only for amd64" <<< "$out"'
 fi
-check "the installer pins no Podman, Compose or Docker version" '! grep -qE "compose/releases/download/v[0-9]|docker-compose-v?[0-9]\.[0-9]|podman-[0-9]\.[0-9]" "$NEW"'
+check "the installer pins no Podman, Compose or Docker version" '! grep -qE "compose/releases/download/v[0-9]|docker-compose-v?[0-9]\.[0-9]|podman-[0-9]\.[0-9]|docker-ce[=-][0-9]|colima@|docker-desktop@" "$NEW"'
 
 # --- macOS (uname -s Darwin; fake Homebrew and Podman machine) -----------------------------------------
 reset_podman
@@ -258,6 +441,121 @@ check "macOS check: machine rootful, vm.max_map_count read in the machine" 'grep
 rm -f "$T/d/docker-compose.yml" "$T/d/.env"
 (cd "$T/d" && PATH="$T/bin:$SYSPATH" bash "$I" generate </dev/null >/dev/null 2>&1)
 check "Linux: no platform line (the files as before)" '! grep -q "platform:" "$T/d/docker-compose.yml"'
+
+# --- macOS with Docker Desktop (CONTAINER_ENGINE=docker) -------------------------------------------------
+DD_SETTINGS="$T/home/Library/Group Containers/group.com.docker/settings-store.json"
+reset_docker
+out="$(SHIM_OS=Darwin PROVIDER= drun install-docker)"; rc=$?
+check "macOS Docker Desktop without Homebrew: says where to get it" '[ "$rc" -ne 0 ] && grep -q "Homebrew is needed" <<< "$out"'
+cp "$T/inst/brew" "$T/bin/brew"
+out="$(SHIM_OS=Darwin PROVIDER= drun install-docker)"; rc=$?
+check "macOS: the GNU tools with Homebrew" 'grep -q "^brew install coreutils gnu-sed grep findutils$" "$LOG"'
+if [ ! -d /Applications/Docker.app ]; then
+  check "macOS: Docker Desktop missing - its license and the brew command, never installed without a question" '[ "$rc" -ne 0 ] && grep -q "fewer than 250 employees AND less than 10 million" <<< "$out" && grep -q "      brew install --cask docker-desktop" <<< "$out" && grep -q "not installed without a question" <<< "$out" && ! grep -q "^brew install --cask" "$LOG" && ! grep -q "^open " "$LOG"'
+fi
+# Docker Desktop installed by the user (the app and its docker command), not started yet
+mkdir -p "$T/home/Applications/Docker.app"; cp "$T/inst/docker" "$T/bin/docker"; touch "$T/docker.plugin"; : > "$LOG"
+out="$(SHIM_OS=Darwin PROVIDER= drun install-docker)"; rc=$?
+check "macOS: Docker Desktop started and waited for; the agreement and Rosetta named" '[ "$rc" -eq 0 ] && grep -q "^open -a Docker$" "$LOG" && grep -q "Docker answers: Docker version 29.9.0" <<< "$out" && grep -q "Use Rosetta for x86_64/amd64 emulation" <<< "$out" && grep -q "accept its agreement" <<< "$out"'
+check "macOS: the docker command talks to Docker Desktop (context desktop-linux)" 'grep -q "^desktop-linux: docker info$" "$T/ctx.log"'
+check "macOS Docker Desktop: its own Compose, nothing downloaded" '[ ! -e "$T/home/.docker/cli-plugins/docker-compose" ] && ! grep -q "releases/download" "$LOG"'
+: > "$LOG"
+out="$(SHIM_OS=Darwin PROVIDER= drun install-docker)"; rc=$?
+check "macOS: a Docker that answers is taken as it is" '[ "$rc" -eq 0 ] && ! grep -q "^brew install --cask" "$LOG" && ! grep -q "^open " "$LOG"'
+mkdir -p "${DD_SETTINGS%/*}"; printf '{\n  "UseVirtualizationFrameworkRosetta": false,\n  "MemoryMiB": 8092\n}\n' > "$DD_SETTINGS"
+out="$(SHIM_OS=Darwin PROVIDER= drun install-docker)"
+check "macOS: Rosetta off in the settings of Docker Desktop - warned" 'grep -q "Rosetta is off in Docker Desktop" <<< "$out"'
+out="$(SHIM_OS=Darwin PROVIDER= drun check)"
+check "macOS check: Rosetta off in Docker Desktop named" 'grep -q "Rosetta is off in Docker Desktop" <<< "$out"'
+rm -f "$DD_SETTINGS"
+out="$(SHIM_OS=Darwin SHIM_MACOS=15.6 SHIM_VM_KERNEL=6.14.2-linuxkit PROVIDER= drun install-docker)"; rc=$?
+check "macOS 15 with VM kernel 6.14: refused (Rosetta fails with 6.13 and newer before macOS 26)" '[ "$rc" -ne 0 ] && grep -q "Rosetta, which runs the amd64" <<< "$out" && grep -q "6.13 and newer before macOS 26" <<< "$out"'
+out="$(SHIM_OS=Darwin SHIM_MACOS=15.6 SHIM_VM_KERNEL=6.10.14-linuxkit PROVIDER= drun install-docker)"; rc=$?
+check "macOS 15 with VM kernel 6.10: allowed" '[ "$rc" -eq 0 ]'
+out="$(SHIM_OS=Darwin SHIM_MACOS=26.1 SHIM_VM_KERNEL=6.14.2-linuxkit PROVIDER= drun install-docker)"; rc=$?
+check "macOS 26 with VM kernel 6.14: allowed" '[ "$rc" -eq 0 ]'
+out="$(SHIM_OS=Darwin SHIM_MACOS=15.6 SHIM_VM_KERNEL=6.14.2-linuxkit PROVIDER= drun check)"
+check "macOS check: the kernel rule of the VM" 'grep -q "6.13 and newer before macOS 26" <<< "$out"'
+out="$(SHIM_OS=Darwin SHIM_ARM=0 SHIM_MACOS=15.6 SHIM_VM_KERNEL=6.14.2-linuxkit PROVIDER= drun install-docker)"; rc=$?
+check "Intel Mac with Docker Desktop: allowed, no Rosetta needed" '[ "$rc" -eq 0 ] && ! grep -q "Rosetta" <<< "$out"'
+rm -f "$T/docker.up"; : > "$LOG"
+out="$(SHIM_OS=Darwin SHIM_DD_NEVER=1 PROVIDER= drun install-docker)"; rc=$?
+check "macOS: Docker Desktop that does not answer - a clear error" '[ "$rc" -ne 0 ] && grep -q "Docker Desktop does not answer (docker info)" <<< "$out" && grep -q "^open -a Docker$" "$LOG"'
+
+# --- macOS with Colima (CONTAINER_ENGINE=colima) ------------------------------------------------------------
+CI_="$T/cc/rn1-technology-catalog-installer.sh"; mkdir -p "$T/cc"
+sed 's/^CONTAINER_ENGINE=.*/CONTAINER_ENGINE="colima"/; s/^CHECK_FOR_UPDATES=.*/CHECK_FOR_UPDATES="false"/' "$NEW" > "$CI_"
+crun() { (cd "$T/cc" && HOME="$T/home" SHIM_OS=Darwin PATH="$T/bin:$SYSPATH" bash "$CI_" "$@" </dev/null 2>&1); }
+reset_docker; cp "$T/inst/brew" "$T/bin/brew"
+out="$(crun install-engine)"; rc=$?
+check "Colima: Homebrew installs colima, docker and the GNU tools" '[ "$rc" -eq 0 ] && grep -q "^brew install colima docker coreutils gnu-sed grep findutils$" "$LOG"'
+check "Colima: a VM with Apple's virtualization, Rosetta, 6 CPUs, 12 GB, 100 GB" 'grep -q "^colima start --vm-type=vz --vz-rosetta --cpu 6 --memory 12 --disk 100$" "$LOG"'
+check "Colima: the newest Docker Compose for darwin-aarch64 in ~/.docker/cli-plugins" '[ -x "$T/home/.docker/cli-plugins/docker-compose" ] && grep -q "download/v5.6.0/docker-compose-darwin-aarch64$" "$LOG" && grep -q "runs it" <<< "$out"'
+check "Colima: vm.max_map_count set in the VM and kept by a provision script" 'grep -q "^colima ssh -- sudo sysctl -w vm.max_map_count=262144$" "$LOG" && grep -q "^provision:$" "$T/home/.colima/default/colima.yaml" && grep -q "^  - mode: system$" "$T/home/.colima/default/colima.yaml" && grep -q "^    script: sysctl -w vm.max_map_count=262144$" "$T/home/.colima/default/colima.yaml" && ! grep -q "provision: \[\]" "$T/home/.colima/default/colima.yaml"'
+check "Colima: Rosetta checked in the VM, started at login with brew services" 'grep -q "^colima ssh -- cat /proc/sys/fs/binfmt_misc/rosetta$" "$LOG" && grep -q "^brew services start colima$" "$LOG"'
+check "Colima: the docker command talks to the Colima VM (context colima)" 'grep -q "^colima: docker info$" "$T/ctx.log" && ! grep -q "^desktop-linux: docker info" "$T/ctx.log"'
+out="$(crun check)"
+check "Colima check: Docker in the Colima VM, Rosetta, vm.max_map_count" 'grep -q "The Docker daemon answers (Colima VM) and runs rootful" <<< "$out" && grep -q "Rosetta runs the amd64 Catalog images in the Colima VM" <<< "$out" && grep -q "vm.max_map_count = 262144 (Colima VM)" <<< "$out" && grep -q "Compose: docker compose with Docker Compose version v5.6.0" <<< "$out"'
+: > "$LOG"
+out="$(crun install-engine)"; rc=$?
+check "Colima again: nothing created twice, provision kept once" '[ "$rc" -eq 0 ] && ! grep -q "^colima start" "$LOG" && ! grep -q "^brew services start" "$LOG" && [ "$(grep -c "vm.max_map_count" "$T/home/.colima/default/colima.yaml")" -eq 1 ]'
+crun generate >/dev/null; rm -f "$T/colima.running"
+out="$(crun up)"; rc=$?
+check "Colima stopped: up refused with how to start it" '[ "$rc" -ne 0 ] && grep -q "Colima does not run - start Colima: colima start" <<< "$out"'
+out="$(SHIM_MACOS=15.6 SHIM_VM_KERNEL=6.14.0-33-generic crun install-engine)"; rc=$?
+check "Colima on macOS 15 with VM kernel 6.14: refused" '[ "$rc" -ne 0 ] && grep -q "6.13 and newer before macOS 26" <<< "$out" && grep -q "^colima start$" "$LOG"'
+rm -f "$T/colima.running"; sed -i 's/^vmType: .*/vmType: qemu/' "$T/home/.colima/default/colima.yaml"
+out="$(crun install-engine)"; rc=$?
+check "Colima: a qemu VM is refused (it has no Rosetta)" '[ "$rc" -ne 0 ] && grep -q "runs with qemu, which cannot use Rosetta" <<< "$out"'
+out="$(cd "$T/cc" && HOME="$T/home" PATH="$T/bin:$SYSPATH" bash "$CI_" check-settings 2>&1)"; rc=$?
+check "Colima on Linux: CONTAINER_ENGINE refused" '[ "$rc" -ne 0 ] && grep -q "\"colima\" (only on macOS)" <<< "$out"'
+out="$(crun __engine_choices)"
+check "macOS choices: podman, Docker Desktop and Colima" 'grep -q "^podman|Podman|" <<< "$out" && grep -q "^docker|Docker Desktop|" <<< "$out" && grep -q "^colima|Colima|installed|$" <<< "$out"'
+out="$(SHIM_ARM=0 crun __engine_choices)"
+check "macOS choices on an Intel Mac: Podman refused with the reason" 'grep -q "^podman|Podman|[a-z]*|Intel Macs are not supported" <<< "$out" && grep -q "^colima|Colima|[a-z]*|$" <<< "$out"'
+# Colima keeps its settings where Colima looks: XDG_CONFIG_HOME when ~/.colima does not exist
+reset_docker; cp "$T/inst/brew" "$T/bin/brew"
+XY="$T/home/xdg/colima/default/colima.yaml"
+out="$(XDG_CONFIG_HOME="$T/home/xdg" crun install-engine)"; rc=$?
+check "Colima with XDG_CONFIG_HOME: the provision script in its colima.yaml there" '[ "$rc" -eq 0 ] && grep -q "^    script: sysctl -w vm.max_map_count=262144$" "$XY" && [ ! -e "$T/home/.colima" ]'
+rm -f "$T/colima.running"; sed -i 's/^vmType: .*/vmType: qemu/' "$XY"
+out="$(XDG_CONFIG_HOME="$T/home/xdg" crun install-engine)"; rc=$?
+check "Colima with XDG_CONFIG_HOME: a qemu VM there is refused" '[ "$rc" -ne 0 ] && grep -q "runs with qemu, which cannot use Rosetta" <<< "$out"'
+
+# --- macOS: Docker Desktop and Colima are two VMs, each with its own containers and volumes ---------------
+reset_docker; cp "$T/inst/brew" "$T/bin/brew"; cp "$T/inst/docker" "$T/bin/docker"; cp "$T/inst/colima" "$T/bin/colima"
+mkdir -p "$T/home/Applications/Docker.app"; touch "$T/docker.plugin" "$T/docker.up" "$T/dd.ctx" "$T/colima.running" "$T/colima.ctx"
+echo colima > "$T/docker.ctx"
+out="$(SHIM_DATA_desktop_linux=cc crun install-engine)"; rc=$?
+check "Colima folder, data in Docker Desktop: refused, nothing set up" '[ "$rc" -ne 0 ] && grep -q "project \"cc\" are in Docker Desktop, but this folder uses Colima" <<< "$out" && ! grep -q "^colima start" "$LOG" && ! grep -q "^brew services start" "$LOG"'
+out="$(SHIM_DATA_desktop_linux=cc crun __engine_choices)"
+check "choices: Docker Desktop holds the data - Colima is not selectable" 'grep -q "^docker|Docker Desktop|data|$" <<< "$out" && grep -q "^colima|Colima|[a-z]*|The containers or data volumes of this installation are in Docker Desktop - one engine per server.$" <<< "$out"'
+out="$(SHIM_DATA_desktop_linux=cc crun check)"
+check "check: the data in Docker Desktop named for a Colima folder" 'grep -q "are in Docker Desktop, but this folder uses Colima" <<< "$out"'
+out="$(SHIM_DATA_desktop_linux=dd SHIM_OS=Darwin PROVIDER= drun install-docker)"; rc=$?
+check "Docker Desktop folder with its data, current context Colima's: allowed" '[ "$rc" -eq 0 ]'
+out="$(SHIM_DATA_colima=dd SHIM_OS=Darwin PROVIDER= drun install-docker)"; rc=$?
+check "Docker Desktop folder, data in Colima: refused" '[ "$rc" -ne 0 ] && grep -q "project \"dd\" are in Colima, but this folder uses Docker Desktop" <<< "$out"'
+echo desktop-linux > "$T/docker.ctx"; : > "$T/ctx.log"
+out="$(SHIM_DATA_colima=cc crun install-engine)"; rc=$?
+check "Colima folder with its data, current context Docker Desktop's: allowed, the docker command talks to Colima" '[ "$rc" -eq 0 ] && grep -q "^colima: docker info$" "$T/ctx.log" && ! grep -q "^desktop-linux: docker info" "$T/ctx.log"'
+EI="$T/ee/rn1-technology-catalog-installer.sh"; mkdir -p "$T/ee"
+sed 's/^CHECK_FOR_UPDATES=.*/CHECK_FOR_UPDATES="false"/' "$NEW" > "$EI"
+erun() { (cd "$T/ee" && HOME="$T/home" SHIM_OS=Darwin PATH="$T/bin:$SYSPATH" bash "$EI" "$@" </dev/null 2>/dev/null); }
+check "CONTAINER_ENGINE empty, data only in Colima: Colima" '[ "$(SHIM_DATA_colima=ee erun __engine)" = "docker colima Colima" ]'
+check "CONTAINER_ENGINE empty, data only in Docker Desktop: Docker" '[ "$(SHIM_DATA_desktop_linux=ee erun __engine)" = "docker docker Docker" ]'
+out="$(cd "$T/ee" && HOME="$T/home" SHIM_OS=Darwin SHIM_DATA_colima=ee SHIM_DATA_desktop_linux=ee PATH="$T/bin:$SYSPATH" bash "$EI" install-engine </dev/null 2>&1)"; rc=$?
+check "CONTAINER_ENGINE empty, data in both VMs: a choice is asked for" '[ "$rc" -ne 0 ] && grep -q "are in Docker Desktop and in Colima" <<< "$out" && grep -q "choose the one to go on with" <<< "$out"'
+# the engine the new installation (I) takes on Enter
+check "new installation, data in Colima: Enter takes Colima" '[ "$(SHIM_DATA_colima=ee erun __wiz_engine_pick)" = colima ]'
+reset_podman; reset_docker
+check "new installation on a Mac without an engine: Enter takes Podman" '[ "$(erun __wiz_engine_pick)" = podman ]'
+check "new installation on an Intel Mac without an engine: Colima, not Docker Desktop (its license comes first)" '[ "$(SHIM_ARM=0 erun __wiz_engine_pick)" = colima ]'
+check "new installation on macOS 15 without an engine: Colima (Podman needs macOS 26)" '[ "$(SHIM_MACOS=15.6 erun __wiz_engine_pick)" = colima ]'
+mkdir -p "$T/home/Applications/Docker.app"; cp "$T/inst/docker" "$T/bin/docker"; touch "$T/docker.plugin" "$T/docker.up" "$T/dd.ctx"
+check "new installation on a Mac with Docker Desktop: Enter takes it" '[ "$(erun __wiz_engine_pick)" = docker ]'
+
+check "fakes: no unknown docker, colima, brew or open call" '[ ! -s "$BAD" ] || { sort "$BAD" | uniq -c | head -20; false; }'
 
 # a UTF-8 locale that is not installed (C.UTF-8 on CentOS 7): plain characters, else the boxes break
 # (only with glibc: Git Bash accepts every locale name)

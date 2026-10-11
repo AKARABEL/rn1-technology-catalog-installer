@@ -4,6 +4,8 @@ NEW="$1"
 SP="$(cd "$(dirname "$0")" && pwd)"
 T="$(mktemp -d)/ad"
 rm -rf "$T"; mkdir -p "$T/bin" "$T/oldroot" "$T/rn1-technology-catalog"
+# these tests run Podman: CONTAINER_ENGINE names it (on a CI runner, detection would see its real Docker)
+sed 's/^CONTAINER_ENGINE=""$/CONTAINER_ENGINE="podman"/' "$1" > "${T%/*}/podman-installer.sh"; NEW="${T%/*}/podman-installer.sh"
 PASS=0; FAIL=0
 check() { if eval "$2"; then PASS=$((PASS+1)); echo "PASS: $1"; else FAIL=$((FAIL+1)); echo "FAIL: $1"; fi; }
 export LOG="$T/podman.log" UNHANDLED="$T/unhandled.log" OLD="$T/oldroot"
@@ -82,7 +84,7 @@ case "${1:-}" in
   volume)
     case "${2:-} ${3:-} ${4:-}" in
       "ls -q --filter") ;;
-      exists\ *) exit 1 ;;
+      inspect\ *) exit 1 ;;
       *) unhandled ;;
     esac ;;
   compose)
@@ -207,7 +209,7 @@ check "same folder: CLI generate refuses with both ways out" '[ "$rc" -ne 0 ] &&
 out="$(SHIM_NO_LABELS=1 bash "$S/$N" adopt </dev/null 2>&1)"; rc=$?
 check "same folder: CLI adopt without a file name does not guess" '[ "$rc" -ne 0 ] && grep -q "Name the one that manages this installation" <<< "$out" && [ -f "$S/catalog.sh" ]'
 out="$(menu "$S" '23\ny\ny\n0\n')"
-check "same folder: differences listed" 'grep -q "CATALOG_WEB_PORT *8080 -> 9393" <<< "$out" && grep -q "MONGO_TAG *8 -> 7.0" <<< "$out"'
+check "same folder: differences listed" 'grep -q "CATALOG_WEB_PORT *8080 -> 9393" <<< "$out" && grep -q "MONGO_TAG *8.0 -> 7.0" <<< "$out"'
 check "same folder: settings taken over, new update address kept" 'grep -qxF "CATALOG_WEB_PORT=\"9393\"" "$S/$N" && grep -qxF "MONGO_TAG=\"7.0\"" "$S/$N" && grep -q "^INSTALLER_URL=\".*/$N\"$" "$S/$N"'
 check "same folder: old installer renamed, files untouched" '[ ! -e "$S/catalog.sh" ] && ls "$S"/catalog.sh.replaced-* >/dev/null 2>&1 && [ "$(cksum < "$S/.env")" = "$env_before" ] && [ "$(cksum < "$S/docker-compose.yml")" = "$compose_before" ]'
 out="$(menu "$S" '0\n')"

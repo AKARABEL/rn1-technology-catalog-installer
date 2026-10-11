@@ -4,6 +4,8 @@ NEW="$1"
 SP="$(cd "$(dirname "$0")" && pwd)"
 T="$(mktemp -d)/b"
 rm -rf "$T"; mkdir -p "$T/bin" "$T/remote" "$T/impbin" "$T/root"
+# these tests run Podman: CONTAINER_ENGINE names it (on a CI runner, detection would see its real Docker)
+sed 's/^CONTAINER_ENGINE=""$/CONTAINER_ENGINE="podman"/' "$1" > "${T%/*}/podman-installer.sh"; NEW="${T%/*}/podman-installer.sh"
 PASS=0; FAIL=0
 check() { if eval "$2"; then PASS=$((PASS+1)); echo "PASS: $1"; else FAIL=$((FAIL+1)); echo "FAIL: $1"; fi; }
 # STATE: the images of the fake Podman, one "ID NAME" per line (NAME <none> after a load without tags).
@@ -76,7 +78,6 @@ case "${1:-}" in
           id="$(lookup "$3")" || { echo "[]"; echo "Error: $3: image not known" >&2; exit 125; }
           printf '[{"Id": "%s"}]\n' "$id"
         fi ;;
-      exists) lookup "$3" >/dev/null || exit 1 ;;
       *) unhandled "$@" ;;
     esac ;;
   # no stack on this machine: nothing runs, no volumes, no networks
@@ -272,10 +273,15 @@ out="$(cd "$X/$NB" && PATH="$IMPPATH" SHIM_LOAD_UNTAGGED=1 ./import-images.sh 2>
 check "import retags by image id" '[ "$rc" -eq 0 ] && grep -q "8 image(s) loaded, 0 failed" <<< "$out" && has_image docker.io/library/mongo:7.0.43'
 check "retag uses the ID from images.txt and the qualified name (never localhost/)" 'grep -q "^podman tag $MONGO_ID docker.io/library/mongo:7.0.43$" "$LOG" && ! grep -q "^podman tag [^ ]* [^ ./]*:" "$LOG" && ! grep -q " localhost/" "$STATE"'
 
-# 4. Import without Podman: clear error, nothing loaded
+# 4. Import without Podman: clear error, nothing loaded. The bundle names no engine (the target finds its own).
+check "the bundled installer names no engine: the target finds its own" 'grep -q "^CONTAINER_ENGINE=\"\"$" "$X/$NB/rn1-technology-catalog-installer.sh"'
 : > "$STATE"; : > "$LOG"
 out="$(cd "$X/$NB" && PATH="$sysdirs" ./import-images.sh 2>&1)"; rc=$?
-check "import without podman fails with a clear error" '[ "$rc" -ne 0 ] && grep -q "Podman is not installed" <<< "$out" && ! grep -q "^podman " "$LOG"'
+check "import without any engine fails with a clear error" '[ "$rc" -ne 0 ] && grep -q "Neither Podman nor Docker is installed" <<< "$out" && ! grep -q "^podman " "$LOG"'
+sed -i 's/^CONTAINER_ENGINE=.*/CONTAINER_ENGINE="podman"/' "$X/$NB/rn1-technology-catalog-installer.sh"
+out="$(cd "$X/$NB" && PATH="$sysdirs" ./import-images.sh 2>&1)"; rc=$?
+check "import without podman, the installer names it: a clear error" '[ "$rc" -ne 0 ] && grep -q "Podman is not installed" <<< "$out" && ! grep -q "^podman " "$LOG"'
+sed -i 's/^CONTAINER_ENGINE=.*/CONTAINER_ENGINE=""/' "$X/$NB/rn1-technology-catalog-installer.sh"
 
 # 5. Import as root: Docker Compose from the bundle becomes the provider of podman compose
 rm -f "$TARGET_COMPOSE"; : > "$STATE"; : > "$LOG"

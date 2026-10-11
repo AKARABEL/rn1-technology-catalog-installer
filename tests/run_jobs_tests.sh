@@ -7,6 +7,8 @@ if ! command -v setsid >/dev/null 2>&1; then
 fi
 T="$(mktemp -d)/j"
 rm -rf "$T"; mkdir -p "$T/bin" "$T/srv/daily" "$T/srv/full"
+# these tests run Podman: CONTAINER_ENGINE names it (on a CI runner, detection would see its real Docker)
+sed 's/^CONTAINER_ENGINE=""$/CONTAINER_ENGINE="podman"/' "$1" > "${T%/*}/podman-installer.sh"; NEW="${T%/*}/podman-installer.sh"
 PASS=0; FAIL=0
 check() { if eval "$2"; then PASS=$((PASS+1)); echo "PASS: $1"; else FAIL=$((FAIL+1)); echo "FAIL: $1"; fi; }
 wait_for() { local i; for i in $(seq 1 "${2:-150}"); do eval "$1" && return 0; sleep 0.2; done; return 1; }

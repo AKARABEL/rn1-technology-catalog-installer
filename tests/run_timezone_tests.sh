@@ -7,6 +7,8 @@ if [ ! -f /usr/share/zoneinfo/Asia/Singapore ] || [ "$(TZ=Asia/Singapore date -d
 fi
 T="$(mktemp -d)/tz"
 rm -rf "$T"; mkdir -p "$T/bin"
+# these tests run Podman: CONTAINER_ENGINE names it (on a CI runner, detection would see its real Docker)
+sed 's/^CONTAINER_ENGINE=""$/CONTAINER_ENGINE="podman"/' "$1" > "${T%/*}/podman-installer.sh"; NEW="${T%/*}/podman-installer.sh"
 PASS=0; FAIL=0
 check() { if eval "$2"; then PASS=$((PASS+1)); echo "PASS: $1"; else FAIL=$((FAIL+1)); echo "FAIL: $1"; fi; }
 
@@ -30,7 +32,7 @@ case "$a" in
   "compose --env-file .env -f docker-compose.yml "*)
     [ "${PODMAN_COMPOSE_PROVIDER:-}" = "$RN1_COMPOSE_PROVIDER" ] || { printf 'UNHANDLED podman %s (PODMAN_COMPOSE_PROVIDER=%s)\n' "$a" "${PODMAN_COMPOSE_PROVIDER:-unset}" >> "$UNH"; exit 125; }
     case "${a#compose --env-file .env -f docker-compose.yml }" in
-      "config --quiet"|ps|"ps --services --filter status=running"|"up -d --remove-orphans") ;;
+      "config --quiet"|ps|"ps -q mongo"|"ps --services --filter status=running"|"up -d --remove-orphans") ;;
       *) printf 'UNHANDLED podman %s\n' "$*" >> "$UNH"; exit 125 ;;
     esac ;;
   *) printf 'UNHANDLED podman %s\n' "$*" >> "$UNH"; exit 125 ;;

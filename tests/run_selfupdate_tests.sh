@@ -3,6 +3,8 @@ set -u
 NEW="$1"
 T="$(mktemp -d)/su"
 rm -rf "$T"; mkdir -p "$T/bin" "$T/srv" "$T/inst"
+# these tests run Podman: CONTAINER_ENGINE names it (on a CI runner, detection would see its real Docker)
+sed 's/^CONTAINER_ENGINE=""$/CONTAINER_ENGINE="podman"/' "$1" > "${T%/*}/podman-installer.sh"; NEW="${T%/*}/podman-installer.sh"
 PASS=0; FAIL=0
 check() { if eval "$2"; then PASS=$((PASS+1)); echo "PASS: $1"; else FAIL=$((FAIL+1)); echo "FAIL: $1"; fi; }
 export SRV="$T/srv"
