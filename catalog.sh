@@ -5405,17 +5405,26 @@ import_snapshot() {
 
 # Worker: import_upload FILE (credentials from the job secret or LOCAL_AUTH)
 import_upload() {
-  local file="$1" resp code opid size pid codefile auth
+  local file="$1" resp code opid size pid codefile auth base
   auth="$(job_secret_take)"
   auth="${auth:-$LOCAL_AUTH}"
   size="$(stat -c %s -- "$file")"
   info "Uploading $(basename -- "$file") ($(human_size "$size")) to $(local_url)"
   resp="$(mktemp)"
   codefile="$(mktemp)"
+  base="$(minio_volume_bytes)" || base=""
   curl -sS -K - -H 'Accept: application/json' --connect-timeout 5 -F "file=@$file;type=application/gzip" \
     -o "$resp" -w '%{http_code}' "$(local_url)/v1/synchronization/snapshot" <<< "header = \"$auth\"" > "$codefile" &
   pid=$!
-  job_watch_bytes "$pid" "rchar:$pid" "$size" "Uploading"
+  if [ -r /proc/self/io ]; then
+    job_watch_bytes "$pid" "rchar:$pid" "$size" "Uploading" until-total
+    if kill -0 "$pid" 2>/dev/null; then
+      import_wait_store "$pid" "$size" "$base"
+    fi
+  else
+    # the bytes sent cannot be seen here: one step for the upload and the storing in the Catalog
+    job_watch_bytes "$pid" "rchar:$pid" "$size" "Uploading and storing in the Catalog (MinIO)"
+  fi
   wait "$pid" || true
   code="$(cat -- "$codefile")"
   opid="$(json_field operationId "$resp")"
@@ -7056,14 +7065,18 @@ fmt_duration() {
 }
 
 # Watches a growing amount of bytes (a file size, or "rchar:PID" for bytes read by a process)
-# until PID ends and reports percent, size, speed and remaining time.
-# job_watch_bytes PID SOURCE TOTAL LABEL
+# until PID ends - with "until-total", until TOTAL is reached - and reports percent, size, speed and
+# remaining time.
+# job_watch_bytes PID SOURCE TOTAL LABEL [until-total]
 job_watch_bytes() {
-  local pid="$1" src="$2" total="$3" label="$4" cur last=0 t0 t1 rate=0 eta pct
+  local pid="$1" src="$2" total="$3" label="$4" until="${5:-}" cur last=0 t0 t1 rate=0 eta pct
   t0="$(date +%s)"
   while kill -0 "$pid" 2>/dev/null; do
-    cur="$(job_bytes "$src")" || cur=0
-    cur="${cur:-0}"
+    if ! cur="$(job_bytes "$src")" || [ -z "$cur" ]; then
+      job_progress "" "$label" "$(if [ "${total:-0}" -gt 0 ]; then printf '%s %s ' "$(human_size "$total")" "$UI_SEP"; fi)$(fmt_duration $(( $(date +%s) - t0 )))"
+      sleep 1
+      continue
+    fi
     t1="$(date +%s)"
     if [ "$t1" -gt "$t0" ]; then
       rate=$(( cur / (t1 - t0) ))
@@ -7078,12 +7091,50 @@ job_watch_bytes() {
     fi
     job_progress "$pct" "$label" "$(human_size "$cur")$(if [ "${total:-0}" -gt 0 ]; then printf ' / %s' "$(human_size "$total")"; fi) $UI_SEP $(human_size "$rate")/s$eta"
     last="$cur"
+    if [ "$until" = "until-total" ] && [ "${total:-0}" -gt 0 ] && [ "$cur" -ge "$total" ]; then
+      return 0
+    fi
     sleep 1
   done
 }
 
+# Bytes in the MinIO volume of this stack, read on this server (fails where it cannot be read, e.g. in
+# the virtual machine of macOS)
+minio_volume_bytes() {
+  local mp
+  mp="$("$ENGINE" volume inspect --format '{{.Mountpoint}}' "$(stack_project)_minio_storage" 2>/dev/null)" || return 1
+  [ -n "$mp" ] && [ -d "$mp" ] && [ -r "$mp" ] || return 1
+  du -sb -- "$mp" 2>/dev/null | cut -f1
+}
+
+# import_wait_store PID SIZE BASE -> while the upload request still runs after the last byte: the
+# Catalog copies the snapshot into its file storage (MinIO) and starts the import only then. Shows how
+# much MinIO holds of it (BASE: its size before the upload), else the time it takes.
+import_wait_store() {
+  local pid="$1" size="$2" base="$3" t0 now cur pct
+  t0="$SECONDS"
+  info "Upload finished - the Catalog now copies the snapshot into its file storage (MinIO); the import starts when that is done."
+  job_step "Storing the snapshot in the Catalog"
+  while kill -0 "$pid" 2>/dev/null; do
+    now=$((SECONDS - t0))
+    cur=""
+    if [ -n "$base" ]; then
+      cur="$(minio_volume_bytes)" || cur=""
+    fi
+    if [[ "$cur" =~ ^[0-9]+$ ]] && [ "$size" -gt 0 ]; then
+      cur=$((cur > base ? cur - base : 0))
+      pct="$(awk -v c="$cur" -v t="$size" 'BEGIN { p = c * 100 / t; if (p > 99.9) p = 99.9; printf "%.1f", p }')"
+      job_progress "$pct" "Storing in the Catalog (MinIO)" "$(human_size "$cur") / $(human_size "$size") $UI_SEP $(fmt_duration "$now")"
+    else
+      job_progress "" "Storing in the Catalog (MinIO)" "the import starts when it is stored $UI_SEP $(fmt_duration "$now")"
+    fi
+    sleep 2
+  done
+}
+
 # Bytes so far: a file size, "rchar:PID" (bytes read by PID) or "proc:PID:NAME" (bytes read by
-# PID or by its child process NAME, e.g. scp under sshpass).
+# PID or by its child process NAME, e.g. scp under sshpass). Fails where the bytes a process read
+# cannot be seen (no /proc/PID/io: macOS, kernels without I/O accounting).
 job_bytes() {
   local src="$1" pid comm
   case "$src" in
@@ -7103,6 +7154,9 @@ job_bytes() {
       return 0
       ;;
   esac
+  if [ ! -r /proc/self/io ]; then
+    return 1
+  fi
   awk '/^rchar:/ { print $2 }' "/proc/${pid:-0}/io" 2>/dev/null || echo 0
 }
 

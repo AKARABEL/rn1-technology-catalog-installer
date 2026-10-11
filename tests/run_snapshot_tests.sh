@@ -69,7 +69,13 @@ if [[ "$url" == http://localhost:* ]]; then
     "POST /v1/databaseconfiguration/synchronization")
       cat "${data#@}" > "$SRV/sync-settings.json"; : > "$out"; reply 204 ;;
     "POST /v1/synchronization/snapshot")
-      echo "$form" > "$SRV/upload-form.txt"; echo "$form" >> "$SRV/uploads.log"; printf '{"operationId":"op-1","status":"accepted"}' > "$out"; reply 202 ;;
+      echo "$form" > "$SRV/upload-form.txt"; echo "$form" >> "$SRV/uploads.log"
+      if [ -n "${SHIM_STORE_SECS:-}" ]; then
+        f="${form#file=@}"; f="${f%%;*}"
+        while IFS= read -r -n 4096 _; do :; done < "$f"
+        sleep "$SHIM_STORE_SECS"
+      fi
+      printf '{"operationId":"op-1","status":"accepted"}' > "$out"; reply 202 ;;
     "POST /v1/synchronization/synchronize")
       printf '{"operationId":"op-2"}' > "$out"; reply 202 ;;
     "GET /v1/operation/"*)
@@ -193,6 +199,17 @@ out="$(SHIM_OP_RESULT=failed bash "$D/rn1-technology-catalog-installer.sh" impor
 check "CLI import: failed operation -> rc!=0" '[ "$rc" -ne 0 ] && grep -q "Import failed: done" <<< "$out"'
 out="$(bash "$D/rn1-technology-catalog-installer.sh" import /nonexistent.tar.gz </dev/null 2>&1)"; rc=$?
 check "CLI import: missing file" '[ "$rc" -ne 0 ] && grep -q "File not found" <<< "$out"'
+rm -f "$SRV/polls"
+out="$(SHIM_STORE_SECS=4 bash "$D/rn1-technology-catalog-installer.sh" import "$D/snapshots/2026-09-28-full.tar.gz" </dev/null 2>&1)"; rc=$?
+if [ -r /proc/self/io ]; then
+  check "CLI import: after the last byte the Catalog stores the snapshot - said, then the import followed" '[ "$rc" -eq 0 ] && grep -q "Upload finished - the Catalog now copies the snapshot into its file storage (MinIO)" <<< "$out" && grep -q "Import finished." <<< "$out"'
+else
+  # no /proc/PID/io (WSL, macOS): the bytes sent cannot be seen, upload and storing are one step
+  check "CLI import without byte counts: one step, then the import followed" '[ "$rc" -eq 0 ] && ! grep -q "Upload finished" <<< "$out" && grep -q "Import finished." <<< "$out"'
+fi
+rm -f "$SRV/polls"
+out="$(bash "$D/rn1-technology-catalog-installer.sh" import "$D/snapshots/2026-09-28-full.tar.gz" </dev/null 2>&1)"; rc=$?
+check "CLI import: a quick answer has no storing step" '[ "$rc" -eq 0 ] && ! grep -q "Upload finished" <<< "$out"'
 out="$(SHIM_LOCAL_DOWN=1 bash "$D/rn1-technology-catalog-installer.sh" import "$D/snapshots/2026-09-28-full.tar.gz" </dev/null 2>&1)"; rc=$?
 check "CLI import: stack down -> clear message" '[ "$rc" -ne 0 ] && grep -q "not reachable at http://localhost:8080" <<< "$out"'
 
