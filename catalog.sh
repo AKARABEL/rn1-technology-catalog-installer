@@ -5619,10 +5619,35 @@ mongo_running_version() {
   fi
 }
 
+# health_pct READY SERVICES HTTP-CODE WEB-SECONDS -> how far the start is. The services fill the first
+# half (they run within seconds or a minute); the second half is Catalog Web, which starts last and
+# takes longest: it grows with the seconds since all services were ready, slower and slower, and only
+# an answer of Catalog Web makes it 100.
+health_pct() {
+  local ready="$1" n="$2" secs="${4:-0}"
+  if [ "$ready" -lt "$n" ]; then
+    printf '%s' "$((ready * 50 / n))"
+  elif [ "$3" = "200" ]; then
+    printf '100'
+  else
+    printf '%s' "$((50 + 49 * secs / (secs + 90)))"
+  fi
+}
+
+# The state of Catalog Web for the progress line: "OK", "HTTP 500" or "no answer yet"
+health_web_text() {
+  case "$1" in
+    200) printf 'OK' ;;
+    ""|000) printf 'no answer yet' ;;
+    *) printf 'HTTP %s' "$1" ;;
+  esac
+}
+
 # Waits until every service runs (and is healthy where it has a healthcheck) and Catalog Web answers.
 # The timeout is wall-clock time: each round also spends time in the engine and curl.
 stack_health() {
   local timeout="${1:-$HEALTH_TIMEOUT}" start="$SECONDS" waited=0 shown=0 svc id state health restarts bad code warned i
+  local ready line web_since="" web_secs=0
   local -a services=() ids=() seen=()
   while IFS= read -r svc; do
     if [ -n "$svc" ]; then
@@ -5635,6 +5660,7 @@ stack_health() {
   while true; do
     bad=""
     warned=""
+    ready=0
     for ((i = 0; i < ${#services[@]}; i++)); do
       svc="${services[$i]}"
       # the container of a service keeps its ID while it restarts: look it up once
@@ -5654,8 +5680,11 @@ stack_health() {
         bad="$bad $svc(${state:-?}/${health:-?})"
       elif [ -n "${seen[$i]}" ] && [ "${restarts:-0}" != "${seen[$i]}" ]; then
         bad="$bad $svc(restarting, ${restarts}x)"
-      elif [ "${restarts:-0}" != "0" ]; then
-        warned="$warned $svc(${restarts}x)"
+      else
+        ready=$((ready + 1))
+        if [ "${restarts:-0}" != "0" ]; then
+          warned="$warned $svc(${restarts}x)"
+        fi
       fi
       seen[$i]="${restarts:-0}"
     done
@@ -5677,13 +5706,23 @@ stack_health() {
       err "Not healthy after $((timeout / 60)) minutes:${bad} Catalog Web: HTTP $code"
       return 1
     fi
+    # the waiting list first: the panel and an 80-column terminal cut the end of a long line
+    if [ -n "$bad" ]; then
+      web_since=""
+      web_secs=0
+      line="waiting for:$bad $UI_SEP $ready/${#services[@]} services ready $UI_SEP Catalog Web: $(health_web_text "$code")"
+    else
+      web_since="${web_since:-$SECONDS}"
+      web_secs=$((SECONDS - web_since))
+      line="all ${#services[@]} services ready $UI_SEP Catalog Web starting, $(fmt_duration "$web_secs") ($(health_web_text "$code"))"
+    fi
     if [ -n "$JOB_DIR" ]; then
-      job_progress "$((timeout > 0 ? waited * 100 / timeout : 0))" "Health check ${waited}s: waiting for${bad:- -} web=$code"
+      job_progress "$(health_pct "$ready" "${#services[@]}" "$code" "$web_secs")" "Health check ${waited}s: $line"
     elif [ -t 1 ]; then
-      printf '\r       %4ss  waiting for:%s web=%s          ' "$waited" "${bad:- -}" "$code"
+      printf '\r\033[K%s' "$(ui_pad "$(printf '       %4ss  %s' "$waited" "$line")" $(($(ui_cols) - 1)))"
     elif [ $((waited / 60)) -gt "$shown" ]; then
       shown=$((waited / 60))
-      echo "  ${waited}s, waiting for:${bad:- -} web=$code"
+      echo "  ${waited}s: $line"
     fi
     sleep 5
     waited=$((SECONDS - start))
@@ -13969,6 +14008,7 @@ main() {
     __settings_groups) settings_grouped "$SCRIPT_PATH" ;;
     __menu_items) menu_items ;;
     __engine) printf '%s %s %s\n' "$ENGINE" "$ENGINE_KIND" "$ENGINE_NAME" ;;
+    __health_pct) health_pct "$@"; echo; health_web_text "${3:-}"; echo ;;
     __engine_choices) engine_choices ;;
     __engine_choose) engine_choose "${1:-}" ;;
     __wiz_engine_pick) wiz_engine_pick "$(engine_choices)" "${1:-}"; echo ;;

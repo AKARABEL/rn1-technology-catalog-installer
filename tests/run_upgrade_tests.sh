@@ -248,9 +248,11 @@ setup
 ( printf '21\ny\nn\n\n0\n' | SHIM_UNHEALTHY=1 bash "$D/rn1-technology-catalog-installer.sh" menu > "$T/cancel2.out" 2>&1 ) &
 mp=$!
 for i in $(seq 1 150); do grep -q "Health check" "$D/.jobs/1/progress" 2>/dev/null && break; sleep 0.2; done
+progress="$(cat "$D/.jobs/1/progress" 2>/dev/null)"
 out="$(cd "$D" && bash rn1-technology-catalog-installer.sh jobs cancel 1 2>&1)"
 wait "$mp"
 check "cancel during the switch: job cancelled" '[ "$(cat "$D/.jobs/1/state")" = cancelled ]'
+check "health progress: the waiting service first, the ready ones counted, half the bar for the services" '[[ "$progress" =~ ^([0-9]+)\|Health\ check\ [0-9]+s:\ waiting\ for:\ catalog-web\(restarting/none\).*\ ([0-9]+)/([0-9]+)\ services\ ready ]] && [ "${BASH_REMATCH[1]}" -eq $(( BASH_REMATCH[2] * 50 / BASH_REMATCH[3] )) ] || { echo "  | $progress"; false; }'
 check "cancel during the switch: 25.4 runs again" 'grep -q "^CATALOG_VERSION=\"25.4.4191.133\"$" "$D/rn1-technology-catalog-installer.sh" && grep -q "^CATALOG_IMAGE=raynetgmbh/rayventory-catalog:25.4.4191.133$" "$D/.env" && [ "$(cat "$ST/catalog_tag")" = 25.4.4191.133 ] && grep -q "going back to Catalog 25.4.4191.133" "$D/.jobs/1/log"'
 check "no rollback question after a cancel" '! grep -q "Go back to" "$T/cancel2.out" && [ ! -e "$D/.upgrade-failed" ]'
 

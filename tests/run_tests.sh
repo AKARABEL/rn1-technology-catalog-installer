@@ -467,6 +467,15 @@ check "plain menu: group headings say what they are for, options have a descript
 out="$(printf '0\n' | COLUMNS=60 bash "$D/gen.sh" menu 2>&1)"
 check "plain menu on a narrow screen: no description" 'grep -Eq "^   13\) . Stop \(data is kept\)$" <<< "$out"'
 
+# 15. Health check progress: the services fill the first half, Catalog Web the second (it grows with its
+# start time and never reaches 100 before it answers) - not the elapsed share of the timeout
+hp() { bash "$D/gen.sh" __health_pct "$@" 2>/dev/null | tr '\n' '|'; }
+check "health progress: nothing ready, no answer: 0%" '[ "$(hp 0 11 000 0)" = "0|no answer yet|" ]'
+check "health progress: 9 of 11 ready: 40%" '[ "$(hp 9 11 000 0)" = "40|no answer yet|" ]'
+check "health progress: all ready, Catalog Web just starting: 50%" '[ "$(hp 11 11 000 0)" = "50|no answer yet|" ]'
+check "health progress: Catalog Web starting for 90 s / 10 min: 74% / 92%, never 100" '[ "$(hp 11 11 500 90)" = "74|HTTP 500|" ] && [ "$(hp 11 11 000 600)" = "92|no answer yet|" ] && [ "$(hp 11 11 000 36000)" = "98|no answer yet|" ]'
+check "health progress: all ready and Catalog Web answers: 100%" '[ "$(hp 11 11 200 30)" = "100|OK|" ]'
+
 check "no podman, compose or systemctl call the fakes do not know" '[ ! -s "$SHIM_UNHANDLED" ] || { sort -u "$SHIM_UNHANDLED"; false; }'
 
 echo "== $PASS passed, $FAIL failed"
