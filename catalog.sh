@@ -34,7 +34,7 @@ rn1_mac_brew() {
 }
 
 rn1_mac_bootstrap() {
-  local brew prefix t missing="" url="https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh"
+  local brew prefix t hb missing="" url="https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh"
   if [ "$(id -u)" = "0" ]; then
     echo "ERROR On macOS run $0 as your normal user, not as root: Homebrew and the Podman machine belong to the user." >&2
     exit 1
@@ -45,11 +45,19 @@ rn1_mac_bootstrap() {
     echo "    needs a current bash and the GNU tools (coreutils, gnu-sed, grep, findutils) from Homebrew."
     echo "    It is installed with the official script of https://brew.sh (it asks for your password):"
     echo "      /bin/bash -c \"\$(curl -fsSL $url)\""
+    if [ ! -t 0 ]; then
+      echo "Homebrew's installer needs a terminal (your password, RETURN): run the command above, then start $0 again." >&2
+      exit 1
+    fi
     if ! rn1_mac_yes "Install Homebrew now?"; then
       echo "Nothing was installed. Install Homebrew from https://brew.sh, then start $0 again." >&2
       exit 1
     fi
-    if ! /bin/bash -c "$(curl -fsSL "$url")"; then
+    if ! hb="$(curl -fsSL "$url")" || [ -z "$hb" ]; then
+      echo "ERROR The Homebrew install script could not be downloaded: $url (network, proxy?)" >&2
+      exit 1
+    fi
+    if ! /bin/bash -c "$hb"; then
       echo "ERROR Homebrew could not be installed (see above)." >&2
       exit 1
     fi
@@ -84,7 +92,7 @@ rn1_mac_bootstrap() {
   export RN1_MAC_BOOTSTRAPPED=1
   if [ "${BASH_VERSINFO[0]}" -lt 4 ] || { [ "${BASH_VERSINFO[0]}" -eq 4 ] && [ "${BASH_VERSINFO[1]}" -lt 2 ]; }; then
     export RN1_BASH_REEXEC=1
-    exec "$prefix/bin/bash" "$0" ${1+"$@"}
+    exec "$prefix/opt/bash/bin/bash" "$0" ${1+"$@"}
   fi
 }
 
@@ -192,7 +200,7 @@ OS_KIND="$(uname -s 2>/dev/null || echo Linux)"
 # a gnubin folder already on the PATH keeps its place
 mac_gnu_path() {
   local p t
-  for p in /opt/homebrew /usr/local; do
+  for p in /usr/local /opt/homebrew $(brew --prefix 2>/dev/null); do
     for t in findutils grep gnu-sed coreutils; do
       if [ -d "$p/opt/$t/libexec/gnubin" ] && [[ ":$PATH:" != *":$p/opt/$t/libexec/gnubin:"* ]]; then
         PATH="$p/opt/$t/libexec/gnubin:$PATH"
@@ -5154,6 +5162,7 @@ snapshot_fetch() {
 LOCAL_AUTH=""
 LOCAL_STATE=""
 LOCAL_ADMIN="no"
+LOCAL_CODE=""
 
 local_url() {
   printf 'http://localhost:%s' "$(setting CATALOG_WEB_PORT)"
@@ -5192,15 +5201,17 @@ json_field() {
   sed -n "s/.*\"$1\" *: *\"\\{0,1\\}\\([^\",}]*\\).*/\\1/p" "$2" | head -n 1
 }
 
-# Checks LOCAL_AUTH: LOCAL_STATE valid / invalid / unreachable / error, LOCAL_ADMIN yes / no.
+# Checks LOCAL_AUTH: LOCAL_STATE valid / invalid / unreachable / error, LOCAL_ADMIN yes / no. A new
+# catalog has no synchronization settings yet and answers 204 (no content) - for an administrator too.
 local_auth_check() {
   local out code
   out="$(mktemp)"
   code="$(local_call GET /v1/databaseconfiguration/synchronization "$out")"
   rm -f -- "$out"
   LOCAL_ADMIN="no"
+  LOCAL_CODE="$code"
   case "$code" in
-    200) LOCAL_STATE="valid"; LOCAL_ADMIN="yes" ;;
+    200|204) LOCAL_STATE="valid"; LOCAL_ADMIN="yes" ;;
     403) LOCAL_STATE="valid" ;;
     401) LOCAL_STATE="invalid" ;;
     000) LOCAL_STATE="unreachable" ;;
@@ -5219,7 +5230,7 @@ report_local_state() {
       ;;
     invalid) err "The local catalog rejected the key or login." ;;
     unreachable) err "The local catalog is not reachable at $(local_url) - is the stack running (option 6)?" ;;
-    *) err "Unexpected answer from the local catalog." ;;
+    *) err "Unexpected answer from the local catalog (HTTP ${LOCAL_CODE:-?})." ;;
   esac
 }
 
@@ -5613,7 +5624,15 @@ local_self_sync() {
   fi
   local_auth_obtain || return 1
   if [ "$LOCAL_ADMIN" != "yes" ]; then
-    err "Changing the synchronization settings needs a local administrator."
+    if [ "$LOCAL_STATE" = "valid" ] && [[ "$LOCAL_AUTH" == "Authorization: Bearer "* ]]; then
+      err "The local catalog refused to change the synchronization settings (HTTP ${LOCAL_CODE:-403})."
+      echo "  The user needs the Admin role. An administrator is refused too while the Catalog has no valid"
+      echo "  license yet: load the license file in the web interface ($(local_url)), then try again."
+    elif [ "$LOCAL_STATE" = "valid" ]; then
+      err "Changing the synchronization settings needs a local administrator."
+    else
+      report_local_state
+    fi
     return 1
   fi
 
@@ -5621,10 +5640,14 @@ local_self_sync() {
   body="$(mktemp)"
   out="$(mktemp)"
   code="$(local_call GET /v1/databaseconfiguration/synchronization "$cur")"
-  if [ "$code" != "200" ]; then
+  if [ "$code" != "200" ] && [ "$code" != "204" ]; then
     rm -f -- "$cur" "$body" "$out"
     err "Could not read the synchronization settings (HTTP $code)."
     return 1
+  fi
+  # a new catalog has none yet (204, or null)
+  if [ ! -s "$cur" ] || [ "$(tr -d ' \r\n\t' < "$cur")" = "null" ]; then
+    printf '{}' > "$cur"
   fi
   chmod 600 "$body"
   if command -v jq >/dev/null 2>&1; then

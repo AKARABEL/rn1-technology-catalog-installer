@@ -65,6 +65,8 @@ if [[ "$url" == http://localhost:* ]]; then
   case "$method $path" in
     "GET /v1/databaseconfiguration/synchronization")
       [ "$role" = admin ] || { : > "$out"; reply 403; }
+      if [ -n "${SHIM_NEW_CATALOG:-}" ]; then : > "$out"; reply 204; fi
+      if [ -n "${SHIM_REFUSE_ADMIN:-}" ]; then : > "$out"; reply 403; fi
       printf '{"parentInstanceUrl":"","parentInstanceKey":"","proxyInfo":{"address":"proxy:3128"}}' > "$out"; reply 200 ;;
     "POST /v1/databaseconfiguration/synchronization")
       cat "${data#@}" > "$SRV/sync-settings.json"; : > "$out"; reply 204 ;;
@@ -222,6 +224,11 @@ check "sync settings: online URL + key set, proxy kept" 'grep -q "\"parentInstan
 check "synchronization started and followed" 'grep -q "now synchronizes from https://rayventorycatalog.raynet.de" <<< "$out" && grep -q "Import finished." <<< "$out"'
 out="$(printf "20\n1\n$LOCALSYNC\nn\n\n0\n" | bash "$D/rn1-technology-catalog-installer.sh" menu 2>&1)"
 check "self-sync refused without admin rights" 'grep -q "needs a local administrator" <<< "$out"'
+rm -f "$LK" "$SRV/polls" "$SRV/sync-settings.json"
+out="$(printf '20\n2\nadmin\np@ss"w0rd\ny\n\n0\n' | SHIM_NEW_CATALOG=1 bash "$D/rn1-technology-catalog-installer.sh" menu 2>&1)"
+check "self-sync on a new catalog (no settings yet, HTTP 204): the administrator is one, the settings are written" '! grep -q "needs a local administrator" <<< "$out" && grep -q "now synchronizes from https://rayventorycatalog.raynet.de" <<< "$out" && grep -q "\"parentInstanceUrl\": *\"https://rayventorycatalog.raynet.de\"" "$SRV/sync-settings.json" && grep -q "\"parentInstanceKey\": *\"$VALID\"" "$SRV/sync-settings.json"'
+out="$(printf '20\n2\nadmin\np@ss"w0rd\n\n0\n' | SHIM_REFUSE_ADMIN=1 bash "$D/rn1-technology-catalog-installer.sh" menu 2>&1)"
+check "self-sync, an administrator login refused (HTTP 403): the role and a missing license named" 'grep -q "refused to change the synchronization settings (HTTP 403)" <<< "$out" && grep -q "while the Catalog has no valid" <<< "$out" && grep -q "license yet: load the license file in the web interface" <<< "$out"'
 
 # 14. Key menu: local key add / test / delete
 rm -f "$LK"
