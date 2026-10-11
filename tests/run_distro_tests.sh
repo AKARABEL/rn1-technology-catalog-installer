@@ -215,7 +215,7 @@ case "$*" in
         colima) cp "$T/inst/colima" "$T/bin/colima" ;;
         docker) cp "$T/inst/docker" "$T/bin/docker" ;;
         docker-desktop) cp "$T/inst/docker" "$T/bin/docker"; touch "$T/docker.plugin"; mkdir -p "$HOME/Applications/Docker.app" ;;
-        coreutils|gnu-sed|grep|findutils) ;;
+        bash|coreutils|gnu-sed|grep|findutils) ;;
         *) echo "UNHANDLED brew $*" >> "$BAD"; exit 1 ;;
       esac
       mkdir -p "$T/brew/opt/$t"
@@ -247,6 +247,9 @@ echo "curl $url" >> "$LOG"
 [ -n "${SHIM_GITHUB_DOWN:-}" ] && exit 6
 tag="${SHIM_TAG:-v5.6.0}"
 case "$url" in
+  https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)
+    # the official Homebrew script: here it only puts the fake brew where Homebrew installs it
+    printf 'echo "homebrew install.sh" >> "%s"; mkdir -p "%s/hb/bin" && cp "%s/inst/brew" "%s/hb/bin/brew"\n' "$LOG" "$T" "$T" "$T" ;;
   https://github.com/docker/compose/releases/latest)
     printf 'HTTP/2 302\r\nlocation: https://github.com/docker/compose/releases/tag/%s\r\n\r\n' "$tag" ;;
   https://github.com/docker/compose/releases/download/*.sha256)
@@ -261,6 +264,8 @@ esac
 EOF
 chmod +x "$T/bin/"* "$T/inst/"*
 export LOG="$T/log" SUDO_LOG="$T/sudo.log" MSTATE="$T/machine" BAD="$T/bad.log" T
+# the macOS start check (Homebrew, bash, GNU tools) has its own tests below; the other macOS cases skip it
+export RN1_MAC_BOOTSTRAPPED=1
 : > "$BAD"
 I="$T/d/rn1-technology-catalog-installer.sh"
 cp "$NEW" "$I"
@@ -554,6 +559,26 @@ check "new installation on an Intel Mac without an engine: Colima, not Docker De
 check "new installation on macOS 15 without an engine: Colima (Podman needs macOS 26)" '[ "$(SHIM_MACOS=15.6 erun __wiz_engine_pick)" = colima ]'
 mkdir -p "$T/home/Applications/Docker.app"; cp "$T/inst/docker" "$T/bin/docker"; touch "$T/docker.plugin" "$T/docker.up" "$T/dd.ctx"
 check "new installation on a Mac with Docker Desktop: Enter takes it" '[ "$(erun __wiz_engine_pick)" = docker ]'
+
+# --- macOS start: Homebrew, a current bash and the GNU tools, each checked, installed only after a yes ------
+B="$T/boot"; rm -rf "$B"; mkdir -p "$B"; cp "$NEW" "$B/i.sh"
+brun() { (cd "$B" && HOME="$T/home" SHIM_OS=Darwin RN1_MAC_BOOTSTRAPPED= RN1_BREW_DIRS="$T/hb/bin" PATH="$T/bin:$SYSPATH" bash i.sh "$@" 2>&1); }
+rm -rf "$T/hb" "$T/brew" "$T/bin/brew"; : > "$LOG"
+out="$(SHIM_UID=0 brun help </dev/null)"; rc=$?
+check "macOS start as root: refused before anything" '[ "$rc" -ne 0 ] && grep -q "On macOS run i.sh as your normal user, not as root" <<< "$out" && ! grep -q . "$LOG"'
+out="$(brun help </dev/null)"; rc=$?
+check "macOS start without Homebrew: says why and how, nothing installed without a yes" '[ "$rc" -ne 0 ] && grep -q "Homebrew is not installed. The installer needs it" <<< "$out" && grep -qF "/bin/bash -c \"\$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)\"" <<< "$out" && grep -q "Nothing was installed. Install Homebrew from https://brew.sh" <<< "$out" && ! grep -q "homebrew install.sh" "$LOG"'
+out="$(printf 'n\n' | brun help)"; rc=$?
+check "macOS start without Homebrew, answered no: nothing installed" '[ "$rc" -ne 0 ] && grep -q "Install Homebrew now?" <<< "$out" && [ ! -e "$T/hb/bin/brew" ]'
+out="$(printf 'y\ny\n' | brun help)"; rc=$?
+check "macOS start, yes and yes: Homebrew from brew.sh, then bash and the GNU tools, then the installer runs" '[ "$rc" -eq 0 ] && grep -q "homebrew install.sh" "$LOG" && grep -q "Homebrew is installed" <<< "$out" && grep -q "Homebrew installs what the installer needs here: bash coreutils gnu-sed grep findutils" <<< "$out" && grep -q "^brew install bash coreutils gnu-sed grep findutils$" "$LOG" && grep -q "^Usage:" <<< "$out" || { echo "rc=$rc"; head -n 14 <<< "$out" | sed "s/^/  > /"; grep -nE "brew|homebrew" "$LOG"; false; }'
+: > "$LOG"
+out="$(brun help </dev/null)"; rc=$?
+check "macOS start with everything there: no question, no install" '[ "$rc" -eq 0 ] && ! grep -q "Homebrew installs\|Install Homebrew" <<< "$out" && ! grep -q "^brew install" "$LOG" && grep -q "^Usage:" <<< "$out"'
+rm -rf "$T/brew/opt/gnu-sed" "$T/brew/opt/grep"; : > "$LOG"
+out="$(printf 'n\n' | brun help)"; rc=$?
+check "macOS start, two tools missing, answered no: named, nothing installed" '[ "$rc" -ne 0 ] && grep -q "Homebrew installs what the installer needs here: gnu-sed grep$" <<< "$out" && grep -q "Nothing was installed. The installer needs them: brew install gnu-sed grep" <<< "$out" && ! grep -q "^brew install" "$LOG"'
+rm -rf "$T/hb" "$T/brew"
 
 check "fakes: no unknown docker, colima, brew or open call" '[ ! -s "$BAD" ] || { sort "$BAD" | uniq -c | head -20; false; }'
 

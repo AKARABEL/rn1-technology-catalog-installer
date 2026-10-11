@@ -3,6 +3,94 @@ if [ -z "${BASH_VERSION:-}" ]; then
   exec bash "$0" "$@"
 fi
 set -euo pipefail
+
+# macOS: Homebrew, a current bash and the GNU tools come first - checked one by one, installed only
+# after a yes. This part runs in the bash 3.2 of macOS.
+rn1_mac_yes() {
+  local answer=""
+  printf '%s [Y/n] ' "$1"
+  if ! read -r answer; then
+    echo
+    return 1
+  fi
+  if [ ! -t 0 ]; then
+    echo
+  fi
+  case "$answer" in
+    ""|[Yy]|[Yy][Ee][Ss]) return 0 ;;
+  esac
+  return 1
+}
+
+rn1_mac_brew() {
+  local d
+  for d in ${RN1_BREW_DIRS-/opt/homebrew/bin /usr/local/bin}; do
+    if [ -x "$d/brew" ]; then
+      printf '%s' "$d/brew"
+      return 0
+    fi
+  done
+  command -v brew 2>/dev/null
+}
+
+rn1_mac_bootstrap() {
+  local brew prefix t missing="" url="https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh"
+  if [ "$(id -u)" = "0" ]; then
+    echo "ERROR On macOS run $0 as your normal user, not as root: Homebrew and the Podman machine belong to the user." >&2
+    exit 1
+  fi
+  brew="$(rn1_mac_brew)" || brew=""
+  if [ -z "$brew" ]; then
+    echo "==> Homebrew is not installed. The installer needs it: macOS has bash 3.2, and the installer"
+    echo "    needs a current bash and the GNU tools (coreutils, gnu-sed, grep, findutils) from Homebrew."
+    echo "    It is installed with the official script of https://brew.sh (it asks for your password):"
+    echo "      /bin/bash -c \"\$(curl -fsSL $url)\""
+    if ! rn1_mac_yes "Install Homebrew now?"; then
+      echo "Nothing was installed. Install Homebrew from https://brew.sh, then start $0 again." >&2
+      exit 1
+    fi
+    if ! /bin/bash -c "$(curl -fsSL "$url")"; then
+      echo "ERROR Homebrew could not be installed (see above)." >&2
+      exit 1
+    fi
+    brew="$(rn1_mac_brew)" || brew=""
+    if [ -z "$brew" ]; then
+      echo "ERROR Homebrew was installed, but its brew command is not found." >&2
+      exit 1
+    fi
+    echo " OK Homebrew is installed. For new terminals, run the commands Homebrew showed under \"Next steps\"."
+  fi
+  prefix="$("$brew" --prefix)"
+  PATH="$prefix/bin:$prefix/sbin:$PATH"
+  export PATH
+  for t in bash coreutils gnu-sed grep findutils; do
+    if [ ! -d "$prefix/opt/$t" ]; then
+      missing="$missing $t"
+    fi
+  done
+  if [ -n "$missing" ]; then
+    echo "==> Homebrew installs what the installer needs here:$missing"
+    echo "      brew install$missing"
+    if ! rn1_mac_yes "Install them now?"; then
+      echo "Nothing was installed. The installer needs them: brew install$missing" >&2
+      exit 1
+    fi
+    # shellcheck disable=SC2086
+    if ! "$brew" install $missing; then
+      echo "ERROR brew install$missing failed (see above)." >&2
+      exit 1
+    fi
+  fi
+  export RN1_MAC_BOOTSTRAPPED=1
+  if [ "${BASH_VERSINFO[0]}" -lt 4 ] || { [ "${BASH_VERSINFO[0]}" -eq 4 ] && [ "${BASH_VERSINFO[1]}" -lt 2 ]; }; then
+    export RN1_BASH_REEXEC=1
+    exec "$prefix/bin/bash" "$0" ${1+"$@"}
+  fi
+}
+
+if [ -z "${RN1_MAC_BOOTSTRAPPED:-}" ] && [ "$(uname -s 2>/dev/null)" = "Darwin" ]; then
+  rn1_mac_bootstrap ${1+"$@"}
+fi
 if [ "${BASH_VERSINFO[0]}" -lt 4 ] || { [ "${BASH_VERSINFO[0]}" -eq 4 ] && [ "${BASH_VERSINFO[1]}" -lt 2 ]; }; then
   for b in /opt/homebrew/bin/bash /usr/local/bin/bash; do
     if [ -x "$b" ] && [ "${RN1_BASH_REEXEC:-}" != "1" ]; then

@@ -205,17 +205,30 @@ jobs:
           persist-credentials: false
       - name: The macOS bash 3.2 is refused with a clear message (before Homebrew bash is used)
         run: |
-          out="$(env RN1_BASH_REEXEC=1 /bin/bash rn1-technology-catalog-installer.sh help 2>&1)" && exit 1
+          out="$(env RN1_MAC_BOOTSTRAPPED=1 RN1_BASH_REEXEC=1 /bin/bash rn1-technology-catalog-installer.sh help 2>&1)" && exit 1
           echo "$out"
           grep -q "bash 4.2 or newer is needed" <<< "$out"
+      - name: The start check in bash 3.2 without a terminal - names what is missing and installs nothing, or starts
+        run: |
+          rc=0
+          out="$(/bin/bash rn1-technology-catalog-installer.sh help < /dev/null 2>&1)" || rc=$?
+          echo "$out"
+          if [ "$rc" -eq 0 ]; then
+            grep -q "^Usage:" <<< "$out"
+          else
+            grep -q "Homebrew installs what the installer needs here:" <<< "$out" && grep -q "Nothing was installed" <<< "$out"
+          fi
       - name: Homebrew bash and the GNU tools
         run: |
           brew install bash coreutils gnu-sed grep findutils
           p="$(brew --prefix)"
           for t in coreutils gnu-sed grep findutils; do echo "$p/opt/$t/libexec/gnubin" >> "$GITHUB_PATH"; done
           echo "$p/bin" >> "$GITHUB_PATH"
-      - name: /bin/bash starts the installer in Homebrew bash
-        run: /bin/bash rn1-technology-catalog-installer.sh help | head -n 5
+      - name: /bin/bash 3.2 runs the start check, finds everything and starts the installer in Homebrew bash
+        run: |
+          out="$(/bin/bash rn1-technology-catalog-installer.sh help < /dev/null 2>&1)"
+          head -n 5 <<< "$out"
+          grep -q "^Usage:" <<< "$out" && ! grep -q "Homebrew installs" <<< "$out"
       - name: Syntax
         run: bash -n rn1-technology-catalog-installer.sh
       - name: Podman, Docker Desktop and Colima flows (fake Homebrew, Podman machine, Colima, GitHub)
