@@ -567,11 +567,29 @@ rm -rf "$T/hb" "$T/brew" "$T/bin/brew"; : > "$LOG"
 out="$(SHIM_UID=0 brun help </dev/null)"; rc=$?
 check "macOS start as root: refused before anything" '[ "$rc" -ne 0 ] && grep -q "On macOS run i.sh as your normal user, not as root" <<< "$out" && ! grep -q . "$LOG"'
 out="$(brun help </dev/null)"; rc=$?
-check "macOS start without Homebrew: says why and how, nothing installed without a yes" '[ "$rc" -ne 0 ] && grep -q "Homebrew is not installed. The installer needs it" <<< "$out" && grep -qF "/bin/bash -c \"\$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)\"" <<< "$out" && grep -q "Nothing was installed. Install Homebrew from https://brew.sh" <<< "$out" && ! grep -q "homebrew install.sh" "$LOG"'
+check "macOS start without Homebrew and without a terminal: says why and how, installs nothing" '[ "$rc" -ne 0 ] && grep -q "Homebrew is not installed. The installer needs it" <<< "$out" && grep -qF "/bin/bash -c \"\$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)\"" <<< "$out" && grep -q "Homebrew.s installer needs a terminal" <<< "$out" && ! grep -q "Install Homebrew now?" <<< "$out" && ! grep -q "homebrew install.sh" "$LOG"'
+# Homebrew's own installer needs a terminal: these cases run in one (script from util-linux)
+if script --version 2>/dev/null | grep -q util-linux; then
+  trun() { # ANSWERS... -> the start check in a terminal, one answer after each question
+    local keys="" a
+    for a in "$@"; do keys="$keys sleep 2; printf '%s\\n' '$a';"; done
+    (cd "$B" && { eval "$keys"; sleep 3; } | HOME="$T/home" SHIM_OS=Darwin RN1_MAC_BOOTSTRAPPED= RN1_BREW_DIRS="$T/hb/bin" PATH="$T/bin:$SYSPATH" \
+      TERM=xterm timeout 60 script -qfec "stty sane; bash i.sh help" /dev/null 2>&1) | tr -d '\r'
+  }
+  out="$(trun n)"
+  check "macOS start without Homebrew, answered no: nothing installed" 'grep -q "Install Homebrew now?" <<< "$out" && grep -q "Nothing was installed. Install Homebrew from https://brew.sh" <<< "$out" && [ ! -e "$T/hb/bin/brew" ]'
+  out="$(SHIM_GITHUB_DOWN=1 trun y)"
+  check "macOS start, Homebrew script not downloadable: named, not called installed" 'grep -q "The Homebrew install script could not be downloaded" <<< "$out" && ! grep -q "Homebrew is installed" <<< "$out" && [ ! -e "$T/hb/bin/brew" ]'
+  : > "$LOG"
+  out="$(trun y y)"
+  check "macOS start, yes and yes: Homebrew from brew.sh, then bash and the GNU tools, then the installer runs" 'grep -q "homebrew install.sh" "$LOG" && grep -q "Homebrew is installed" <<< "$out" && grep -q "Homebrew installs what the installer needs here: bash coreutils gnu-sed grep findutils" <<< "$out" && grep -q "^brew install bash coreutils gnu-sed grep findutils$" "$LOG" && grep -q "^Usage:" <<< "$out" || { tail -n 12 <<< "$out" | sed "s/^/  > /"; false; }'
+fi
+# Homebrew there (as after its installer): the formulas are checked and installed without a terminal too
+mkdir -p "$T/hb/bin"; cp "$T/inst/brew" "$T/hb/bin/brew"; rm -rf "$T/brew"; : > "$LOG"
 out="$(printf 'n\n' | brun help)"; rc=$?
-check "macOS start without Homebrew, answered no: nothing installed" '[ "$rc" -ne 0 ] && grep -q "Install Homebrew now?" <<< "$out" && [ ! -e "$T/hb/bin/brew" ]'
-out="$(printf 'y\ny\n' | brun help)"; rc=$?
-check "macOS start, yes and yes: Homebrew from brew.sh, then bash and the GNU tools, then the installer runs" '[ "$rc" -eq 0 ] && grep -q "homebrew install.sh" "$LOG" && grep -q "Homebrew is installed" <<< "$out" && grep -q "Homebrew installs what the installer needs here: bash coreutils gnu-sed grep findutils" <<< "$out" && grep -q "^brew install bash coreutils gnu-sed grep findutils$" "$LOG" && grep -q "^Usage:" <<< "$out" || { echo "rc=$rc"; head -n 14 <<< "$out" | sed "s/^/  > /"; grep -nE "brew|homebrew" "$LOG"; false; }'
+check "macOS start, the formulas missing, answered no: named, nothing installed" '[ "$rc" -ne 0 ] && grep -q "Homebrew installs what the installer needs here: bash coreutils gnu-sed grep findutils$" <<< "$out" && grep -q "Nothing was installed. The installer needs them: brew install bash coreutils gnu-sed grep findutils" <<< "$out" && ! grep -q "^brew install" "$LOG"'
+out="$(printf 'y\n' | brun help)"; rc=$?
+check "macOS start, the formulas missing, answered yes: installed, then the installer runs" '[ "$rc" -eq 0 ] && grep -q "^brew install bash coreutils gnu-sed grep findutils$" "$LOG" && grep -q "^Usage:" <<< "$out"'
 : > "$LOG"
 out="$(brun help </dev/null)"; rc=$?
 check "macOS start with everything there: no question, no install" '[ "$rc" -eq 0 ] && ! grep -q "Homebrew installs\|Install Homebrew" <<< "$out" && ! grep -q "^brew install" "$LOG" && grep -q "^Usage:" <<< "$out"'
