@@ -8,6 +8,8 @@ rm -rf "$T"; mkdir -p "$T/bin" "$T/remote" "$T/impbin" "$T/root"
 sed 's/^CONTAINER_ENGINE=""$/CONTAINER_ENGINE="podman"/' "$1" > "${T%/*}/podman-installer.sh"; NEW="${T%/*}/podman-installer.sh"
 PASS=0; FAIL=0
 check() { if eval "$2"; then PASS=$((PASS+1)); echo "PASS: $1"; else FAIL=$((FAIL+1)); echo "FAIL: $1"; fi; }
+# the internet check (menu start, new installation, option 16, engine setup) has its own suite (run_network_tests)
+export RN1_NET_CHECK=off
 # STATE: the images of the fake Podman, one "ID NAME" per line (NAME <none> after a load without tags).
 # UNHANDLED: every call a fake did not know, over all runs (LOG is emptied now and then).
 export LOG="$T/calls.log" STATE="$T/engine.state" REMOTE="$T/remote" UNHANDLED="$T/unhandled.log" FAKEROOT="$T/root"
@@ -34,6 +36,7 @@ case "${1:-}" in
       info) echo "host: fake" ;;
       "info --format {{.Host.Security.Rootless}}") echo false ;;
       "info --format {{.Host.Kernel}}") echo 6.8.0-generic ;;
+      "info --format {{.Host.MemTotal}}") echo "${SHIM_MEMTOTAL:-34359738368}" ;;
       *) unhandled "$@" ;;
     esac ;;
   pull)

@@ -7,6 +7,8 @@ rm -rf "$T"; mkdir -p "$T/bin" "$T/state"
 sed 's/^CONTAINER_ENGINE=""$/CONTAINER_ENGINE="podman"/' "$1" > "${T%/*}/podman-installer.sh"; NEW="${T%/*}/podman-installer.sh"
 PASS=0; FAIL=0
 check() { if eval "$2"; then PASS=$((PASS+1)); echo "PASS: $1"; else FAIL=$((FAIL+1)); echo "FAIL: $1"; fi; }
+# the internet check (menu start, new installation, option 16, engine setup) has its own suite (run_network_tests)
+export RN1_NET_CHECK=off
 export LOG="$T/calls.log" ST="$T/state"
 : > "$LOG"
 
@@ -32,6 +34,15 @@ esac
 code=200; body=""
 case "$url" in
   http://localhost:*/) [ "${SHIM_WEB_DOWN:-}" = 1 ] && code=502 ;;
+  # the license check after a restart; SHIM_LICENSE_VALID=false: the new start does not accept the license;
+  # SHIM_LICENSE_HOST: the license is bound to this host name of catalog-web (valid only while it has it)
+  http://localhost:*/v1/license/isValid)
+    echo "isValid" >> "$ST/asked"
+    body="${SHIM_LICENSE_VALID:-true}"
+    if [ -n "${SHIM_LICENSE_HOST:-}" ]; then
+      h="$(cat "$ST/hostname" 2>/dev/null)"
+      [ "${h:-4f9c2d71e8a3}" = "$SHIM_LICENSE_HOST" ] || body=false
+    fi ;;
   https://hub.docker.com/v2/repositories/raynetgmbh/rayventory-catalog*/tags*)
     d="sha256:aaaa"
     body='{"count":3,"next":null,"results":[{"name":"stable","digest":"'$d'"},{"name":"26.3.4789.148","digest":"'$d'"},{"name":"26.1.4475.137","digest":"sha256:bbbb"},{"name":"25.4.4191.133","digest":"sha256:cccc"}]}' ;;
@@ -58,7 +69,9 @@ EOF
 
 # Fake rootful Podman 5.7.0 (SHIM_PODMAN_VERSION) with "podman compose" built in. Containers are
 # "id-SERVICE" while $ST/up exists (they exist stopped while $ST/exited does), $ST/wd is the folder
-# the stack was created in. Calls it does not know are logged to $UNH and fail with 125.
+# the stack was created in. catalog-web has the CATALOG_HOSTNAME of .env at its last start ($ST/hostname;
+# without one a new container ID), before the first start the container ID 4f9c2d71e8a3. Calls it does
+# not know are logged to $UNH and fail with 125.
 export UNH="$T/unhandled.log" RN1_COMPOSE_PROVIDER="$T/cli-plugins/docker-compose"
 : > "$UNH"
 cat > "$T/bin/podman" <<'EOF'
@@ -73,6 +86,10 @@ inspect_one() {
   local id="$2" svc="${2#id-}"
   { exists && [ "$svc" != "$id" ] && [[ " $SVCS " == *" $svc "* ]]; } || nosuch "$id"
   case "$1" in
+    '{{.Config.Hostname}}')
+      [ "$svc" = catalog-web ] || bad container inspect --format "$1" "$id"
+      h="$(cat "$ST/hostname" 2>/dev/null)"; echo "${h:-4f9c2d71e8a3}" ;;
+    '{{.State.OOMKilled}}|{{index .Config.Labels "com.docker.compose.service"}}|{{.RestartCount}}') echo "false|$svc|0" ;;
     '{{.Config.Image}}')
       # the images the stack was started with ($ST/upenv: the env file of the last "up")
       upenv() { sed -n "s/^$1=//p" "$ST/upenv"; }
@@ -87,13 +104,14 @@ inspect_one() {
         nginx-proxy-manager) echo "docker.io/jc21/nginx-proxy-manager:$(upenv NGINX_PROXY_MANAGER_TAG)" ;;
       esac ;;
     '{{.State.Status}}|{{with .State.Health}}{{or .Status "none"}}{{else}}none{{end}}|{{.RestartCount}}')
-      if [ "$svc" = catalog-web ] && [ "${SHIM_UNHEALTHY:-}" = 1 ]; then echo "restarting|none|3"
+      if ! running; then echo "exited|none|0"
+      elif [ "$svc" = catalog-web ] && [ "${SHIM_UNHEALTHY:-}" = 1 ]; then echo "restarting|none|3"
       elif [ "$svc" = rabbitmq ]; then echo "running|healthy|0"
       else echo "running|none|0"; fi ;;
     '{{index .Config.Labels "com.docker.compose.project"}}|{{index .Config.Labels "com.docker.compose.project.working_dir"}}|{{index .Config.Labels "com.docker.compose.project.config_files"}}|{{index .Config.Labels "com.docker.compose.project.environment_file"}}|{{.Config.Image}}|{{.State.Status}}')
       [ "$svc" = catalog-web ] || bad container inspect --format "$1" "$id"
       w="$(cat "$ST/wd")"
-      echo "inst|$w|$w/docker-compose.yml|$w/.env|docker.io/raynetgmbh/rayventory-catalog:$(cat "$ST/catalog_tag")|running" ;;
+      echo "inst|$w|$w/docker-compose.yml|$w/.env|docker.io/raynetgmbh/rayventory-catalog:$(cat "$ST/catalog_tag")|$(if running; then echo running; else echo exited; fi)" ;;
     *) bad container inspect --format "$1" "$id" ;;
   esac
 }
@@ -101,8 +119,11 @@ case "${1:-}" in
   --version) [ $# -eq 1 ] || bad "$@"; echo "podman version ${SHIM_PODMAN_VERSION:-5.7.0}" ;;
   info)
     if [ $# -eq 1 ]; then exit 0; fi
-    [ "$*" = "info --format {{.Host.Security.Rootless}}" ] || bad "$@"
-    echo false ;;
+    case "$*" in
+      "info --format {{.Host.Security.Rootless}}") echo false ;;
+      "info --format {{.Host.MemTotal}}") echo "${SHIM_MEMTOTAL:-34359738368}" ;;
+      *) bad "$@" ;;
+    esac ;;
   volume)
     # the data volumes exist once the stack was created ($ST/wd); "down" keeps them
     [ "$*" = "volume ls -q --filter label=com.docker.compose.project=inst" ] || bad "$@"
@@ -111,8 +132,9 @@ case "${1:-}" in
     fi ;;
   ps)
     case "$*" in
-      "ps -aq --filter label=com.docker.compose.service=catalog-web") running && echo id-catalog-web ;;
-      "ps -aq --filter label=com.docker.compose.project=inst") if running; then for s in $SVCS; do echo "id-$s"; done; fi ;;
+      "ps -aq --filter label=com.docker.compose.service=catalog-web") exists && echo id-catalog-web ;;
+      "ps -aq --filter label=com.docker.compose.project=inst --filter label=com.docker.compose.service=catalog-web") exists && echo id-catalog-web ;;
+      "ps -aq --filter label=com.docker.compose.project=inst") if exists; then for s in $SVCS; do echo "id-$s"; done; fi ;;
       *) bad "$@" ;;
     esac ;;
   container)
@@ -158,6 +180,7 @@ case "${1:-}" in
       up)
         [ "$*" = "-d --remove-orphans" ] || bad compose up "$@"
         touch "$ST/up"; rm -f "$ST/exited"; pwd -P > "$ST/wd"; cp "$envf" "$ST/upenv"
+        h="$(sed -n 's/^CATALOG_HOSTNAME=//p' "$envf")"; echo "${h:-9e1b07c3d5a2}" > "$ST/hostname"
         sed -n 's/^CATALOG_IMAGE=.*://p' "$envf" > "$ST/catalog_tag"
         m="$(sed -n 's/^MONGO_TAG=//p' "$envf")"; [[ "$m" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] && echo "$m" > "$ST/mongo_version" ;;
       logs) echo "catalog-web | fake log line" ;;
@@ -227,6 +250,7 @@ check "patch updates offered (MongoDB, OpenSearch, RabbitMQ)" 'grep -q "MongoDB 
 check "no major or cross-series offer (no 9.0.2 / 3.9.0 / 4.3.6)" '! grep -E -- "-> (9\.0\.2|3\.9\.0|4\.3\.6)" <<< "$out"'
 check "selected patches applied, OpenSearch left out" 'grep -q "^MONGO_TAG=\"8.0.32\"$" "$D/rn1-technology-catalog-installer.sh" && grep -q "^RABBITMQ_TAG=\"3.13.7-management-alpine\"$" "$D/rn1-technology-catalog-installer.sh" && grep -q "^OPENSEARCH_TAG=\"2.19.5\"$" "$D/rn1-technology-catalog-installer.sh"'
 check "MongoDB runs the new patch after up" '[ "$(cat "$ST/mongo_version")" = 8.0.32 ]'
+check "the license is still valid after the restarts: nothing said about it" '! grep -q "no valid license after the restart" <<< "$out" && ! grep -q "catalog-web gets the fixed host name" <<< "$out"'
 
 # 2. Already up to date -> only patch check (on Podman 4.9, the oldest one the installer accepts)
 out="$(printf '21\n0\n\n0\n' | SHIM_PODMAN_VERSION=4.9.3 bash "$D/rn1-technology-catalog-installer.sh" menu 2>&1)"
@@ -278,8 +302,33 @@ check "health progress: the waiting service first, the ready ones counted, half 
 check "cancel during the switch: 25.4 runs again" 'grep -q "^CATALOG_VERSION=\"25.4.4191.133\"$" "$D/rn1-technology-catalog-installer.sh" && grep -q "^CATALOG_IMAGE=raynetgmbh/rayventory-catalog:25.4.4191.133$" "$D/.env" && [ "$(cat "$ST/catalog_tag")" = 25.4.4191.133 ] && grep -q "going back to Catalog 25.4.4191.133" "$D/.jobs/1/log"'
 check "no rollback question after a cancel" '! grep -q "Go back to" "$T/cancel2.out" && [ ! -e "$D/.upgrade-failed" ]'
 
-# 9. The installer upgraded this folder to 26.3 (MongoDB 8.0.32, port 8181), then a new download of it
-#    brought back the default settings (Catalog 25.4)
+# 9. The files of an older installer (no fixed host name): a licensed catalog-web keeps the host name it has
+# (its container ID), so its license survives the upgrade and the patch updates; said before the upgrade
+# starts, without asking the Catalog. A license the new start does not accept (an older version, another host
+# name) is named after the upgrade and the patch updates.
+setup
+sed -i '/^CATALOG_HOSTNAME=/d' "$D/.env"
+out="$(printf '21\nn\n\n0\n' | bash "$D/rn1-technology-catalog-installer.sh" menu 2>&1)"
+check "upgrade of older files: a licensed Catalog keeps its host name - said before the question, the Catalog not asked" 'sed -n "/Upgrade plan/,/Upgrade the Catalog to/p" <<< "$out" | grep -q "catalog-web gets a fixed host name now (CATALOG_HOSTNAME): a licensed$" && grep -q "^  Catalog keeps the one it has, so its license stays valid.$" <<< "$out" && ! grep -q "needs a license" <<< "$out" && ! grep -q "compose.* down" "$LOG" && [ ! -f "$ST/asked" ]'
+setup
+sed -i '/^CATALOG_HOSTNAME=/d' "$D/.env"
+out="$(printf '21\ny\nn\n\n\n0\n' | SHIM_LICENSE_HOST=4f9c2d71e8a3 bash "$D/rn1-technology-catalog-installer.sh" menu 2>&1)"
+check "upgrade of older files, licensed catalog-web named like a container ID: the name kept (.env, compose file), said once in the job log" 'grep -q "Catalog upgraded: 25.4.4191.133 -> 26.3.4789.148." <<< "$out" && grep -q "^CATALOG_HOSTNAME=4f9c2d71e8a3$" "$D/.env" && grep -q "^    hostname: \${CATALOG_HOSTNAME}$" "$D/docker-compose.yml" && [ "$(cat "$ST/hostname")" = 4f9c2d71e8a3 ] && [ "$(grep -c "catalog-web keeps its host name 4f9c2d71e8a3: the Catalog.s license$" "$D/.jobs/1/log")" -eq 1 ] && grep -q "^  is bound to it (CATALOG_HOSTNAME in .env).$" "$D/.jobs/1/log" && ! grep -q "keeps its host name" "$D/.jobs/2/log"'
+check "the license survives the upgrade and the patch updates: the checks afterwards stay quiet" 'grep -q "^MONGO_TAG=\"8.0.32\"$" "$D/rn1-technology-catalog-installer.sh" && ! grep -q -e "no valid license after the restart" -e "needs a license" <<< "$out"'
+setup
+sed -i 's/^CATALOG_VERSION=.*/CATALOG_VERSION="26.3.4789.148"/' "$D/rn1-technology-catalog-installer.sh"
+(cd "$D" && bash rn1-technology-catalog-installer.sh generate </dev/null >/dev/null 2>&1)
+echo 26.3.4789.148 > "$ST/catalog_tag"; sed -i '/^CATALOG_HOSTNAME=/d' "$D/.env"
+out="$(printf '21\n\n\n0\n' | SHIM_LICENSE_HOST=4f9c2d71e8a3 bash "$D/rn1-technology-catalog-installer.sh" menu 2>&1)"
+check "patch updates of older files, licensed catalog-web: the name kept, the check afterwards quiet" 'grep -q "The Catalog is up to date." <<< "$out" && grep -q "^CATALOG_HOSTNAME=4f9c2d71e8a3$" "$D/.env" && grep -q "catalog-web keeps its host name 4f9c2d71e8a3" "$D/.jobs/1/log" && [ "$(cat "$ST/hostname")" = 4f9c2d71e8a3 ] && grep -q "^MONGO_TAG=\"8.0.32\"$" "$D/rn1-technology-catalog-installer.sh" && ! grep -q "no valid license after the restart" <<< "$out"'
+setup
+sed -i '/^CATALOG_HOSTNAME=/d' "$D/.env"
+out="$(printf '21\ny\nn\n\n\n0\n' | SHIM_LICENSE_VALID=false bash "$D/rn1-technology-catalog-installer.sh" menu 2>&1)"
+check "license not accepted after the upgrade and the patch updates: named in both jobs" 'grep -q "Catalog upgraded: 25.4.4191.133 -> 26.3.4789.148." <<< "$out" && [ "$(grep -c "The Catalog has no valid license after the restart - option 25 shows why." <<< "$out")" -eq 2 ] && grep -q "A license for an older Catalog version or another host name of catalog-web" <<< "$out" && grep -q "no valid license after the restart" "$D/.jobs/1/log"'
+check "older files without a valid license: the name of this server (nothing to lose)" 'h="$(sed -n "s/^CATALOG_HOSTNAME=//p" "$D/.env")"; [ -n "$h" ] && [ "$h" != 4f9c2d71e8a3 ] && [ "$h" = "$(cd "$D" && bash rn1-technology-catalog-installer.sh __server_hostname)" ] && grep -q "catalog-web now has the fixed host name $h (CATALOG_HOSTNAME)." "$D/.jobs/1/log" && ! grep -q "keeps its host name" "$D/.jobs/1/log"'
+
+# 10. The installer upgraded this folder to 26.3 (MongoDB 8.0.32, port 8181), then a new download of it
+#     brought back the default settings (Catalog 25.4)
 export SHIM_TZ="Etc/UTC"
 N="rn1-technology-catalog-installer.sh"
 installation26() {
@@ -295,7 +344,7 @@ FRESH="$T/fresh.sh"
 sed '0,/^TZ=/s#^TZ=.*#TZ="Etc/UTC"#; 0,/^AUTOSYNC_CRON=/s/^AUTOSYNC_CRON=.*/AUTOSYNC_CRON="30 5 * * *"/' "$NEW" > "$FRESH"
 nocompose() { ! grep -Eq "compose.* (up|down|pull)" "$LOG"; }
 
-# 9a. The screenshot: settings 25.4, .env and the running catalog-web 26.3
+# 10a. The screenshot: settings 25.4, .env and the running catalog-web 26.3
 installation26
 cp "$FRESH" "$D/$N"
 out="$(printf 'n\n\n21\n\n0\n' | bash "$D/$N" menu 2>&1)"
@@ -310,8 +359,8 @@ check "fresh download: the take-over writes the values of the installation, noth
 out="$(printf '0\n' | bash "$D/$N" menu 2>&1)"
 check "fresh download: afterwards no note, the files match the settings" '! grep -q "The settings say" <<< "$out" && ! grep -q "do not match the settings" <<< "$out" && grep -q "(Catalog 26.3.4789.148 - up to date)" <<< "$out"'
 
-# 9b. Option 2 of the old installer then wrote .env and the compose file from the default settings in the
-#     same second as their backups; catalog-web and the workers still run 26.3. The installer is updated.
+# 10b. Option 2 of the old installer then wrote .env and the compose file from the default settings in the
+#      same second as their backups; catalog-web and the workers still run 26.3. The installer is updated.
 server_state() {
   installation26
   rm -f "$ST/up"
@@ -346,7 +395,7 @@ check "server state: the files of the running Catalog are back, the passwords to
 out="$(printf '0\n' | bash "$D/$N" menu 2>&1)"
 check "server state: afterwards no note" '! grep -q "The settings say\|The files say" <<< "$out" && ! grep -q "do not match the settings" <<< "$out"'
 
-# 9c. MongoDB below the running one
+# 10c. MongoDB below the running one
 sed -i '0,/^MONGO_TAG=/s/^MONGO_TAG=.*/MONGO_TAG="7.0"/' "$D/$N"
 env_before="$(cksum < "$D/.env")"
 out="$(bash "$D/$N" generate </dev/null 2>&1)"; rc=$?
@@ -364,15 +413,15 @@ out="$(printf 'n\n\n0\n' | bash "$D/$N" menu 2>&1)"
 check "OpenSearch 2.17.0 against 2.19.5: named in the menu" 'grep -q "The settings say OpenSearch 2.17.0, 2.19.5 is installed - option 23" <<< "$out" && grep -q "OPENSEARCH_TAG *2.17.0 -> 2.19.5" <<< "$out"'
 sed -i '0,/^OPENSEARCH_TAG=/s/^OPENSEARCH_TAG=.*/OPENSEARCH_TAG="2.19.5"/' "$D/$N"
 
-# 9d. A new catalog.sh next to the installer of the installation: it names it at its start and takes the
-#     settings of that installer over
+# 10d. A new catalog.sh next to the installer of the installation: it names it at its start and takes the
+#      settings of that installer over
 cp "$FRESH" "$D/catalog.sh"
 out="$(printf 'y\nn\n0\n' | bash "$D/catalog.sh" menu 2>&1)"
 check "catalog.sh next to it: named at the start, the settings of the installer taken over" 'grep -q "The settings say Catalog 25.4.4191.133, 26.3.4789.148 is installed\." <<< "$out" && grep -q "$N in this folder has other settings than catalog.sh" <<< "$out" && grep -qxF "CATALOG_VERSION=\"26.3.4789.148\"" "$D/catalog.sh" && [ -f "$D/$N" ] && nocompose'
 rm -f "$D/catalog.sh" "$D/catalog.sh".bak-*
 
-# 9e. In the server state the containers are what shows 26.3: stopping them is refused, and a stopped
-#     catalog-web still counts
+# 10e. In the server state the containers are what shows 26.3: stopping them is refused, and a stopped
+#      catalog-web still counts
 server_state
 out="$(bash "$D/$N" down </dev/null 2>&1)"; rc=$?
 check "server state: 'down' refuses to remove the containers that show 26.3" '[ "$rc" -ne 0 ] && grep -q "Catalog 25.4.4191.133 would replace the installed 26.3.4789.148" <<< "$out" && grep -q "nothing was stopped" <<< "$out" && nocompose && [ -f "$ST/up" ]'
@@ -385,7 +434,7 @@ out="$(printf 'n\n\n0\n' | bash "$D/$N" menu 2>&1)"
 check "a stopped catalog-web 26.3: named at the start, the values of that second offered" 'grep -q "The settings say Catalog 25.4.4191.133, 26.3.4789.148 is installed\." <<< "$out" && grep -q "other values come from .env.bak-20261011-123742" <<< "$out" && grep -q "(Catalog 26.3.4789.148" <<< "$out"'
 rm -f "$ST/exited"; touch "$ST/up"
 
-# 9f. On the command line: 'adopt .' takes the values over; 'up' then points to generate, not back to adopt
+# 10f. On the command line: 'adopt .' takes the values over; 'up' then points to generate, not back to adopt
 out="$(bash "$D/$N" adopt . </dev/null 2>&1)"; rc=$?
 check "CLI 'adopt .': the values taken over, the files left, generate named" '[ "$rc" -eq 0 ] && grep -qxF "CATALOG_VERSION=\"26.3.4789.148\"" "$D/$N" && grep -qxF "CATALOG_WEB_PORT=\"8181\"" "$D/$N" && [ "$(cksum < "$D/.env")" = "$envA" ] && grep -q "generate. writes them from the settings" <<< "$out" && nocompose'
 out="$(bash "$D/$N" up </dev/null 2>&1)"; rc=$?
@@ -395,14 +444,14 @@ check "CLI generate writes 26.3 with the values and passwords of the installatio
 out="$(bash "$D/$N" up </dev/null 2>&1)"; rc=$?
 check "CLI 'up' then starts 26.3" '[ "$rc" -eq 0 ] && [ "$(cat "$ST/catalog_tag")" = 26.3.4789.148 ]'
 
-# 9g. No .env and no backup of it names the installed Catalog: only the versions are known
+# 10g. No .env and no backup of it names the installed Catalog: only the versions are known
 server_state; rm -f "$D"/.env.bak-*
 out="$(printf 'n\n\n0\n' | bash "$D/$N" menu 2>&1)"
 check "no backup names the installed Catalog: the versions offered, no broken sentence" 'grep -q "CATALOG_VERSION *25.4.4191.133 -> 26.3.4789.148" <<< "$out" && grep -q "No .env and no backup of it names the installed Catalog 26.3.4789.148" <<< "$out" && ! grep -q "other values come from" <<< "$out"'
 
-# 9h. A new download whose default is the installed Catalog: the versions fit, other values differ. The
-#     menu names them instead of "option 2 regenerates them", no time zone note (the Catalog runs in the
-#     server's), nothing offered at the start; option 23 takes them over
+# 10h. A new download whose default is the installed Catalog: the versions fit, other values differ. The
+#      menu names them instead of "option 2 regenerates them", no time zone note (the Catalog runs in the
+#      server's), nothing offered at the start; option 23 takes them over
 installation26
 sed 's/^CATALOG_VERSION=.*/CATALOG_VERSION="26.3.4789.148"/' "$NEW" > "$D/$N"
 out="$(printf '0\n' | bash "$D/$N" menu 2>&1)"
@@ -414,12 +463,98 @@ check "same version: option 23 lists and takes the values of this folder over, t
 out="$(printf '0\n' | bash "$D/$N" menu 2>&1)"
 check "same version: afterwards no note" '! grep -q "differ from the installation" <<< "$out" && ! grep -q "regenerates them" <<< "$out"'
 
-# 9i. After a reset (option 99) nothing is installed: .env no longer holds back an older Catalog
+# 10i. After a reset (option 99) nothing is installed: .env no longer holds back an older Catalog
 installation26
 out="$(printf '99\nDELETE\n\n0\n' | bash "$D/$N" menu 2>&1)"
 check "reset: containers and data volumes gone, .env still names 26.3" '[ ! -f "$ST/up" ] && [ ! -f "$ST/wd" ] && grep -qx "CATALOG_IMAGE=raynetgmbh/rayventory-catalog:26.3.4789.148" "$D/.env"'
 out="$(bash "$D/$N" set-version 25.4.4191.133 </dev/null 2>&1)"; rc=$?
 check "after a reset an older Catalog is selected and written" '[ "$rc" -eq 0 ] && grep -qxF "CATALOG_VERSION=\"25.4.4191.133\"" "$D/$N" && bash "$D/$N" generate </dev/null >/dev/null 2>&1 && grep -qx "CATALOG_IMAGE=raynetgmbh/rayventory-catalog:25.4.4191.133" "$D/.env"'
+
+# 10j. The values .env derives: CATALOG_HOSTNAME empty (automatic) with the kept container-ID name of a
+#      licensed Catalog in .env, MONGO_CACHE_GB empty with a cache in .env the memory no longer gives - no
+#      difference, nothing to take over; the start writes the cache without a note of other settings
+installation26
+sed -i 's/^CATALOG_HOSTNAME=.*/CATALOG_HOSTNAME=4f9c2d71e8a3/; s/^MONGO_WT_CACHE_GB=.*/MONGO_WT_CACHE_GB=3/' "$D/.env"
+cp "$D/.env" "$ST/upenv"; echo 4f9c2d71e8a3 > "$ST/hostname"
+out="$(printf '0\n' | bash "$D/$N" menu 2>&1)"
+check "derived values: the menu names no difference, offers nothing" '! grep -q -e "differ from the installation" -e "do not match the settings" -e "The settings say" -e "Taking them over writes" <<< "$out"'
+out="$(bash "$D/$N" status </dev/null 2>&1)"
+check "derived values: status names no difference" '! grep -q -e "differ from the installation" -e "CATALOG_HOSTNAME" -e "MONGO_" <<< "$out"'
+out="$(printf '23\n\n0\n' | bash "$D/$N" menu 2>&1)"
+check "derived values: option 23 has nothing to take over, the settings stay automatic" '! grep -q -e "has other values than the settings" -e "Took over" <<< "$out" && grep -qx "CATALOG_HOSTNAME=\"\"" "$D/$N" && grep -qx "MONGO_CACHE_GB=\"\"" "$D/$N" && ! ls "$D/$N".bak-* >/dev/null 2>&1'
+out="$(SHIM_LICENSE_HOST=4f9c2d71e8a3 bash "$D/$N" up </dev/null 2>&1)"; rc=$?
+check "derived values: up writes the cache for the memory, no false difference, the host name kept" '[ "$rc" -eq 0 ] && grep -q "MongoDB gets a cache of 11 GB (was 3 GB)" <<< "$out" && ! grep -q -e "do not match the settings" -e "differ from the installation" -e "would replace" <<< "$out" && grep -qx "MONGO_WT_CACHE_GB=11" "$D/.env" && grep -qx "CATALOG_HOSTNAME=4f9c2d71e8a3" "$D/.env" && [ "$(cat "$ST/hostname")" = 4f9c2d71e8a3 ]'
+out="$(printf '0\n' | bash "$D/$N" menu 2>&1)"
+check "derived values: after the refresh still no note" '! grep -q -e "differ from the installation" -e "do not match the settings" <<< "$out"'
+# a fixed CATALOG_HOSTNAME of the settings that differs from .env is a difference
+sed -i 's/^CATALOG_HOSTNAME=""$/CATALOG_HOSTNAME="catalog-other"/' "$D/$N"
+out="$(bash "$D/$N" status </dev/null 2>&1)"
+check "a fixed CATALOG_HOSTNAME other than .env: named" 'grep -q "The settings differ from the installation in CATALOG_HOSTNAME" <<< "$out"'
+sed -i 's/^CATALOG_HOSTNAME="catalog-other"$/CATALOG_HOSTNAME=""/' "$D/$N"
+
+# 10k. A refused start asks nothing before: 'setup' and option 7 in the server state on an engine with 8 GB
+#      stop at the version, before the memory question
+server_state
+out="$(SHIM_MEMTOTAL=8589934592 bash "$D/$N" setup </dev/null 2>&1)"; rc=$?
+check "server state, 8 GB: 'setup' refused before the memory question, nothing written" '[ "$rc" -ne 0 ] && grep -q "Catalog 25.4.4191.133 would replace the installed 26.3.4789.148" <<< "$out" && ! grep -q "GB of memory; at least" <<< "$out" && [ "$(cksum < "$D/.env")" = "$envA" ] && nocompose'
+out="$(printf 'n\n\n7\nn\n\n0\n' | SHIM_MEMTOTAL=8589934592 bash "$D/$N" menu 2>&1)"
+check "server state, 8 GB: option 7 refused before the memory question" 'grep -q "nothing was written" <<< "$out" && ! grep -q "GB of memory; at least" <<< "$out" && ! grep -q "Continue with .* GB anyway" <<< "$out" && [ "$(cksum < "$D/.env")" = "$envA" ] && nocompose'
+
+# 10l. A new download after a licensed Catalog kept its container-ID name (CATALOG_HOSTNAME in the backup
+#      of that second, the server's name in the new .env): the take-over keeps the licensed name, with the
+#      backups put back and without them
+lic_state() {
+  server_state
+  sed -i 's/^CATALOG_HOSTNAME=.*/CATALOG_HOSTNAME=4f9c2d71e8a3/' "$D/.env.bak-20261011-123742"
+  cp "$D/.env.bak-20261011-123742" "$ST/upenv"; echo 4f9c2d71e8a3 > "$ST/hostname"
+}
+lic_state
+out="$(printf 'y\ny\n\n0\n' | SHIM_LICENSE_HOST=4f9c2d71e8a3 bash "$D/$N" menu 2>&1)"
+check "licensed name in the backup: the take-over puts it back" 'grep -qxF "CATALOG_VERSION=\"26.3.4789.148\"" "$D/$N" && grep -qx "CATALOG_HOSTNAME=4f9c2d71e8a3" "$D/.env"'
+out="$(SHIM_LICENSE_HOST=4f9c2d71e8a3 bash "$D/$N" generate </dev/null 2>&1)"; rc=$?
+check "licensed name in the backup: generate and up keep it, the license stays valid, no note" '[ "$rc" -eq 0 ] && grep -qx "CATALOG_HOSTNAME=4f9c2d71e8a3" "$D/.env" && ! grep -q "needs a license" <<< "$out" && SHIM_LICENSE_HOST=4f9c2d71e8a3 bash "$D/$N" up </dev/null >/dev/null 2>&1 && [ "$(cat "$ST/hostname")" = 4f9c2d71e8a3 ] && ! printf "0\n" | bash "$D/$N" menu 2>&1 | grep -q -e "differ from the installation" -e "do not match the settings"'
+lic_state
+out="$(printf 'y\nn\n\n0\n' | SHIM_LICENSE_HOST=4f9c2d71e8a3 bash "$D/$N" menu 2>&1)"
+check "licensed name in the backup, the backups not put back: the name taken over" 'grep -q "CATALOG_HOSTNAME *(empty) -> 4f9c2d71e8a3" <<< "$out" && grep -qxF "CATALOG_HOSTNAME=\"4f9c2d71e8a3\"" "$D/$N"'
+out="$(SHIM_LICENSE_HOST=4f9c2d71e8a3 bash "$D/$N" generate </dev/null 2>&1)"; rc=$?
+check "licensed name, the backups not put back: generate writes it, not the name of the server" '[ "$rc" -eq 0 ] && grep -qx "CATALOG_HOSTNAME=4f9c2d71e8a3" "$D/.env" && grep -qx "CATALOG_IMAGE=raynetgmbh/rayventory-catalog:26.3.4789.148" "$D/.env"'
+
+# 10m. The backups of that second come from an older installer: no CATALOG_HOSTNAME, no MONGO_WT_CACHE_GB, and
+#      catalog-web runs with its container ID, to which the license is bound. The take-over fixes that name (the
+#      new .env has the server's), no cache; put back, the next generate keeps the name and computes the cache
+#      again - with the setting automatic too
+old_state() {
+  server_state
+  sed -i '/^CATALOG_HOSTNAME=/d; /^MONGO_WT_CACHE_GB=/d' "$D/.env.bak-20261011-123742"
+  sed -i '/hostname: \${CATALOG_HOSTNAME}/d; /wiredTigerCacheSizeGB/d' "$D/docker-compose.yml.bak-20261011-123742"
+  cp "$D/.env.bak-20261011-123742" "$ST/upenv"; rm -f "$ST/hostname"
+}
+old_state
+out="$(printf 'y\ny\n\n0\n' | SHIM_LICENSE_HOST=4f9c2d71e8a3 bash "$D/$N" menu 2>&1)"
+check "older backups put back: the licensed container-ID name in the table, no cache, the files of that installer back" 'grep -q "CATALOG_HOSTNAME *(empty) -> 4f9c2d71e8a3" <<< "$out" && ! grep -q -e "MONGO_CACHE_GB " -e "MONGO_WT_CACHE_GB" <<< "$(sed -n "/has other values than the settings/,/Taking them over/p" <<< "$out")" && grep -q "Took over" <<< "$out" && grep -qxF "CATALOG_HOSTNAME=\"4f9c2d71e8a3\"" "$D/$N" && ! grep -q "^CATALOG_HOSTNAME=" "$D/.env" && ! grep -q "hostname: \${CATALOG_HOSTNAME}" "$D/docker-compose.yml"'
+cp -p "$D/.env" "$T/old.env"; cp -p "$D/docker-compose.yml" "$T/old.yml"
+out="$(SHIM_LICENSE_HOST=4f9c2d71e8a3 bash "$D/$N" generate </dev/null 2>&1)"; rc=$?
+check "older backups put back: generate writes the licensed container-ID name, the cache computed again" '[ "$rc" -eq 0 ] && grep -qx "CATALOG_HOSTNAME=4f9c2d71e8a3" "$D/.env" && ! grep -q "needs a license" <<< "$out" && grep -qx "MONGO_WT_CACHE_GB=11" "$D/.env" && grep -q "^    hostname: \${CATALOG_HOSTNAME}$" "$D/docker-compose.yml" && [ "$(grep "^MONGO_INITDB_ROOT_PASSWORD=" "$D/.env")" = "$(grep "^MONGO_INITDB_ROOT_PASSWORD=" "$D/.env.bak-20261011-123742")" ]'
+out="$(SHIM_LICENSE_HOST=4f9c2d71e8a3 bash "$D/$N" up </dev/null 2>&1)"; rc=$?
+check "older backups put back: the start keeps the license" '[ "$rc" -eq 0 ] && [ "$(cat "$ST/hostname")" = 4f9c2d71e8a3 ] && ! grep -q -e "no valid license" -e "would replace" <<< "$out"'
+cp -p "$T/old.env" "$D/.env"; cp -p "$T/old.yml" "$D/docker-compose.yml"
+sed -i 's/^CATALOG_HOSTNAME="4f9c2d71e8a3"$/CATALOG_HOSTNAME=""/' "$D/$N"
+out="$(SHIM_LICENSE_HOST=4f9c2d71e8a3 bash "$D/$N" generate </dev/null 2>&1)"; rc=$?
+check "older files, the setting automatic: generate keeps the licensed container-ID name" '[ "$rc" -eq 0 ] && grep -q "catalog-web keeps its host name 4f9c2d71e8a3: the Catalog.s license" <<< "$out" && grep -qx "CATALOG_HOSTNAME=4f9c2d71e8a3" "$D/.env" && grep -qx "MONGO_WT_CACHE_GB=11" "$D/.env"'
+
+# 10n. The same older backups, not put back: the take-over still fixes the licensed name, so 'generate' (which
+#      the files-stay path suggests) keeps it instead of the server's name of the new .env
+old_state
+out="$(printf 'y\nn\n\n0\n' | SHIM_LICENSE_HOST=4f9c2d71e8a3 bash "$D/$N" menu 2>&1)"
+check "older backups not put back: the licensed container-ID name taken over" 'grep -q "CATALOG_HOSTNAME *(empty) -> 4f9c2d71e8a3" <<< "$out" && grep -qxF "CATALOG_HOSTNAME=\"4f9c2d71e8a3\"" "$D/$N" && [ "$(cksum < "$D/.env")" = "$envA" ]'
+out="$(SHIM_LICENSE_HOST=4f9c2d71e8a3 bash "$D/$N" generate </dev/null 2>&1)"; rc=$?
+check "older backups not put back: generate keeps the licensed name, not the server's" '[ "$rc" -eq 0 ] && grep -qx "CATALOG_HOSTNAME=4f9c2d71e8a3" "$D/.env" && grep -qx "CATALOG_IMAGE=raynetgmbh/rayventory-catalog:26.3.4789.148" "$D/.env" && ! grep -q "needs a license" <<< "$out"'
+out="$(SHIM_LICENSE_HOST=4f9c2d71e8a3 bash "$D/$N" up </dev/null 2>&1)"; rc=$?
+check "older backups not put back: the start keeps the license" '[ "$rc" -eq 0 ] && [ "$(cat "$ST/hostname")" = 4f9c2d71e8a3 ] && ! grep -q -e "no valid license" -e "would replace" <<< "$out"'
+# without a valid license there is nothing to keep: the name is not offered
+old_state
+out="$(printf 'y\nn\n\n0\n' | SHIM_LICENSE_VALID=false bash "$D/$N" menu 2>&1)"
+check "older backups, no valid license: the host name not offered" 'grep -q "Took over" <<< "$out" && ! grep -q "CATALOG_HOSTNAME " <<< "$out" && grep -qxF "CATALOG_HOSTNAME=\"\"" "$D/$N"'
 
 check "no Podman, Compose or systemctl call the fakes do not know" '[ ! -s "$UNH" ] || { cat "$UNH"; false; }'
 

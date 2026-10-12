@@ -11,6 +11,8 @@ rm -rf "$T"; mkdir -p "$T/bin"
 sed 's/^CONTAINER_ENGINE=""$/CONTAINER_ENGINE="podman"/' "$1" > "${T%/*}/podman-installer.sh"; NEW="${T%/*}/podman-installer.sh"
 PASS=0; FAIL=0
 check() { if eval "$2"; then PASS=$((PASS+1)); echo "PASS: $1"; else FAIL=$((FAIL+1)); echo "FAIL: $1"; fi; }
+# the internet check (menu start, new installation, option 16, engine setup) has its own suite (run_network_tests)
+export RN1_NET_CHECK=off
 
 cat > "$T/bin/timedatectl" <<'EOF'
 #!/usr/bin/env bash
@@ -28,6 +30,7 @@ case "$a" in
   --version) echo "podman version 5.7.0" ;;
   info) ;;
   "info --format {{.Host.Security.Rootless}}") echo false ;;
+  "info --format {{.Host.MemTotal}}") echo "${SHIM_MEMTOTAL:-34359738368}" ;;
   "volume ls -q --filter label=com.docker.compose.project="*|"ps -aq --filter label="*) ;;
   "compose --env-file .env -f docker-compose.yml "*)
     [ "${PODMAN_COMPOSE_PROVIDER:-}" = "$RN1_COMPOSE_PROVIDER" ] || { printf 'UNHANDLED podman %s (PODMAN_COMPOSE_PROVIDER=%s)\n' "$a" "${PODMAN_COMPOSE_PROVIDER:-unset}" >> "$UNH"; exit 125; }

@@ -5,6 +5,8 @@ T="$(mktemp -d)/v"
 rm -rf "$T"; mkdir -p "$T/bin" "$T/state"
 PASS=0; FAIL=0
 check() { if eval "$2"; then PASS=$((PASS+1)); echo "PASS: $1"; else FAIL=$((FAIL+1)); echo "FAIL: $1"; fi; }
+# the internet check (menu start, new installation, option 16, engine setup) has its own suite (run_network_tests)
+export RN1_NET_CHECK=off
 export LOG="$T/calls.log" ST="$T/state" UNH="$T/unhandled.log"
 : > "$LOG"; : > "$UNH"
 
@@ -65,6 +67,8 @@ if [ -n "${SHIM_REG_DOWN:-}" ] && [ "${url#https://}" != "$url" ]; then
 fi
 case "$url" in
   http://localhost:*/) ;;
+  # the license check after a restart: still valid
+  http://localhost:*/v1/license/isValid) body=true ;;
   https://hub.docker.com/v2/repositories/raynetgmbh/rayventory-catalog*/tags*)
     body='{"count":6,"next":null,"results":[{"name":"latest","digest":"sha256:aaaa"},{"name":"stable","digest":"sha256:'"${SHIM_STABLE:-aaaa}"'"},{"name":"26.3.4789.148","digest":"sha256:aaaa"},{"name":"26.1.4475.137","digest":"sha256:bbbb"},{"name":"25.4.4191.133","digest":"sha256:cccc"},{"name":"25","digest":"sha256:cccc"}]}' ;;
   https://*/v2/) [ -n "$hdr" ] && printf 'HTTP/1.1 200 OK\r\n\r\n' > "$( [ "$hdr" = - ] && echo /dev/stdout || echo "$hdr")" ;;
@@ -100,6 +104,7 @@ inspect_one() {
   local id="$2" svc="${2#id-}"
   { running && [ "$svc" != "$id" ] && [[ " $SVCS " == *" $svc "* ]]; } || nosuch "$id"
   case "$1" in
+    '{{.State.OOMKilled}}|{{index .Config.Labels "com.docker.compose.service"}}|{{.RestartCount}}') echo "false|$svc|0" ;;
     '{{.Config.Image}}')
       [ "$svc" = catalog-web ] || bad container inspect --format "$1" "$id"
       echo "docker.io/raynetgmbh/rayventory-catalog:$(cat "$ST/catalog_tag")" ;;
@@ -118,8 +123,11 @@ case "${1:-}" in
   --version) [ $# -eq 1 ] || bad "$@"; echo "podman version 5.7.0" ;;
   info)
     if [ $# -eq 1 ]; then exit 0; fi
-    [ "$*" = "info --format {{.Host.Security.Rootless}}" ] || bad "$@"
-    echo false ;;
+    case "$*" in
+      "info --format {{.Host.Security.Rootless}}") echo false ;;
+      "info --format {{.Host.MemTotal}}") echo "${SHIM_MEMTOTAL:-34359738368}" ;;
+      *) bad "$@" ;;
+    esac ;;
   volume)
     [ "$*" = "volume ls -q --filter label=com.docker.compose.project=inst" ] || bad "$@"
     if [ -f "$ST/wd" ]; then

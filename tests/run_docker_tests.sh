@@ -5,6 +5,8 @@ T="$(mktemp -d)/dk"
 rm -rf "$T"; mkdir -p "$T/bin" "$T/pbin" "$T/impbin" "$T/state" "$T/inst"
 PASS=0; FAIL=0
 check() { if eval "$2"; then PASS=$((PASS+1)); echo "PASS: $1"; else FAIL=$((FAIL+1)); echo "FAIL: $1"; fi; }
+# the internet check (menu start, new installation, option 16, engine setup) has its own suite (run_network_tests)
+export RN1_NET_CHECK=off
 # openSUSE and SLES: Docker comes from the distribution, the newest Compose from GitHub (more sudo steps)
 docker_distro_host() { grep -qiE '^ID(_LIKE)?=.*(suse|sles)' /etc/os-release 2>/dev/null; }
 # LOG: the calls of one case. BAD: calls the fakes do not know, for the whole suite.
@@ -82,6 +84,7 @@ case "${1:-}" in
       "info --format {{range .SecurityOptions}}{{.}} {{end}}")
         printf 'name=apparmor name=seccomp,profile=builtin name=cgroupns %s\n' "$(if [ -n "${SHIM_DOCKER_ROOTLESS:-}" ]; then echo name=rootless; fi)" ;;
       "info --format {{.KernelVersion}}") echo "${SHIM_KERNEL:-6.8.0-generic}" ;;
+      "info --format {{.MemTotal}}") echo "${SHIM_MEMTOTAL:-34359738368}" ;;
       *) bad ;;
     esac ;;
   ps)
@@ -118,10 +121,17 @@ case "${1:-}" in
       rp '{{.State.Status}}' running
       rp '{{with .State.Health}}{{or .Status "none"}}{{else}}none{{end}}' none
       rp '{{.RestartCount}}' 0
+      rp '{{.State.OOMKilled}}' false
       case "$out" in *'{{'*) bad ;; esac
       printf '%s\n' "$out"
     done
     exit "$rc" ;;
+  events)
+    # the oom events of the stack (Docker clears OOMKilled when the container starts again): none here
+    case "$ARGS" in
+      "events --since "*" --until "*" --filter type=container --filter event=oom --filter label=com.docker.compose.project=$(proj) --format {{index .Actor.Attributes \"com.docker.compose.service\"}}") ;;
+      *) bad ;;
+    esac ;;
   exec)
     shift
     is_ct "${1:-}" || { echo "Error response from daemon: No such container: ${1:-}" >&2; exit 1; }
@@ -281,6 +291,7 @@ case "$a" in
   --version) echo "podman version ${SHIM_PODMAN_VERSION:-5.7.0}" ;;
   info) echo "host: (fake)" ;;
   "info --format {{.Host.Security.Rootless}}") echo false ;;
+  "info --format {{.Host.MemTotal}}") echo "${SHIM_MEMTOTAL:-34359738368}" ;;
   "ps -aq --filter label=com.docker.compose.project="*)
     if [ "${a##*=}" = "${SHIM_PODMAN_DATA:-}" ]; then echo 7f7f7f7f7f7f; fi ;;
   "volume ls -q --filter label=com.docker.compose.project="*)
@@ -298,6 +309,7 @@ case "$*" in
   "is-enabled docker.service") if [ -n "${SHIM_DOCKER_DISABLED:-}" ]; then echo disabled; exit 1; fi; echo enabled ;;
   "enable --now docker") ;;
   "is-active --quiet podman.socket") ;;
+  "is-active --quiet docker") [ -n "${SHIM_DOCKER_ACTIVE:-}" ] ;;
   "is-enabled podman-restart.service") echo enabled ;;
   *) echo "UNHANDLED systemctl $*" | tee -a "$LOG" >> "$BAD"; exit 1 ;;
 esac
@@ -393,8 +405,13 @@ MUTATING='compose.* (down|up)|^docker (rm|volume rm|network rm|image rm) '
 fresh docker
 (cd "$D" && bash "$I" generate </dev/null >/dev/null 2>&1)
 P="$T/pod"; rm -rf "$P"; mkdir -p "$P"; sed 's/^CONTAINER_ENGINE=.*/CONTAINER_ENGINE="podman"/' "$NEW" > "$P/gen.sh"
-(cd "$P" && bash gen.sh generate </dev/null >/dev/null 2>&1)
+# the fake Podman (same SHIM_MEMTOTAL as the fake Docker): without it the cache of MongoDB would come from the
+# MemTotal of this machine, not from the memory of the engine
+(cd "$P" && PATH="$PPATH" bash gen.sh generate </dev/null >/dev/null 2>&1)
 check "the same .env and docker-compose.yml as with Podman" '[ -s "$D/.env" ] && diff <(mask "$D/.env") <(mask "$P/.env") >/dev/null && cmp -s "$D/docker-compose.yml" "$P/docker-compose.yml"'
+if ! { diff <(mask "$D/.env") <(mask "$P/.env") && diff "$D/docker-compose.yml" "$P/docker-compose.yml"; } > "$T/gen.diff" 2>&1; then
+  sed 's/^/  docker|podman: /' "$T/gen.diff"
+fi
 check "generate does not touch a container" '! grep -Eq "$MUTATING" "$LOG"'
 
 # 2. Compose commands: docker compose with the pinned files; DOCKER_HOST is kept, nothing of Podman is set
@@ -573,7 +590,7 @@ check "settings screen: CONTAINER_ENGINE in the general group" '[ "$out" = "-|CO
 
 # 11. engine_choices and engine_choose
 fresh ""
-out="$(cd "$D" && PATH="$PPATH" RN1_COMPOSE_PROVIDER="$T/pbin/docker-compose" bash "$I" __engine_choices 2>&1)"
+out="$(cd "$D" && PATH="$PPATH" RN1_COMPOSE_PROVIDER="$T/pbin/docker-compose" bash "$I" __engine_choices 2>&1 | grep -v '^bash: warning: setlocale: ')"
 check "choices on Linux: podman and docker, both ready, no colima" '[ "$(wc -l <<< "$out")" -eq 2 ] && grep -qx "podman|Podman|ready|" <<< "$out" && grep -qx "docker|Docker Engine|ready|" <<< "$out"'
 out="$(cd "$D" && PATH="$PPATH" SHIM_PODMAN_VERSION=4.3.1 bash "$I" __engine_choices 2>&1)"
 check "choices: a Podman that is too old has its reason" 'grep -qx "podman|Podman|installed|Podman 4.3.1 is too old: 4.9.0 or newer is needed." <<< "$out"'
@@ -598,6 +615,19 @@ check "install-docker: CONTAINER_ENGINE set to docker" 'grep -q "^CONTAINER_ENGI
 fresh podman
 out="$(cd "$D" && bash "$I" install-docker </dev/null 2>&1)"; rc=$?
 check "install-docker in a Podman folder: refused, nothing run" '[ "$rc" -ne 0 ] && grep -q "This folder uses CONTAINER_ENGINE=\"podman\"" <<< "$out" && [ ! -s "$SUDO_LOG" ]'
+
+# 13. install-docker with an internet proxy: the env file of the proxy and the drop-in of docker.service are
+# written as root before the daemon step, the units reloaded first; a running Docker is restarted only after a
+# question
+# (not on openSUSE and SLES: there the Compose download runs as root through the proxy, which this sudo skips)
+if ! docker_distro_host; then
+  fresh ""
+  sed -i 's|^INTERNET_PROXY=.*|INTERNET_PROXY="http://proxy.example.com:8080"|' "$I"
+  out="$(cd "$D" && PATH="$T/impbin:$PATH" SHIM_UID=1000 SHIM_DOCKER_ACTIVE=1 RN1_ETC_DIR="$T/etc13" RN1_RUN_DIR="$T/run13" bash "$I" install-docker </dev/null 2>&1)"; rc=$?
+  line_of() { grep -n -- "$1" "$SUDO_LOG" | head -n 1 | cut -d: -f1; }
+  check "install-docker with a proxy: the env file (600) and the drop-in (644) as root before the daemon steps, the units reloaded first" '[ "$rc" -eq 0 ] && w1="$(line_of "sh $T/etc13/rn1-technology-catalog/engine-proxy.env 600$")" && w2="$(line_of "sh $T/etc13/systemd/system/docker.service.d/50-rn1-proxy.conf 644$")" && r="$(line_of "systemctl daemon-reload$")" && e="$(line_of "systemctl enable --now docker$")" && [ -n "$w1" ] && [ -n "$w2" ] && [ -n "$r" ] && [ -n "$e" ] && [ "$w1" -lt "$r" ] && [ "$w2" -lt "$r" ] && [ "$r" -lt "$e" ] && grep -q "Docker gets the internet proxy before these steps" <<< "$out"'
+  check "install-docker with a proxy: Docker ran already - not restarted without a question, said how" 'grep -q "Docker reads the change at its next restart (systemctl restart docker)." <<< "$out" && ! grep -q "restart docker$" "$SUDO_LOG"'
+fi
 
 check "fakes: no unknown docker, podman or systemctl call in the whole suite" '[ ! -s "$BAD" ] || { sort "$BAD" | uniq -c | head -20; false; }'
 

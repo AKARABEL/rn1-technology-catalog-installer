@@ -7,6 +7,8 @@ rm -rf "$T"; mkdir -p "$T/bin" "$T/dbin" "$T/state" "$T/npm" "$T/dns"
 sed 's/^CONTAINER_ENGINE=""$/CONTAINER_ENGINE="podman"/' "$1" > "${T%/*}/podman-installer.sh"; NEW="${T%/*}/podman-installer.sh"
 PASS=0; FAIL=0
 check() { if eval "$2"; then PASS=$((PASS+1)); echo "PASS: $1"; else FAIL=$((FAIL+1)); echo "FAIL: $1"; fi; }
+# the internet check (menu start, new installation, option 16, engine setup) has its own suite (run_network_tests)
+export RN1_NET_CHECK=off
 # LOG: the calls of one case (emptied by fresh/installed). BAD: calls the fakes do not know, for the whole suite.
 # NS: the state of the fake Nginx Proxy Manager (see curl). DNS: $DNS/NAME holds the addresses of NAME.
 # LOCAL_IPS: the addresses of this server. LISTEN_PORTS: the ports other programs listen on.
@@ -20,7 +22,10 @@ if command -v jq >/dev/null 2>&1 || command -v python3 >/dev/null 2>&1; then NPM
 # - Docker Hub (the Catalog: newest 26.3; SHIM_STABLE=bbbb: "stable" is 26.1) and the registries with the
 #   tags of 2026-10-11; a moving tag has the digest of the version it points to (8.0 -> 8.0.32 ...)
 # - GitHub: the newest Docker Compose, this installer (served from $ST/new-installer.sh when it exists)
-# - Catalog Web on localhost
+# - Catalog Web on localhost: the license (valid when $ST/license exists), the login of root (password
+#   rootpw) and the activation by license file (the file it got: $ST/got-license; a file with "wrong" in it
+#   is for another server) or by the text of an e-mail ($ST/got-text; without its last line LICENSE ENDS
+#   HERE it is refused); its calls in $ST/local.log
 # - the API of Nginx Proxy Manager on 127.0.0.1:81 and the checks through it (--resolve). Its state in $NS:
 #   version, user (EMAIL|PASSWORD; missing: not set up yet), token, hosts/ID (DOMAIN|CERT|HOST|PORT|SSL_FORCED),
 #   certs/ID (DOMAIN|EXPIRES), seq (last id), calls (METHOD PATH CODE). SHIM_NPM_HOST_FAIL: it refuses to
@@ -28,13 +33,14 @@ if command -v jq >/dev/null 2>&1 || command -v python3 >/dev/null 2>&1; then NPM
 # Any other URL is written to $BAD.
 cat > "$T/bin/curl" <<'EOF'
 #!/usr/bin/env bash
-method=GET; out=""; hdr=""; fmt=""; head="no"; url=""; cfg=""; data=""; resolve=""
+method=GET; out=""; hdr=""; fmt=""; head="no"; url=""; cfg=""; data=""; resolve=""; form=""
 while [ $# -gt 0 ]; do
   case "$1" in
     -o) out="$2"; shift 2 ;;
     -D) hdr="$2"; shift 2 ;;
     -w) fmt="$2"; shift 2 ;;
     -X) method="$2"; shift 2 ;;
+    -F) form="$2"; shift 2 ;;
     -K) if [ "$2" = "-" ]; then cfg="$(cat)"; fi; shift 2 ;;
     --data-binary) data="${2#@}"; shift 2 ;;
     --resolve) resolve="$2"; shift 2 ;;
@@ -46,6 +52,31 @@ done
 echo "curl $url" >> "$LOG"
 emit() { if [ -n "$out" ] && [ "$out" != "-" ]; then printf '%s' "$1" > "$out"; else printf '%s' "$1"; fi; }
 done_with() { emit "$2"; if [ -n "$fmt" ]; then printf '%s' "${fmt//%\{http_code\}/$1}"; fi; [ "$1" -ge 400 ] && exit 22; exit 0; }
+if [[ "$url" == http://localhost:*/v1/* ]]; then
+  p="/${url#http://localhost:*/}"
+  auth="$(printf '%s' "$cfg" | sed -n 's/^header = "\(.*\)"$/\1/p')"
+  echo "$method $p" >> "$ST/local.log"
+  LICOK='{"status":"Ok","edition":"Enterprise","expirationDate":"2027-12-31T00:00:00","version":"26.3","yourHardwareId":"HID8-4B1E-11-22-33"}'
+  case "$method $p" in
+    "GET /v1/license/isValid") if [ -f "$ST/license" ]; then done_with 200 true; fi; done_with 200 false ;;
+    "POST /v1/authentication/request")
+      if grep -q '"username":"root"' "$data" && grep -q '"password":"rootpw"' "$data"; then done_with 200 '{"access_token":"TOKROOT","expires_in":3600}'; fi
+      done_with 401 "" ;;
+  esac
+  [ "$auth" = "Authorization: Bearer TOKROOT" ] || done_with 401 ""
+  case "$method $p" in
+    "GET /v1/license") if [ -f "$ST/license" ]; then done_with 200 "$LICOK"; fi; done_with 200 '{"status":"NotPresent","yourHardwareId":"HID8-4B1E-11-22-33"}' ;;
+    "POST /v1/license/activate/file")
+      cp "${form#file=@}" "$ST/got-license"
+      grep -q wrong "$ST/got-license" && done_with 400 '"license.messages.invalid-hardware-id"'
+      touch "$ST/license"; done_with 200 "$LICOK" ;;
+    "POST /v1/license/activate/mail")
+      cp "$data" "$ST/got-text"
+      grep -q "LICENSE ENDS HERE" "$ST/got-text" || done_with 400 '"Activation failed with the following error: Unknown order number. Activation not possible."'
+      touch "$ST/license"; done_with 200 "$LICOK" ;;
+  esac
+  echo "UNHANDLED curl $method $url" >> "$BAD"; done_with 404 ""
+fi
 tags_of() {
   case "$1" in
     library/mongo) echo 7.0.43 8.0.30 8.0.32 8.2.12 8.3.11 9.0.2 7 7.0 8 8.0 8.2 8.3 9 9.0 latest ;;
@@ -227,6 +258,7 @@ case "${1:-}" in
       "1||") echo "host: (fake)" ;;
       "3|--format|{{.Host.Security.Rootless}}") echo "${SHIM_ROOTLESS:-false}" ;;
       "3|--format|{{.Host.Kernel}}") echo "${SHIM_KERNEL:-6.8.0-generic}" ;;
+      "3|--format|{{.Host.MemTotal}}") echo "${SHIM_MEMTOTAL:-34359738368}" ;;
       *) bad ;;
     esac ;;
   ps)
@@ -264,6 +296,10 @@ case "${1:-}" in
       # Podman 5.x: a container without a healthcheck has no .State.Health
       rp '{{with .State.Health}}{{or .Status "none"}}{{else}}none{{end}}' none
       rp '{{.RestartCount}}' 0
+      # the host name: from the env file of the last start (none: the container ID), else the env file now
+      if [ -f "$ST/hostname" ]; then h="$(cat "$ST/hostname")"; else h="$(envval CATALOG_HOSTNAME)"; fi
+      rp '{{.Config.Hostname}}' "${h:-$id}"
+      rp '{{.State.OOMKilled}}' false
       case "$out" in *'{{'*) bad ;; esac
       printf '%s\n' "$out"
     done
@@ -396,6 +432,7 @@ case "${1:-}" in
         printf '%s\n' "docker.io/library/mongo:$(envval MONGO_TAG)" "docker.io/$(envval CATALOG_IMAGE)" "docker.io/$(envval CATALOG_WORKER_IMAGE)" > "$ST/images"
         envval CATALOG_IMAGE | sed 's/.*://' > "$ST/catalog_tag"
         envval MONGO_TAG > "$ST/mongo_tag"
+        envval CATALOG_HOSTNAME > "$ST/hostname"
         printf '%s\n' "$PWD" > "$ST/wd"
         if [ "$(envval INSTALL_NGINX_PROXY_MANAGER)" = true ] && [ ! -f "$NS/user" ] && grep -q 'INITIAL_ADMIN_PASSWORD: "${NPM_ADMIN_PASSWORD}"' "$CF"; then
           e="$(envval NPM_ADMIN_EMAIL)"
@@ -481,6 +518,7 @@ case "${1:-}" in
       info) echo "Client: Docker Engine - Community" ;;
       "info --format {{range .SecurityOptions}}{{.}} {{end}}") echo "name=apparmor name=seccomp,profile=builtin name=cgroupns " ;;
       "info --format {{.KernelVersion}}") echo "${SHIM_KERNEL:-6.8.0-generic}" ;;
+      "info --format {{.MemTotal}}") echo "${SHIM_MEMTOTAL:-34359738368}" ;;
       *) bad ;;
     esac ;;
   ps)
@@ -517,6 +555,10 @@ case "${1:-}" in
       rp '{{.State.Status}}' running
       rp '{{with .State.Health}}{{or .Status "none"}}{{else}}none{{end}}' none
       rp '{{.RestartCount}}' 0
+      # the host name: from the env file of the last start (none: the container ID), else the env file now
+      if [ -f "$ST/hostname" ]; then h="$(cat "$ST/hostname")"; else h="$(envval CATALOG_HOSTNAME)"; fi
+      rp '{{.Config.Hostname}}' "${h:-$id}"
+      rp '{{.State.OOMKilled}}' false
       case "$out" in *'{{'*) bad ;; esac
       printf '%s\n' "$out"
     done
@@ -568,6 +610,7 @@ case "${1:-}" in
         touch "$ST/up" "$ST/net" "$ST/vols"
         envval CATALOG_IMAGE | sed 's/.*://' > "$ST/catalog_tag"
         envval MONGO_TAG > "$ST/mongo_tag"
+        envval CATALOG_HOSTNAME > "$ST/hostname"
         printf '%s\n' "$PWD" > "$ST/wd" ;;
       *) bad ;;
     esac ;;
@@ -666,7 +709,7 @@ fresh() {
 installed() {
   fresh
   (cd "$D" && bash rn1-technology-catalog-installer.sh generate </dev/null >/dev/null 2>&1)
-  touch "$ST/up" "$ST/net" "$ST/vols"; echo "25.4.4191.133" > "$ST/catalog_tag"; echo 8.0 > "$ST/mongo_tag"; echo "$D" > "$ST/wd"
+  touch "$ST/up" "$ST/net" "$ST/vols" "$ST/license"; echo "25.4.4191.133" > "$ST/catalog_tag"; echo 8.0 > "$ST/mongo_tag"; echo "$D" > "$ST/wd"
   printf '%s\n' docker.io/library/mongo:8.0 docker.io/raynetgmbh/rayventory-catalog:25.4.4191.133 docker.io/raynetgmbh/rayventory-catalog-worker:25.4.4191.133 > "$ST/images"
   : > "$LOG"
 }
@@ -689,10 +732,10 @@ check "menu without a terminal: no automatic start of the new installation" '! g
 check "help: guided tasks explained, 7 no longer the start" 'out2="$(printf "h\n\n0\n" | bash "$I" menu 2>&1)"; grep -q "START HERE - GUIDED TASKS" <<< "$out2" && ! grep -q "Start here on a new server" <<< "$out2" && grep -q "engine, domain name, Nginx Proxy Manager" <<< "$out2"'
 
 # 2. New installation with Enter only: Podman, no domain, no Nginx Proxy Manager, the recommended versions,
-# files written, stack started with a health check, data later, summary
+# files written, stack started with a health check, the license later (the data then too), summary
 fresh
 out="$(printf 'i\n\n\n\n\n\n\n\n0\n' | bash "$I" menu 2>&1)"
-check "install: all seven steps shown" '( for s in 1 2 3 4 5 6 7; do grep -q "Install .* step $s of 7" <<< "$out" || exit 1; done )'
+check "install: the nine steps shown - the data step skipped without a license" '( for s in 1 2 3 4 5 6 7 9; do grep -q "Install .* step $s of 9" <<< "$out" || exit 1; done ) && ! grep -q "Install .* step 8 of 9" <<< "$out"'
 check "install: the engines listed, Podman ready and the default" 'grep -Eq "1  Podman +[^ ]+ ready" <<< "$out" && grep -Eq "2  Docker Engine +installed - the setup completes it" <<< "$out" && [ "$(setting CONTAINER_ENGINE)" = podman ] && grep -q "Podman is ready" <<< "$out"'
 check "install: no domain - the address of the server" 'grep -q "Catalog then runs on http://192.0.2.10:8080.$" <<< "$out" && [ -z "$(setting CATALOG_DOMAIN)" ] && grep -q "The Catalog: http://192.0.2.10:8080$" <<< "$out"'
 check "install: Nginx Proxy Manager - no without a domain (the default)" 'grep -q "Without a domain name it only forwards http://192.0.2.10 to the Catalog" <<< "$out" && [ "$(setting INSTALL_NGINX_PROXY_MANAGER)" = false ] && grep -qx "INSTALL_NGINX_PROXY_MANAGER=false" "$D/.env"'
@@ -700,23 +743,36 @@ check "install: Enter takes the recommended versions (Catalog the newest, the ot
 check "install: one summary box before the start" 'grep -q "Summary" <<< "$out" && grep -Eq "Engine +Podman" <<< "$out" && grep -Eq "Address +http://192.0.2.10:8080" <<< "$out" && ! grep -Eq "Direct +http" <<< "$out" && grep -Eq "Proxy +none - Catalog Web answers directly" <<< "$out" && grep -Eq "Versions +Catalog 26.3.4789.148 . MongoDB 8.0.32 . OpenSearch 2.19.6" <<< "$out" && grep -Eq "RabbitMQ 3.13.7 . MinIO RELEASE.2025-10-15T17-29-55Z" <<< "$out" && grep -Eq "Folder +$D" <<< "$out"'
 check "install: the check is quiet when it passes" 'grep -q "All required checks passed" <<< "$out" && ! grep -q "Checking prerequisites" <<< "$out" && ! grep -q "OK Podman 5.7.0" <<< "$out"'
 check "install: files generated with the versions, stack started" '[ -f "$D/.env" ] && [ -f "$D/docker-compose.yml" ] && grep -qx "MONGO_TAG=8.0.32" "$D/.env" && grep -q "^podman compose .*--env-file .env -f docker-compose.yml up -d --remove-orphans$" "$LOG"'
-check "install: after the start straight on to the data (no question in between)" '! grep -q "Continue with the catalog data" <<< "$out" && grep -q "Install .* step 6 of 7" <<< "$out"'
+check "install: after the start straight on to the license (no question in between)" '! grep -q "Continue with the" <<< "$out" && grep -q "Install .* step 7 of 9" <<< "$out"'
+check "install: the license step - why, the three ways, Enter is later" 'grep -q "The Catalog needs a license from Raynet: without one it takes no data." <<< "$out" && grep -q "By order number" <<< "$out" && grep -q "By license file" <<< "$out" && grep -q "By e-mail" <<< "$out" && grep -q "Later: option 25 activates the Catalog." <<< "$out" && ! grep -q "activate/" "$ST/local.log"'
 check "install: health check, addresses once, summary" 'grep -q "Health check" <<< "$out" && grep -q "The Catalog is installed" <<< "$out" && [ "$(grep -c "Catalog Web (direct)" <<< "$out")" -eq 1 ] && grep -q "http://192.0.2.10:8080" <<< "$out"'
-check "install: no data yet named, then the full menu" 'grep -q "The Catalog has no data yet" <<< "$out" && grep -q "Options: 14 passwords . 15 addresses . 24 domain and HTTPS . 9 status" <<< "$out" && grep -q "Next: the full menu - every option (H: help)" <<< "$out" && sed -n "/Next: the full menu/,\$p" <<< "$out" | grep -q "START HERE"'
+check "install: no license - no data, how to go on; the Catalog Web login; then the full menu" 'grep -q "The Catalog has no data yet: it is not activated (no valid license)." <<< "$out" && grep -q "Option 25 activates the Catalog, then options 20 / 17 and 19 load the data." <<< "$out" && grep -q "Catalog Web login: root (default password root unless it was changed) -" <<< "$out" && grep -q "change it in the web interface." <<< "$out" && grep -q "Options: 14 passwords . 15 addresses . 24 domain and HTTPS . 9 status" <<< "$out" && grep -q "Next: the full menu - every option (H: help)" <<< "$out" && sed -n "/Next: the full menu/,\$p" <<< "$out" | grep -q "START HERE"'
 check "install: no Nginx Proxy Manager set up without a domain" '! grep -q "Setting up Nginx Proxy Manager" <<< "$out" && [ ! -s "$NS/calls" ]'
 
-# 3. Install on a folder that is already installed: repair, data, update or remove
+# 3. Install on a folder that is already installed: repair, license and data, update or remove
 out="$(printf 'i\n0\n\n0\n' | bash "$I" menu 2>&1)"
-check "install again: existing installation found, cancel changes nothing" 'grep -q "This folder already has an installation" <<< "$out" && grep -q "Continue with the catalog data" <<< "$out" && grep -q "Cancelled" <<< "$out"'
+check "install again: existing installation found, cancel changes nothing" 'grep -q "This folder already has an installation" <<< "$out" && grep -q "Continue with the license and the catalog data" <<< "$out" && grep -q "Cancelled" <<< "$out"'
 out="$(printf 'i\n2\n0\n\n0\n' | bash "$I" menu 2>&1)"
-check "install again: continues with the catalog data (step 5)" 'grep -q "Install .* step 5 of 6" <<< "$out" && ! grep -q "Install .* step 3 of 6" <<< "$out"'
+check "install again: continues with the license (step 5), later: the data skipped" 'grep -q "Install .* step 5 of 7" <<< "$out" && ! grep -q "Install .* step 3 of 7" <<< "$out" && ! grep -q "Install .* step 6 of 7" <<< "$out" && grep -q "Install .* step 7 of 7" <<< "$out"'
+
+# 3b. The files of an older installer (no fixed host name; catalog-web runs with its container ID c2): the
+# license step activates without a warning (writing the files later keeps the name of a licensed Catalog); a
+# repair keeps the name of a licensed catalog-web, and gives an unlicensed one the name of this server
+installed; rm -f "$ST/license"; sed -i '/^CATALOG_HOSTNAME=/d' "$D/.env"
+out="$(printf 'i\n2\n\n\n0\n' | bash "$I" menu 2>&1)"
+check "license step on files without a fixed host name: no warning, the ways, Enter is later" '! grep -q -e "has no fixed host name yet" -e "still runs with the host name" <<< "$out" && grep -q "By license file" <<< "$out" && grep -q "Later: option 25 activates the Catalog." <<< "$out" && ! grep -q "activate/" "$ST/local.log" && grep -q "Install .* step 7 of 7" <<< "$out"'
+out="$(printf 'i\n1\ny\ny\n\ny\ny\ny\n0\n\n0\n' | bash "$I" menu 2>&1)"
+check "repair of these files without a license: the name of this server (nothing lost), then the license step without a warning" 'grep -q "catalog-web now has the fixed host name" <<< "$out" && grep -q "holds no valid license now: none is" <<< "$out" && ! grep -q -e "needs a license for" -e "keeps its host name" <<< "$out" && [ -n "$(envv CATALOG_HOSTNAME)" ] && [ "$(envv CATALOG_HOSTNAME)" != c2 ] && grep -q "Install .* step 5 of 7" <<< "$out" && grep -q "By license file" <<< "$out" && ! grep -q "still runs with the host name" <<< "$out"'
+installed; sed -i '/^CATALOG_HOSTNAME=/d' "$D/.env"
+out="$(printf 'i\n1\ny\ny\n\ny\ny\ny\n0\n\n0\n' | bash "$I" menu 2>&1)"
+check "repair of these files with a license: catalog-web keeps its name, the license stays valid" '[ "$(envv CATALOG_HOSTNAME)" = c2 ] && grep -q "catalog-web keeps its host name c2: the Catalog.s license" <<< "$out" && grep -q "is bound to it (CATALOG_HOSTNAME in .env)." <<< "$out" && ! grep -q -e "needs a license for" -e "fixed host name" <<< "$out" && grep -q "The Catalog is activated (valid license)." <<< "$out" || { printf "%s\n" "$out" | grep -n -i -e "host name" -e "license" -e "step" | head -30; false; }'
 
 # 4. Repair keeps the installed version (an upgrade belongs to U with backup and rollback)
 installed
 sed -i 's/^CATALOG_VERSION=.*/CATALOG_VERSION="26.3.4789.148"/' "$I"
 out="$(printf 'i\n1\ny\ny\n\ny\ny\nn\n\n0\n' | bash "$I" menu 2>&1)"
 check "repair: version of the installation kept" 'grep -q "the repair keeps 25.4.4191.133" <<< "$out" && grep -q "^CATALOG_VERSION=\"25.4.4191.133\"$" "$I" && grep -q "^CATALOG_IMAGE=.*:25.4.4191.133$" "$D/.env"'
-check "repair: the steps of a repair (check, settings, files, start)" 'grep -q "Install .* step 3 of 6" <<< "$out" && grep -q "Install .* step 4 of 6" <<< "$out" && ! grep -q "of 7" <<< "$out"'
+check "repair: the steps of a repair (check, settings, files, start)" 'grep -q "Install .* step 3 of 7" <<< "$out" && grep -q "Install .* step 4 of 7" <<< "$out" && ! grep -q "of 9" <<< "$out"'
 # 4b. 26.3 runs, a new download of the installer says 25.4 (and port 8080 instead of 8181): the start offers
 #     the values of the installation (declined here), the repair offers them again before it writes anything
 installed
@@ -736,6 +792,29 @@ sed -i '0,/^CATALOG_WEB_PORT=/s/^CATALOG_WEB_PORT=.*/CATALOG_WEB_PORT="8080"/' "
 : > "$LOG"
 out="$(printf 'i\n1\ny\ny\ny\n\ny\ny\nn\n\n0\n' | bash "$I" menu 2>&1)"
 check "repair with another port in the settings: the port of the installation taken over first, kept" 'grep -q "The settings differ from the installation in CATALOG_WEB_PORT" <<< "$out" && [ "$(grep -c "CATALOG_WEB_PORT *8080 -> 8181" <<< "$out")" -eq 1 ] && grep -q "Took over 1 value(s) of the installation" <<< "$out" && [ "$(setting CATALOG_WEB_PORT)" = 8181 ] && grep -qx "CATALOG_WEB_PORT=8181" "$D/.env"'
+# 4d. The host name and the cache of MongoDB that .env derives (CATALOG_HOSTNAME and MONGO_CACHE_GB empty) are
+#     no difference: the repair offers nothing and keeps the host name
+installed
+sed -i 's/^CATALOG_HOSTNAME=.*/CATALOG_HOSTNAME=c2/; s/^MONGO_WT_CACHE_GB=.*/MONGO_WT_CACHE_GB=3/' "$D/.env"
+out="$(printf 'i\n1\ny\ny\n\ny\ny\nn\n\n0\n' | bash "$I" menu 2>&1)"
+check "repair with the derived host name and cache: nothing offered, the name kept, the cache for the memory" '! grep -q -e "differ from the installation" -e "Taking them over writes" <<< "$out" && [ "$(envv CATALOG_HOSTNAME)" = c2 ] && [ "$(envv MONGO_WT_CACHE_GB)" = 11 ] && [ -z "$(setting CATALOG_HOSTNAME)" ] && [ -z "$(setting MONGO_CACHE_GB)" ] && grep -q "Install .* step 4 of 7" <<< "$out"'
+# 4e. Below 24 GB the repair asks at its check (step 1), before it writes: no and 0 stop it with the files as
+#     they were, yes goes on with the cache for that memory
+installed
+before="$(cksum < "$D/.env")"
+out="$(printf 'i\n1\ny\nn\n\n0\n' | SHIM_MEMTOTAL=15032385536 bash "$I" menu 2>&1)"
+check "repair below 24 GB, no: stopped at the check, nothing written" 'grep -q "This engine has 14 GB of memory; at least 24 GB is recommended." <<< "$out" && back_in_menu && ! grep -q "Install .* step 2 of 7" <<< "$out" && [ "$(cksum < "$D/.env")" = "$before" ] && ! grep -q "compose.* up" "$LOG"'
+out="$(printf 'i\n1\ny\n0\n\n0\n' | SHIM_MEMTOTAL=15032385536 bash "$I" menu 2>&1)"
+check "repair below 24 GB, 0: stopped, nothing written" 'back_in_menu && ! grep -q "Install .* step 2 of 7" <<< "$out" && [ "$(cksum < "$D/.env")" = "$before" ]'
+out="$(printf 'i\n1\ny\ny\ny\n\ny\ny\nn\n\n0\n' | SHIM_MEMTOTAL=15032385536 bash "$I" menu 2>&1)"
+check "repair below 24 GB, yes: the steps go on, the cache for 14 GB" 'grep -q "This engine has 14 GB of memory" <<< "$out" && grep -q "Install .* step 4 of 7" <<< "$out" && [ "$(envv MONGO_WT_CACHE_GB)" = 2 ] && grep -q "up -d --remove-orphans" "$LOG"'
+# 4f. An older MongoDB in the settings than the installation's, the take-over declined: the repair stops
+#     before the check and the memory question, nothing written
+installed
+sed -i '0,/^MONGO_TAG=/s/^MONGO_TAG=.*/MONGO_TAG="7.0"/' "$I"
+before="$(cksum < "$D/.env")"
+out="$(printf 'n\n\ni\n1\nn\n\n0\n' | SHIM_MEMTOTAL=15032385536 bash "$I" menu 2>&1)"
+check "repair with MongoDB 7.0 against the installed 8.0, take-over declined twice: stopped before the check" '[ "$(grep -c "MONGO_TAG *7.0 -> 8.0" <<< "$out")" -eq 2 ] && grep -q "MongoDB 7.0 would replace the" <<< "$out" && grep -q "take the installation.s values over first (option 23)" <<< "$out" && ! grep -q -e "This engine has" -e "Install .* step 2 of 7" <<< "$out" && [ "$(cksum < "$D/.env")" = "$before" ] && [ "$(setting MONGO_TAG)" = 7.0 ]'
 # 0 at the time zone question stops the repair; outside the guided tasks (option 2) 0 is a no, as before
 TZDATA="no"
 if [ -f /usr/share/zoneinfo/America/New_York ] && [ -f /usr/share/zoneinfo/Europe/Berlin ]; then TZDATA="yes"; fi
@@ -761,11 +840,23 @@ out="$(printf 'i\n\n\n\n\n0\n\n0\n' | bash "$I" menu 2>&1)"
 check "install again: the saved domain is the default (Enter keeps it), so Nginx Proxy Manager defaults to yes" '[ "$(setting CATALOG_DOMAIN)" = catalog.example.com ] && grep -q "Let.s Encrypt needs a real e-mail address" <<< "$out" && back_in_menu'
 sed -i 's/^INSTALL_NGINX_PROXY_MANAGER=.*/INSTALL_NGINX_PROXY_MANAGER="false"/' "$I"
 out="$(printf 'i\n\n\n\n\n0\n\n0\n' | bash "$I" menu 2>&1)"
-check "install again: a saved no for Nginx Proxy Manager is the default while the domain stays" '[ "$(setting INSTALL_NGINX_PROXY_MANAGER)" = false ] && ! grep -q "Let.s Encrypt needs a real e-mail address" <<< "$out" && grep -q "Install .* step 4 of 7" <<< "$out" && back_in_menu'
+check "install again: a saved no for Nginx Proxy Manager is the default while the domain stays" '[ "$(setting INSTALL_NGINX_PROXY_MANAGER)" = false ] && ! grep -q "Let.s Encrypt needs a real e-mail address" <<< "$out" && grep -q "Install .* step 5 of 9" <<< "$out" && back_in_menu'
 out="$(printf 'i\n\n-\n0\n\n0\n' | bash "$I" menu 2>&1)"
 check "install again: - removes the domain" '[ -z "$(setting CATALOG_DOMAIN)" ] && [ "$(setting BASEURL)" = "http://catalog-web" ]'
 out="$(printf 'i\n\ncatalog.example.com\n\n\n0\n\n0\n' | bash "$I" menu 2>&1)"
 check "install again: a new domain - Nginx Proxy Manager defaults to yes again" '[ "$(setting CATALOG_DOMAIN)" = catalog.example.com ] && grep -q "Let.s Encrypt needs a real e-mail address" <<< "$out" && [ "$(setting INSTALL_NGINX_PROXY_MANAGER)" = false ]'
+
+# 5a. Below 24 GB of memory the Install step says so after the check and asks (on Linux there is nothing to
+# offer); no stops before the files, yes goes on with the cache of MongoDB for that memory
+fresh
+out="$(printf 'i\n\n\n\n\nn\n\n0\n' | SHIM_MEMTOTAL=15032385536 bash "$I" menu 2>&1)"
+check "install below 24 GB: the line of the check and the warning; no stops before the files" 'grep -q "^WARN Memory: 14 GB for the containers - at least 24 GB is recommended$" <<< "$out" && grep -q "^      A full snapshot import loads MongoDB, the Catalog and OpenSearch at once.$" <<< "$out" && grep -q "This engine has 14 GB of memory; at least 24 GB is recommended." <<< "$out" && back_in_menu && [ ! -f "$D/.env" ] && ! grep -q "compose.* up" "$LOG"'
+fresh
+out="$(printf 'i\n\n\n\n\ny\n\n\n\n0\n' | SHIM_MEMTOTAL=15032385536 bash "$I" menu 2>&1)"
+check "install below 24 GB: yes goes on - the cache of MongoDB for 14 GB, the Catalog started" 'grep -q "This engine has 14 GB of memory" <<< "$out" && grep -qx "MONGO_WT_CACHE_GB=2" "$D/.env" && grep -q "up -d --remove-orphans" "$LOG" && grep -q "The Catalog is installed" <<< "$out"'
+fresh
+out="$(printf 'i\n\n\n\n\n\n\n\n0\n' | bash "$I" menu 2>&1)"
+check "install with 32 GB: no warning, no question, the cache of MongoDB for 32 GB" '! grep -q "This engine has" <<< "$out" && ! grep -q "WARN Memory" <<< "$out" && grep -qx "MONGO_WT_CACHE_GB=11" "$D/.env" && grep -q "The Catalog is installed" <<< "$out"'
 
 # 5b. 0 at each question stops the task and returns to the menu; only the answers before are kept
 fresh
@@ -800,7 +891,23 @@ out="$(printf 'i\n\n\ny\n\nn\n\n0\n' | bash "$I" menu 2>&1)"
 check "failed check, n at Continue anyway: stopped, no files" 'grep -q "1 problem(s) found" <<< "$out" && back_in_menu && [ ! -f "$D/.env" ] && ! grep -q "The first start pulls the images" <<< "$out"'
 fresh
 out="$(printf 'i\n\n\n\n\n\n0\n\n0\n' | bash "$I" menu 2>&1)"
-check "0 at the data step means later: installed, the summary shown, the marker gone" '[ -f "$D/.env" ] && grep -q "compose.* up -d" "$LOG" && grep -q "Install .* step 7 of 7" <<< "$out" && grep -q "The Catalog has no data yet" <<< "$out" && ! grep -q "Stopped. I starts it again" <<< "$out"'
+check "0 at the license step means later: installed, the data skipped, the summary shown, the marker gone" '[ -f "$D/.env" ] && grep -q "compose.* up -d" "$LOG" && grep -q "Install .* step 9 of 9" <<< "$out" && grep -q "The Catalog has no data yet: it is not activated" <<< "$out" && ! grep -q "Install .* step 8 of 9" <<< "$out" && ! grep -q "Stopped. I starts it again" <<< "$out"'
+
+# 5c. The license step: activation by the license file (root by default), then the data step with the valid
+# license; at 80 columns nothing is wider
+fresh
+printf 'fake license file\001\002\nline 2\n' > "$T/lic.rswl"
+out="$(printf 'i\n\n\n\n\n\n2\n\nrootpw\n%s\n\n\n0\n' "$T/lic.rswl" | bash "$I" menu 2>&1)"
+check "license step: activated by the license file, root by default, the exact bytes" 'grep -q "Install .* step 7 of 9" <<< "$out" && grep -q "Catalog Web confirms it: the license is valid." <<< "$out" && cmp -s "$ST/got-license" "$T/lic.rswl" && grep -q "POST /v1/license/activate/file" "$ST/local.log"'
+check "license step: the login shows the hardware ID with the host name catalog-web runs with, before the path" 'sed -n "/Activation needs a site administrator/,/Uploading lic.rswl/p" <<< "$out" | grep -Eq "Hardware ID +HID8-4B1E-11-22-33 \(host name $(envv CATALOG_HOSTNAME)\)" && grep -q "Raynet makes a license file or e-mail text for this hardware ID." <<< "$out"'
+check "license step: then the data step names the valid license, later, the summary" 'grep -q "Install .* step 8 of 9" <<< "$out" && grep -q "The Catalog is activated (valid license)." <<< "$out" && grep -q "Install .* step 9 of 9" <<< "$out" && grep -q "The Catalog has no data yet: option 20 (daily self-sync), or 17 and 19." <<< "$out"'
+# at 80 columns: the ways, the login with the license, the order screen (cancelled at its first field), a
+# refused license file, later, the summary
+fresh
+printf 'a license for the wrong server\n' > "$T/wrong.rswl"
+out="$(printf 'i\n\n\n\n\n\n1\n\nrootpw\n0\n2\n%s\n0\n\n0\n' "$T/wrong.rswl" | COLUMNS=80 LC_ALL=C bash "$I" menu 2>&1)"
+wide="$(sed -n '/step 7 of 9/,/Next: the full menu/p' <<< "$out" | awk 'length($0) > 80')"
+check "license step at 80 columns: the ways, the order screen, a refusal and the summary fit" 'grep -q "step 7 of 9" <<< "$out" && grep -q "By license file" <<< "$out" && grep -q "it needs internet access" <<< "$out" && grep -q "This license is for another server: the hardware ID does not match." <<< "$out" && grep -q "Another way below, or 0." <<< "$out" && grep -q "Later: option 25 activates the Catalog." <<< "$out" && grep -q "Catalog Web login: root" <<< "$out" && [ -z "$wide" ] || { printf "%s\n" "$wide" | head -5; false; }'
 
 # 6. Ports in use: Nginx Proxy Manager defaults to no; Catalog Web gets another port (a port of another
 # setting is refused at once)
@@ -827,7 +934,7 @@ check "port of Catalog Web in use, volumes left: Enter does not keep the busy po
 # 7. A step that fails stops the task (no start with broken files)
 fresh 's/^HEALTH_TIMEOUT=.*/HEALTH_TIMEOUT="0900"/'
 out="$(printf 'i\n\n\ny\n\ny\n\n\n0\n' | bash "$I" menu 2>&1)"
-check "install: failed check shown in full, continued anyway, failed files step stops before the start" 'grep -q "1 problem(s) found" <<< "$out" && grep -q "OK Podman runs rootful" <<< "$out" && grep -q "The first start pulls the images" <<< "$out" && grep -q "The files could not be written" <<< "$out" && ! grep -q "compose.* up" "$LOG" && ! grep -q "Install .* step 6 of 7" <<< "$out"'
+check "install: failed check shown in full, continued anyway, failed files step stops before the start" 'grep -q "1 problem(s) found" <<< "$out" && grep -q "OK Podman runs rootful" <<< "$out" && grep -q "The first start pulls the images" <<< "$out" && grep -q "The files could not be written" <<< "$out" && ! grep -q "compose.* up" "$LOG" && ! grep -q "Install .* step 7 of 9" <<< "$out"'
 
 # 7b. Step 5: a cancelled self-sync is not reported as set up
 installed
@@ -1017,7 +1124,7 @@ check "docker: the summary names Docker, the quiet check passed" 'grep -Eq "Engi
 # 22b. Docker ready, Podman not installed, CONTAINER_ENGINE empty: Enter takes the Docker that is there
 fresh 's/^CONTAINER_ENGINE=.*/CONTAINER_ENGINE=""/'
 out="$(printf 'i\n\n0\n\n0\n' | PATH="$NOPPATH" RN1_SYSTEMD_DIR="$T" bash "$I" menu 2>&1)"
-check "docker ready, Podman missing: Enter takes Docker, Podman is not installed next to it" 'grep -Eq "^   (1  Podman +not installed - the setup installs it|-  Podman )" <<< "$out" && grep -Eq "2  Docker Engine +[^ ]+ ready" <<< "$out" && [ "$(setting CONTAINER_ENGINE)" = docker ] && grep -q "Docker is ready" <<< "$out" && ! grep -q "Run these commands" <<< "$out" && grep -q "Install .* step 2 of 7" <<< "$out"'
+check "docker ready, Podman missing: Enter takes Docker, Podman is not installed next to it" 'grep -Eq "^   (1  Podman +not installed - the setup installs it|-  Podman )" <<< "$out" && grep -Eq "2  Docker Engine +[^ ]+ ready" <<< "$out" && [ "$(setting CONTAINER_ENGINE)" = docker ] && grep -q "Docker is ready" <<< "$out" && ! grep -q "Run these commands" <<< "$out" && grep -q "Install .* step 3 of 9" <<< "$out"'
 mkdir -p "$T/pick"; sed 's/^CONTAINER_ENGINE=.*/CONTAINER_ENGINE=""/' "$NEW" > "$T/pick/inst.sh"
 pick() { (cd "$T/pick" && bash inst.sh __wiz_engine_pick "$@" </dev/null 2>/dev/null); }
 check "the default engine: a ready one first, Podman when both are, never the one whose setup failed" '[ "$(PATH="$NOPPATH" RN1_SYSTEMD_DIR="$T" pick)" = docker ] && [ "$(PATH="$DPATH" pick)" = podman ] && [ "$(PATH="$DPATH" pick podman)" = docker ] && [ "$(SHIM_ROOTLESS=true PATH="$DPATH" pick)" = docker ]'
@@ -1043,26 +1150,26 @@ fresh
 mkdir -p "$ST/docker"; touch "$ST/docker/up" "$ST/docker/vols"; echo "$D" > "$ST/docker/wd"
 echo "MONGO_INITDB_ROOT_PASSWORD=x" > "$D/.env.bak-20261001-120000"
 out="$(printf 'i\n\n0\n\n0\n' | PATH="$DPATH" bash "$I" menu 2>&1)"
-check "containers found by the Engine step: the repair menu, no new installation" 'grep -Eq "2  Docker Engine +[^ ]+ holds the data of this folder" <<< "$out" && [ "$(setting CONTAINER_ENGINE)" = docker ] && grep -q "This folder already has an installation" <<< "$out" && grep -q "Install .* step 1 of 6" <<< "$out" && ! grep -q "Install .* step 2 of 7" <<< "$out"'
+check "containers found by the Engine step: the repair menu, no new installation" 'grep -Eq "2  Docker Engine +[^ ]+ holds the data of this folder" <<< "$out" && [ "$(setting CONTAINER_ENGINE)" = docker ] && grep -q "This folder already has an installation" <<< "$out" && grep -q "Install .* step 1 of 7" <<< "$out" && ! grep -q "Install .* step 3 of 9" <<< "$out"'
 
 # 24. The engine is not ready and is not set up: try again, another engine, or stop
 fresh
 if [ "$(id -u)" -eq 0 ]; then RUNQ='n\n'; else RUNQ=''; fi
 out="$(printf "i\n\n${RUNQ}2\n2\n0\n\n0\n" | PATH="$DPATH" SHIM_ROOTLESS=true RN1_SYSTEMD_DIR="$T" bash "$I" menu 2>&1)"
-check "engine not set up: try again, another engine or stop - then another one chosen" 'grep -Eq "1  Podman +installed - the setup completes it" <<< "$out" && grep -q "Podman is not ready - the Catalog cannot start without it" <<< "$out" && grep -q "Choose another engine" <<< "$out" && [ "$(setting CONTAINER_ENGINE)" = docker ] && grep -q "Install .* step 2 of 7" <<< "$out"'
+check "engine not set up: try again, another engine or stop - then another one chosen" 'grep -Eq "1  Podman +installed - the setup completes it" <<< "$out" && grep -q "Podman is not ready - the Catalog cannot start without it" <<< "$out" && grep -q "Choose another engine" <<< "$out" && [ "$(setting CONTAINER_ENGINE)" = docker ] && grep -q "Install .* step 3 of 9" <<< "$out"'
 if [ "$(id -u)" -ne 0 ]; then
   check "engine not set up: rootless Podman as a normal user - no try again, start it as root" 'grep -q "Rootful Podman needs root: start rn1-technology-catalog-installer.sh again with sudo." <<< "$out" && ! grep -q "Try again" <<< "$out"'
 fi
 fresh
 out="$(printf "i\n\n${RUNQ}2\n\n0\n\n0\n" | PATH="$DPATH" SHIM_ROOTLESS=true RN1_SYSTEMD_DIR="$T" bash "$I" menu 2>&1)"
-check "engine not set up, choose another: Enter takes another engine than the one that failed" '[ "$(setting CONTAINER_ENGINE)" = docker ] && grep -q "Docker is ready" <<< "$out" && grep -q "Install .* step 2 of 7" <<< "$out"'
+check "engine not set up, choose another: Enter takes another engine than the one that failed" '[ "$(setting CONTAINER_ENGINE)" = docker ] && grep -q "Docker is ready" <<< "$out" && grep -q "Install .* step 3 of 9" <<< "$out"'
 fresh
 out="$(printf "i\n\n${RUNQ}x\n3\n0\n\n0\n" | SHIM_ROOTLESS=true RN1_SYSTEMD_DIR="$T" bash "$I" menu 2>&1)"
-check "engine not set up: an invalid answer is asked again, 0 stops (not the first question)" 'grep -q "Invalid choice: x" <<< "$out" && grep -q "Invalid choice: 3" <<< "$out" && back_in_menu && [ ! -e "$D/.setup-later" ] && ! grep -q "Install .* step 2 of 7" <<< "$out"'
+check "engine not set up: an invalid answer is asked again, 0 stops (not the first question)" 'grep -q "Invalid choice: x" <<< "$out" && grep -q "Invalid choice: 3" <<< "$out" && back_in_menu && [ ! -e "$D/.setup-later" ] && ! grep -q "Install .* step 3 of 9" <<< "$out"'
 # as root the setup shows its commands and asks: 0 there stops the task at once
 fresh
 out="$(printf 'i\n\n0\n\n0\n' | PATH="$T/rootbin:$PATH" SHIM_ROOTLESS=true RN1_SYSTEMD_DIR="$T" bash "$I" menu 2>&1)"
-check "engine setup: 0 at its own question stops the task at once" 'back_in_menu && ! grep -q "Choose another engine" <<< "$out" && ! grep -q "Install .* step 2 of 7" <<< "$out" && ! grep -Eq "^systemctl (enable|start)" "$LOG"'
+check "engine setup: 0 at its own question stops the task at once" 'back_in_menu && ! grep -q "Choose another engine" <<< "$out" && ! grep -q "Install .* step 3 of 9" <<< "$out" && ! grep -Eq "^systemctl (enable|start)" "$LOG"'
 
 # 25. A domain with Nginx Proxy Manager and an e-mail address: proxy host and certificate, HTTPS
 if [ "$NPM_OK" = "yes" ]; then
@@ -1094,7 +1201,7 @@ if [ "$NPM_OK" = "yes" ]; then
   fresh
   dns catalog.example.com 192.0.2.10
   out="$(printf 'i\n\ncatalog.example.com\n\nit@mail.example.net\n\n\n\n\n0\n' | SHIM_NPM_HOST_FAIL=1 bash "$I" menu 2>&1)"
-  check "proxy host refused: named with option 24, then the data and the summary" 'grep -q "did not create the proxy host of catalog.example.com (HTTP 500" <<< "$out" && grep -q "Nginx Proxy Manager is not set up for catalog.example.com yet (see above)." <<< "$out" && grep -q "Option 24 retries it." <<< "$out" && grep -q "Install .* step 7 of 7" <<< "$out" && [ ! -e "$D/.domain-certificate" ]'
+  check "proxy host refused: named with option 24, then the data and the summary" 'grep -q "did not create the proxy host of catalog.example.com (HTTP 500" <<< "$out" && grep -q "Nginx Proxy Manager is not set up for catalog.example.com yet (see above)." <<< "$out" && grep -q "Option 24 retries it." <<< "$out" && grep -q "Install .* step 9 of 9" <<< "$out" && [ ! -e "$D/.domain-certificate" ]'
 
   # 26c. A name Let's Encrypt gives no certificate for (.lan): HTTP through Nginx Proxy Manager, no e-mail
   # asked, no HTTPS promised
@@ -1118,7 +1225,7 @@ fi
 fresh
 out="$(printf 'i\n\nbad_name\n192.0.2.10\ncatalog.example.com\n\n0\n\n0\n' | bash "$I" menu 2>&1)"
 check "domain: an invalid name and an IP address refused, asked again" 'grep -q "Give a host name in lower case, e.g. catalog.example.com" <<< "$out" && grep -q "\"192.0.2.10\" is an IP address - leave it empty to use the IP address" <<< "$out" && [ "$(setting CATALOG_DOMAIN)" = catalog.example.com ]'
-check "domain: not in DNS yet - named, not blocked" 'grep -q "catalog.example.com is not in DNS yet" <<< "$out" && grep -q "Install .* step 3 of 7" <<< "$out"'
+check "domain: not in DNS yet - named, not blocked" 'grep -q "catalog.example.com is not in DNS yet" <<< "$out" && grep -q "Install .* step 4 of 9" <<< "$out"'
 fresh
 dns catalog.example.com 192.0.2.10
 out="$(printf 'i\n\ncatalgo.example.com\nn\ncatalog.example.com\n0\n\n0\n' | bash "$I" menu 2>&1)"
@@ -1126,13 +1233,13 @@ check "domain: a typo not in DNS typed again on the same screen, the typo never 
 fresh 's/^CATALOG_DOMAIN=.*/CATALOG_DOMAIN="catalog.example.com"/'
 dns catalog.example.com 192.0.2.10
 out="$(printf 'i\n\nhttp://\n\n0\n\n0\n' | bash "$I" menu 2>&1)"
-check "domain: an input without a host name is refused, the saved domain stays" 'grep -q "Give a host name, e.g. catalog.example.com (- removes the domain)." <<< "$out" && [ "$(setting CATALOG_DOMAIN)" = catalog.example.com ] && grep -q "Install .* step 3 of 7" <<< "$out"'
+check "domain: an input without a host name is refused, the saved domain stays" 'grep -q "Give a host name, e.g. catalog.example.com (- removes the domain)." <<< "$out" && [ "$(setting CATALOG_DOMAIN)" = catalog.example.com ] && grep -q "Install .* step 4 of 9" <<< "$out"'
 
 # 29. .setup-later: the I card still runs the task, and a completed installation removes the marker
 fresh
 touch "$D/.setup-later"
 out="$(printf 'i\n\n\n\n\n\n\n\n0\n' | bash "$I" menu 2>&1)"
-check "I with .setup-later: the new installation runs, the marker goes when it is done" 'grep -q "Install .* step 1 of 7" <<< "$out" && grep -q "The Catalog is installed" <<< "$out" && [ ! -e "$D/.setup-later" ]'
+check "I with .setup-later: the new installation runs, the marker goes when it is done" 'grep -q "Install .* step 2 of 9" <<< "$out" && grep -q "The Catalog is installed" <<< "$out" && [ ! -e "$D/.setup-later" ]'
 
 # 21. Full screen and terminal: the first start, and the lines above the prompt say what the typed number does
 if command -v script >/dev/null 2>&1 && [ "$(uname -s)" = "Linux" ]; then
@@ -1156,14 +1263,18 @@ if command -v script >/dev/null 2>&1 && [ "$(uname -s)" = "Linux" ]; then
   }
   fresh
   out="$(tty_run "bash $I menu" "Select \[1\]:" '0\n' "Press Enter to open the menu" '\n' "Select:" q)"
-  check "first start: the welcome and the new installation, without asking for the engine first" '{ grep -q "New installation. A few questions - engine, domain, proxy, versions - then$" <<< "$out" && grep -q "the Catalog starts. 0 at any question opens the full menu." <<< "$out" && grep -q "Install .* step 1 of 7" <<< "$out" && ! grep -q "Prerequisites are not met" <<< "$out"; } || { printf "%s\n" "$out" | tail -n 40 | sed "s/^/  | /"; false; }'
+  check "first start: the welcome and the new installation, without asking for the engine first" '{ grep -q "New installation. A few questions - engine, domain, proxy, versions - then$" <<< "$out" && grep -q "the Catalog starts. 0 at any question opens the full menu." <<< "$out" && grep -q "Install .* step 2 of 9" <<< "$out" && ! grep -q "Prerequisites are not met" <<< "$out"; } || { printf "%s\n" "$out" | tail -n 40 | sed "s/^/  | /"; false; }'
   check "first start: 0 at the first question - stopped, .setup-later, then the full menu" 'grep -q "Stopped. I starts it again" <<< "$out" && [ -f "$D/.setup-later" ] && grep -q "Type a number - what it does shows here" <<< "$out"'
   out="$(tty_run "bash $I menu" "Select:" q)"
   check "second start after 0: the menu opens directly" '! grep -q "New installation. A few questions" <<< "$out" && grep -q "Type a number - what it does shows here" <<< "$out"'
   fresh
-  out="$(tty_run "bash $I menu" "Select \[1\]:" '\n' "Domain name \[none\]:" '\n' "Install Nginx Proxy Manager" '\n' "Enter, or a row:" '\n' "Write the files and start the Catalog" '\n' "Press any key to continue" ' ' "Select \[0\]:" '\n' "Press any key to continue" ' ' "Press Enter to open the menu" '\n' "Select:" q)"
-  check "first start in a terminal: installed with Enter only, then the full menu" '{ [ -f "$D/.env" ] && [ -f "$ST/up" ] && grep -q "The Catalog is installed" <<< "$out" && grep -q "Next: the full menu" <<< "$out" && grep -q "Type a number - what it does shows here" <<< "$out" && [ ! -e "$D/.setup-later" ]; } || { printf "%s\n" "$out" | tail -n 40 | sed "s/^/  | /"; false; }'
+  out="$(tty_run "bash $I menu" "Select \[1\]:" '\n' "Domain name \[none\]:" '\n' "Install Nginx Proxy Manager" '\n' "Enter, or a row:" '\n' "Write the files and start the Catalog" '\n' "Press any key to continue" ' ' "By license file" '' "Select \[0\]:" '\n' "Press Enter to open the menu" '\n' "Select:" q)"
+  check "first start in a terminal: installed with Enter only (the license later), then the full menu" '{ [ -f "$D/.env" ] && [ -f "$ST/up" ] && grep -q "The Catalog is installed" <<< "$out" && grep -q "Later: option 25 activates the Catalog." <<< "$out" && grep -q "Next: the full menu" <<< "$out" && grep -q "Type a number - what it does shows here" <<< "$out" && [ ! -e "$D/.setup-later" ]; } || { printf "%s\n" "$out" | tail -n 40 | sed "s/^/  | /"; false; }'
   check "first start in a terminal: the address line on the versions screen, no question after the start" '{ grep -q "The Catalog: http://192.0.2.10:8080" <<< "$out" && ! grep -q "Continue with the catalog data" <<< "$out"; } || { printf "%s\n" "$out" | tail -n 40 | sed "s/^/  | /"; false; }'
+  # a failed license step stays on the screen until a key (the summary clears it); later goes on at once
+  fresh
+  out="$(tty_run "bash $I menu" "Select \[1\]:" '\n' "Domain name \[none\]:" '\n' "Install Nginx Proxy Manager" '\n' "Enter, or a row:" '\n' "Write the files and start the Catalog" '\n' "Press any key to continue" ' ' "By license file" '' "Select \[0\]:" '2\n' "user name \[root\]:" '\n' "Password" 'rootpw\n' "Path of the license file" '/none/1\n' "Select \[0\]:" '2\n' "Path of the license file" '/none/2\n' "Select \[0\]:" '2\n' "Path of the license file" '/none/3\n' "Press any key to continue" ' ' "Press Enter to open the menu" '\n' "Select:" q)"
+  check "license step in a terminal: after three failures the reasons stay until a key, then the summary" '{ sed -n "/Stopped after 3 failed attempts/,/step 9 of 9/p" <<< "$out" | grep -q "Press any key to continue" && grep -q "The Catalog has no data yet: it is not activated" <<< "$out"; } || { printf "%s\n" "$out" | tail -n 40 | sed "s/^/  | /"; false; }'
   out="$(tty_run "bash $I menu" "Select:" q)"
   check "no automatic start in an installed folder" '! grep -q "New installation. A few questions" <<< "$out" && grep -q "Type a number - what it does shows here" <<< "$out"'
   fresh
@@ -1189,7 +1300,8 @@ if command -v script >/dev/null 2>&1 && [ "$(uname -s)" = "Linux" ]; then
   # 80x24 (PuTTY and many SSH clients): the screens of the new installation fit, the summary is not cut
   fresh
   out="$(TTY_SIZE=80x24 tty_run "bash $I menu" "Select \[1\]:" '\n' "Domain name \[none\]:" '\n' "Install Nginx Proxy Manager" '\n' "Enter, or a row:" '\n' "Write the files and start the Catalog" 'n\n' "Press Enter to open the menu" '\n' "Select:" q)"
-  wide="$(sed -n '/step 1 of 7/,/Checking the engine, Compose/p' <<< "$out" | LC_ALL=C grep -v '[^ -~]' | awk 'length($0) > 80')"
+  # (without the warning of a bash started with a locale that is not installed - not a text of the installer)
+  wide="$(sed -n '/step 1 of 9/,/Checking the engine, Compose/p' <<< "$out" | LC_ALL=C grep -v '[^ -~]' | grep -v '^bash: warning: setlocale: ' | awk 'length($0) > 80')"
   check "80 columns: the texts of the new installation fit, the summary is not cut" 'grep -q "Summary" <<< "$out" && ! sed -n "/Summary/,/Folder/p" <<< "$out" | grep -q "~" && [ -z "$wide" ] || { printf "%s\n" "$wide" | head -5; false; }'
 
   touch "$D/.setup-later"
@@ -1219,6 +1331,49 @@ if command -v script >/dev/null 2>&1 && [ "$(uname -s)" = "Linux" ]; then
   installed; rm -f "$D/.env"
   out="$(tui_type "" 132)"
   check "full screen, 132 columns: the cards fit (no cut texts) and name what is missing" 'grep -q "Incomplete: no .env" <<< "$out" && grep -q "put the old .env back first" <<< "$out" && grep -q "you choose: data, images, files" <<< "$out" && ! grep -q "~ " <<< "$(grep -E "Incomplete|choose|old .env" <<< "$out")"'
+
+  # The logo above the menu: 4 rows centred as one block (75 columns wide: 22 columns margin at 120),
+  # CATALOG (from column 48) in bold; only from 80 columns and when the whole menu fits below it
+  installed
+  # the rows as the installer holds them: first the UTF-8 rows, then the ASCII ones
+  mapfile -t LOGO_ALL < <(sed -n '/^  UI_LOGO=($/,/^  )$/p' "$I" | sed -n "s/^    '\(.*\)'$/\1/p")
+  LOGO_U=("${LOGO_ALL[@]:0:4}")
+  LOGO_A=("${LOGO_ALL[@]:4:4}")
+  # the rows the installer takes with LC_ALL=C.UTF-8: the UTF-8 ones only where that locale is installed
+  # (bash then counts a line character as one), else the ASCII ones (CentOS 7 has no C.UTF-8)
+  if [ "$(LC_ALL=C.UTF-8 bash -c 'p="$(printf "\342\224\200")"; printf "%s" "${#p}"' 2>/dev/null)" = 1 ]; then
+    LOGO_C=("${LOGO_U[@]}")
+  else
+    LOGO_C=("${LOGO_A[@]}")
+  fi
+  BOLD=$'\e[1m' NORM=$'\e[0m'
+  # logo_at PAD ROW... -> true when the rows follow each other in $out, each after PAD spaces, then a
+  # blank line and the header of the menu
+  logo_at() {
+    local pad="$1" first i
+    shift
+    first="$(grep -n -m1 -xF -- "$(printf '%*s' "$pad" '')$1" <<< "$out" | cut -d: -f1)"
+    [ -n "$first" ] || return 1
+    for ((i = 1; i <= $#; i++)); do
+      [ "$(sed -n "$((first + i - 1))p" <<< "$out")" = "$(printf '%*s' "$pad" '')${!i}" ] || return 1
+    done
+    [ -z "$(sed -n "$((first + $#))p" <<< "$out")" ] || return 1
+    sed -n "$((first + $# + 1))p" <<< "$out" | grep -q "RAYNET ONE TECHNOLOGY CATALOG\|Raynet One Technology Catalog - Installation Portal"
+  }
+  out="$(TTY_SIZE=120x50 tty_run "LC_ALL=C.UTF-8 bash $I menu" "Select:" q)"
+  check "logo: 120x50 shows the 4 rows centred above the header box" '[ ${#LOGO_ALL[@]} -eq 8 ] && logo_at 22 "${LOGO_C[@]}" || { printf "%s\n" "$out" | head -n 12 | sed "s/^/  | /"; false; }'
+  check "logo: CATALOG in bold, the mark and TECHNOLOGY in normal weight" 'grep -aqF -- "$(printf "%22s" "")${LOGO_C[1]:0:48}$BOLD${LOGO_C[1]:48}$NORM" "$T/tty.log"'
+  check "logo: the whole menu below it (legend and keys)" 'grep -q "Number + Enter runs it" <<< "$out" && grep -q "Type a number - what it does shows here" <<< "$out"'
+  out="$(TTY_SIZE=120x43 tty_run "LC_ALL=C.UTF-8 bash $I menu" "Select:" q)"
+  check "logo: not in a short terminal (120x43), the full menu as before" '! grep -qF -- "${LOGO_U[3]:0:30}" <<< "$out" && grep -q "Number + Enter runs it" <<< "$out"'
+  out="$(TTY_SIZE=79x80 tty_run "LC_ALL=C.UTF-8 bash $I menu" "Select an option:" '0\n')"
+  check "logo: not at 79 columns (plain menu), even with rows enough" '! grep -qF -- "${LOGO_U[3]:0:30}" <<< "$out" && grep -q "Raynet One Technology Catalog - Installation Portal" <<< "$out"'
+  out="$(TTY_SIZE=100x80 tty_run "RVC_UI=plain LC_ALL=C.UTF-8 bash $I menu" "Select an option:" '0\n')"
+  check "logo: the plain menu in a tall terminal (100x80) shows it centred above its header" 'logo_at 12 "${LOGO_C[@]}" || { printf "%s\n" "$out" | head -n 12 | sed "s/^/  | /"; false; }'
+  out="$(TTY_SIZE=100x40 tty_run "RVC_UI=plain LC_ALL=C.UTF-8 bash $I menu" "Select an option:" '0\n')"
+  check "logo: not in the plain menu when it does not fit (100x40)" '! grep -qF -- "${LOGO_U[3]:0:30}" <<< "$out" && grep -q "Raynet One Technology Catalog - Installation Portal" <<< "$out"'
+  out="$(TTY_SIZE=120x50 tty_run "LC_ALL=C bash $I menu" "Select:" q)"
+  check "logo: ASCII in a C locale, centred the same" '[ ${#LOGO_A[@]} -eq 4 ] && logo_at 22 "${LOGO_A[@]}" && ! grep -qF -- "${LOGO_U[1]:48:3}" <<< "$out" || { printf "%s\n" "$out" | head -n 12 | sed "s/^/  | /"; false; }'
 else
   echo "SKIP: script (util-linux) missing - no test of the first start and of the full screen typing hints"
 fi

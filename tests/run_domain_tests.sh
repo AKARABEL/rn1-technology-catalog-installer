@@ -9,6 +9,8 @@ T="$(mktemp -d)/dom"
 rm -rf "$T"; mkdir -p "$T/bin" "$T/dns"
 PASS=0; FAIL=0
 check() { if eval "$2"; then PASS=$((PASS+1)); echo "PASS: $1"; else FAIL=$((FAIL+1)); echo "FAIL: $1"; fi; }
+# the internet check (menu start, new installation, option 16, engine setup) has its own suite (run_network_tests)
+export RN1_NET_CHECK=off
 LE="Let's Encrypt"
 
 # UNH: calls the fakes do not know (checked at the end). NS: the state of the fake Nginx Proxy Manager:
@@ -36,6 +38,7 @@ case "$a" in
   --version) echo "podman version 5.7.0" ;;
   info) ;;
   "info --format {{.Host.Security.Rootless}}") echo false ;;
+  "info --format {{.Host.MemTotal}}") echo "${SHIM_MEMTOTAL:-34359738368}" ;;
   "volume ls -q --filter label=com.docker.compose.project=inst") cat "$NS/volumes" 2>/dev/null ;;
   "volume ls -q --filter label=com.docker.compose.project="*) ;;
   "ps -aq --filter label="*|"ps -a --filter label="*) ;;

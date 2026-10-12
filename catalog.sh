@@ -33,12 +33,35 @@ rn1_mac_brew() {
   command -v brew 2>/dev/null
 }
 
+# The proxy of the settings (option 26) with its login, for the downloads of Homebrew, which passes on only
+# the lower-case variables; a proxy the shell already has stays
+rn1_mac_proxy() {
+  local p l=""
+  if [ -n "${https_proxy:-}" ] || [ ! -r "$0" ]; then
+    return 0
+  fi
+  p="$(sed -n 's/^INTERNET_PROXY="\([^"]*\)"$/\1/p' "$0")"
+  p="${p%%$'\n'*}"
+  if [ -z "$p" ]; then
+    return 0
+  fi
+  # the login only when .proxy_login belongs to this proxy (its line proxy=, when it has one)
+  if [ -r "$(dirname "$0")/.proxy_login" ]; then
+    l="$(tr -d ' \r\t' < "$(dirname "$0")/.proxy_login" | awk -v p="$p" '/^proxy=/ { s = 1; ok = (substr($0, 7) == p); next } $0 != "" && l == "" { l = $0 } END { if (!s || ok) print l }')"
+  fi
+  if [ -n "$l" ]; then
+    p="${p%%://*}://$l@${p#*://}"
+  fi
+  export http_proxy="$p" https_proxy="$p" RN1_PROXY_SET="yes"
+}
+
 rn1_mac_bootstrap() {
   local brew prefix t hb missing="" url="https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh"
   if [ "$(id -u)" = "0" ]; then
     echo "ERROR On macOS run $0 as your normal user, not as root: Homebrew and the Podman machine belong to the user." >&2
     exit 1
   fi
+  rn1_mac_proxy
   brew="$(rn1_mac_brew)" || brew=""
   if [ -z "$brew" ]; then
     echo "==> Homebrew is not installed. The installer needs it: macOS has bash 3.2, and the installer"
@@ -131,6 +154,13 @@ CONTAINER_ENGINE=""
 CATALOG_DOMAIN=""
 NPM_ADMIN_EMAIL=""
 
+# Internet access (option 26): the proxy, e.g. http://proxy.example.com:8080 (its login is not kept here),
+# the internal names reached without it, the root certificate of a network that inspects HTTPS, the PAC file
+INTERNET_PROXY=""
+INTERNET_NO_PROXY=""
+INTERNET_PROXY_CA_FILE=""
+INTERNET_PROXY_PAC=""
+
 # Image Tags
 NGINX_PROXY_MANAGER_TAG="2"
 OPENSEARCH_TAG="2"
@@ -149,6 +179,8 @@ MONGO_INITDB_ROOT_USERNAME="raymaster_rc"
 MONGO_INITDB_DATABASE="raymaster_rc"
 MONGO_AUTH_DATABASE="admin"
 MONGO_PORT_HOST="27017"
+# Cache of MongoDB in GB, e.g. 4 or 2.5; empty: automatic, (memory of the engine - 10 GB) / 2
+MONGO_CACHE_GB=""
 
 # MinIO
 MINIO_ROOT_USER="rvc"
@@ -163,6 +195,9 @@ RABBITMQ_UI_PORT="15672"
 
 # Catalog / App
 CATALOG_WEB_PORT="8080"
+# Host name of catalog-web, which the license is bound to; empty: as in .env, else the one a licensed catalog-web
+# has, else the short name of this server
+CATALOG_HOSTNAME=""
 CATALOG_LICENSE_PATH="/app/license"
 CATALOG_CLOUD_URL="https://rayventorycatalog.raynet.de"
 SYNC_MAX_UPLOAD="32GB"
@@ -214,6 +249,8 @@ if [ "$OS_KIND" = "Darwin" ]; then
 fi
 
 SCRIPT_NAME="$(basename -- "$0")"
+# the folder the installer was called from (main changes to the folder of the installer)
+CALL_DIR="$PWD"
 if [ -f "${BASH_SOURCE[0]:-}" ]; then
   # Resolve symlinks so the files always land next to the real script.
   SCRIPT_PATH="$(readlink -f -- "${BASH_SOURCE[0]}" 2>/dev/null)" || SCRIPT_PATH=""
@@ -422,6 +459,67 @@ host_ip() {
     addr="$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for (i = 1; i < NF; i++) if ($i == "src") { print $(i + 1); exit }}')" || addr=""
   fi
   printf '%s' "${addr:-<server-ip>}"
+}
+
+# True when NAME is another service of the stack: as the host name of catalog-web, that name would point
+# to catalog-web itself inside it
+hostname_taken() {
+  case " nginx-proxy-manager opensearch opensearch-dashboards mongo minio rabbitmq worker-recognition-1 worker-recognition-2 worker-other worker-search " in
+    *" ${1,,} "*) return 0 ;;
+  esac
+  return 1
+}
+
+# True when NAME can be the host name of catalog-web: letters, digits and -, 1 to 63 characters, no dots,
+# not localhost (every machine's name for itself)
+hostname_valid() {
+  local re='^[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?$'
+  [[ "$1" =~ $re ]] && ! hostname_taken "$1" && [ "${1,,}" != "localhost" ]
+}
+
+# The short name of this server in lower case, without the domain (macOS: its local host name), as a
+# host name for catalog-web; the name of a service of the stack gets "catalog-" in front, a server
+# without a name of its own (localhost) gives catalog-web
+server_hostname() {
+  local h=""
+  if [ "$OS_KIND" = "Darwin" ]; then
+    h="$(scutil --get LocalHostName 2>/dev/null)" || h=""
+    if [ -z "$h" ]; then
+      h="$(hostname -s 2>/dev/null)" || h=""
+    fi
+  fi
+  if [ -z "$h" ]; then
+    h="$(uname -n 2>/dev/null)" || h=""
+  fi
+  h="${h%%.*}"
+  h="$(printf '%s' "$h" | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9-' '-' | cut -c1-63 | sed 's/^-*//; s/-*$//')"
+  if [ -z "$h" ] || [ "$h" = "localhost" ]; then
+    h="catalog-web"
+  elif hostname_taken "$h"; then
+    h="catalog-$h"
+  fi
+  printf '%s' "$h"
+}
+
+# The host name of catalog-web in the env file FILE (default: the generated one), without quotes
+env_hostname() {
+  env_unquote "$(env_file_value CATALOG_HOSTNAME "${1:-$ENV_FILE}")"
+}
+
+# The host name catalog-web gets: CATALOG_HOSTNAME, else the one the env file FILE has (the license stays
+# bound to it when the server is renamed), else the short name of this server
+catalog_hostname() {
+  local h="$CATALOG_HOSTNAME"
+  if [ -z "$h" ] && [ -n "${1:-}" ] && [ -f "$1" ]; then
+    h="$(env_hostname "$1")"
+    if ! hostname_valid "$h"; then
+      h=""
+    fi
+  fi
+  if [ -z "$h" ]; then
+    h="$(server_hostname)"
+  fi
+  printf '%s' "$h"
 }
 
 count_lines() {
@@ -1251,17 +1349,41 @@ docker_service_plan() {
   echo "systemctl enable --now docker"
 }
 
-# run_plan "STEP" ... -> runs each step as root (sudo when needed), stops at the first failure
+# run_plan "STEP" ... -> runs each step as root (sudo when needed), stops at the first failure. With a proxy
+# in this run each step reads it first (proxy_run_begin); the step shown stays as it is.
 run_plan() {
-  local step n=0
+  local step n=0 rc=0 traps="" stopped=""
+  if [[ "$*" == *zypper* ]]; then
+    net_zypper_note
+  fi
+  proxy_run_begin || return 1
+  if proxy_run_active; then
+    traps="$(trap -p INT TERM HUP)"
+    trap 'stopped="yes"' INT TERM HUP
+  fi
   for step in "$@"; do
     n=$((n + 1))
     info "Step $n of $#: $step"
-    if ! ${SUDO[@]+"${SUDO[@]}"} sh -c "$step"; then
-      err "Step $n failed (see above)."
-      return 1
+    if ! ${SUDO[@]+"${SUDO[@]}"} sh -c "$(proxy_run_step "$step")"; then
+      rc=1
+      if [ -n "$stopped" ]; then
+        rc=130
+      else
+        err "Step $n failed (see above)."
+      fi
+      break
+    fi
+    if [ -n "$stopped" ]; then
+      rc=130
+      break
     fi
   done
+  if proxy_run_active; then
+    proxy_run_end
+    trap - INT TERM HUP
+    eval "$traps"
+  fi
+  return "$rc"
 }
 
 # The tag of the newest Docker Compose release (v5.6.0), from the redirect of GitHub's latest-release page
@@ -1331,9 +1453,10 @@ install_compose_provider() {
     err "Cannot write to ${COMPOSE_PROVIDER%/*}."
     return 1
   fi
-  if ! ${SUDO[@]+"${SUDO[@]}"} curl -fsSL --proto '=https' --max-time 600 -o "$tmp" "$url"; then
+  if ! proxy_sudo curl -fsSL --proto '=https' --max-time 600 -o "$tmp" "$url"; then
     ${SUDO[@]+"${SUDO[@]}"} rm -f -- "$tmp"
     err "The download failed: $url"
+    net_offer_check "The download of Docker Compose"
     return 1
   fi
   exp="$(curl -fsSL --proto '=https' --max-time 30 "$url.sha256" 2>/dev/null)" || exp=""
@@ -1384,7 +1507,7 @@ install_compose_provider() {
 
 # install_podman_linux ask|yes -> Podman with its socket and restart service on this Linux
 install_podman_linux() {
-  local mode="$1" plan="" v="" rc=0
+  local mode="$1" plan="" v="" rc=0 proxy="no" was="no"
   local -a steps=()
   if [ "$(engine_arch)" != "amd64" ]; then
     err "The Catalog images exist only for amd64 (x86_64); this machine is $(uname -m 2>/dev/null)."
@@ -1408,15 +1531,33 @@ install_podman_linux() {
     fi
     mapfile -t steps <<< "$plan"
   fi
+  if net_engine_plan podman >/dev/null; then
+    proxy="yes"
+    steps+=("systemctl daemon-reload")
+  fi
   mapfile -t -O "${#steps[@]}" steps < <(podman_service_plan)
   echo
   info "Podman $(if [ -n "$plan" ]; then printf 'will be installed from the packages of %s, then its' "$(os_release PRETTY_NAME)"; else printf '%s is installed; its' "$(engine_version)"; fi) API socket and restart service will be enabled:"
   printf '      %s\n' "${steps[@]}"
+  if [ "$proxy" = "yes" ]; then
+    net_engine_plan podman || true
+  fi
   if [ "$mode" = "ask" ] && ! confirm "Run these commands${SUDO[*]:+ with sudo}?" y; then
     info "Podman was not set up."
     return 1
   fi
+  if [ "$proxy" = "yes" ]; then
+    if systemctl is-active --quiet podman.service 2>/dev/null; then
+      was="yes"
+    fi
+    net_engine_write "$mode" podman || return 1
+  fi
   run_plan "${steps[@]}" || return 1
+  # a Podman service that was not running starts with the proxy files already
+  if [ "$was" = "no" ]; then
+    NET_ENGINE_CHANGED="${NET_ENGINE_CHANGED// podman/}"
+  fi
+  net_engine_restart "$mode" podman || true
   COMPOSE=()
   ok "Podman $(engine_version) is ready (rootful, API socket on, containers restart after a reboot)."
 }
@@ -1424,7 +1565,7 @@ install_podman_linux() {
 # install_docker_linux ask|yes -> Docker Engine with its service on this Linux (from Docker's repository;
 # openSUSE and SLES: their packages). A Docker that is there already only gets its service enabled.
 install_docker_linux() {
-  local mode="$1" plan="" rc=0 from
+  local mode="$1" plan="" rc=0 from proxy="no" was="no"
   local -a steps=()
   if [ "$(engine_arch)" != "amd64" ]; then
     err "The Catalog images exist only for amd64 (x86_64); this machine is $(uname -m 2>/dev/null)."
@@ -1446,6 +1587,10 @@ install_docker_linux() {
     fi
     mapfile -t steps <<< "$plan"
   fi
+  if net_engine_plan docker >/dev/null; then
+    proxy="yes"
+    steps+=("systemctl daemon-reload")
+  fi
   mapfile -t -O "${#steps[@]}" steps < <(docker_service_plan)
   from="the packages of $(os_release PRETTY_NAME)"
   if [[ "$plan" == *download.docker.com* ]]; then
@@ -1457,11 +1602,25 @@ install_docker_linux() {
   if [[ "$plan" == *" remove -y "* ]]; then
     echo "  The remove step takes out the packages that conflict with Docker's (named in it)."
   fi
+  if [ "$proxy" = "yes" ]; then
+    net_engine_plan docker || true
+  fi
   if [ "$mode" = "ask" ] && ! confirm "Run these commands${SUDO[*]:+ with sudo}?" y; then
     info "Docker was not set up."
     return 1
   fi
+  if [ "$proxy" = "yes" ]; then
+    if systemctl is-active --quiet docker 2>/dev/null; then
+      was="yes"
+    fi
+    net_engine_write "$mode" docker || return 1
+  fi
   run_plan "${steps[@]}" || return 1
+  # a Docker that was not running started with the proxy files already
+  if [ "$was" = "no" ]; then
+    NET_ENGINE_CHANGED="${NET_ENGINE_CHANGED// docker/}"
+  fi
+  net_engine_restart "$mode" docker || true
   COMPOSE=()
   ok "Docker $(engine_version) is ready (daemon on, the containers restart after a reboot)."
 }
@@ -1516,25 +1675,34 @@ mac_agent() {
   <key>Label</key><string>de.raynet.rn1-podman-machine</string>
   <key>ProgramArguments</key><array><string>$(command -v podman)</string><string>machine</string><string>start</string><string>$1</string></array>
   <key>RunAtLoad</key><true/>
-  <key>AbandonProcessGroup</key><true/>
+  <key>AbandonProcessGroup</key><true/>$(net_plist_env)
 </dict>
 </plist>
 EOF
 }
 
-# mac_vm_size -> "CPUS MEMORY-MB" of the Linux VM for the Catalog: up to 6 CPUs, 12 GB of memory on a Mac
-# with 24 GB or more, else 8 GB
+# mac_vm_size -> "CPUS MEMORY-MB" of the Linux VM for the Catalog: up to 6 CPUs; MEM_RECOMMENDED_GB of memory
+# when the Mac keeps 8 GB for itself, else all but 8 GB (at least 8 GB). macOS gives the VM memory only as it
+# uses it.
 mac_vm_size() {
-  local ram cpus mem=8192
+  local ram cpus mem
   ram="$(sysctl -n hw.memsize 2>/dev/null)" || ram=0
   cpus="$(sysctl -n hw.ncpu 2>/dev/null)" || cpus=4
   if [ "$cpus" -gt 6 ]; then
     cpus=6
   fi
-  if [ "$ram" -ge $((24 * 1024 * 1024 * 1024)) ]; then
-    mem=12288
-  elif [ "$ram" -lt $((16 * 1024 * 1024 * 1024)) ]; then
-    warn "This Mac has less than 16 GB of memory; the Catalog needs about 8 GB in its Linux VM."
+  mem=$(((ram / 1073741824 - 8) * 1024))
+  if [ "$mem" -ge $((MEM_RECOMMENDED_GB * 1024)) ]; then
+    mem=$((MEM_RECOMMENDED_GB * 1024))
+  else
+    if [ "$mem" -lt 8192 ]; then
+      mem=8192
+    fi
+    if [ "$ram" -lt $((16 * 1024 * 1024 * 1024)) ]; then
+      warn "This Mac has less than 16 GB of memory; the Catalog needs about 8 GB in its Linux VM."
+    fi
+    warn "The Linux VM gets $((mem / 1024)) GB of memory; at least $MEM_RECOMMENDED_GB GB is recommended"
+    echo "  (a Mac with $((MEM_RECOMMENDED_GB + 8)) GB or more)." >&2
   fi
   printf '%s %s' "$cpus" "$mem"
 }
@@ -1635,8 +1803,9 @@ mac_prepare() {
     fi
     mem="$(podman machine inspect --format '{{.Resources.Memory}}' "$name" 2>/dev/null)" || mem=0
     if [[ "${mem%%$'\n'*}" =~ ^[0-9]+$ ]] && [ "${mem%%$'\n'*}" -lt 8192 ]; then
-      warn "The Podman machine has ${mem%%$'\n'*} MB of memory; the Catalog needs 8192 MB. A bigger machine means a new one"
-      echo "      (its containers and data are lost): podman machine rm $name, then start $SCRIPT_NAME again."
+      warn "The Podman machine has ${mem%%$'\n'*} MB of memory; the Catalog needs 8192 MB."
+      echo "  $MEM_RECOMMENDED_GB GB is recommended; the machine gets more memory while it is stopped:"
+      mem_vm_cmds podman "$name"
     fi
   fi
   if ! mac_rosetta_on "$name"; then
@@ -1666,14 +1835,14 @@ mac_prepare() {
     echo "  when you log in; the Catalog then comes back by itself ($MAC_AGENT)."
     if [ "$mode" = "yes" ] || confirm "Add the LaunchAgent?" y; then
       mkdir -p "${MAC_AGENT%/*}"
-      mac_agent "$name" > "$MAC_AGENT"
+      mac_agent "$name" | net_private_write "$MAC_AGENT"
       launchctl load -w "$MAC_AGENT" >/dev/null 2>&1 || true
       ok "LaunchAgent added: the Podman machine starts when you log in."
     fi
   elif [ "$(mac_agent "$name")" != "$(cat "$MAC_AGENT" 2>/dev/null)" ]; then
     # an older LaunchAgent, or one for another machine or Podman: brought up to date
     launchctl unload "$MAC_AGENT" >/dev/null 2>&1 || true
-    mac_agent "$name" > "$MAC_AGENT"
+    mac_agent "$name" | net_private_write "$MAC_AGENT"
     launchctl load -w "$MAC_AGENT" >/dev/null 2>&1 || true
     ok "LaunchAgent updated: it starts the Podman machine $name when you log in."
   fi
@@ -1948,6 +2117,7 @@ mac_colima() {
     colima ssh -- sudo sysctl -w vm.max_map_count=262144 >/dev/null 2>&1 || true
   fi
   mac_colima_provision
+  net_colima_apply "$mode" y
   if [ "$(brew services list 2>/dev/null | awk '$1 == "colima" { print $2 }')" != "started" ]; then
     info "Colima does not start by itself after a restart of the Mac. Homebrew can start it when you log in"
     echo "  (brew services start colima); the Catalog then comes back by itself."
@@ -1983,6 +2153,10 @@ engine_offer() {
 engine_setup() {
   local mode="${1:-ask}"
   engine_guard || return 1
+  # the sites the setup downloads from: only those that cannot be reached are named
+  if ! net_engine_check && [ "$mode" = "ask" ] && ! confirm "Set up $ENGINE_NAME anyway?" n; then
+    return 1
+  fi
   case "$ENGINE_KIND" in
     podman) podman_setup "$mode" || return 1 ;;
     *) docker_setup "$mode" || return 1 ;;
@@ -2194,6 +2368,12 @@ project_volumes() {
   "$ENGINE" volume ls -q --filter "label=com.docker.compose.project=$(stack_project)" 2>/dev/null || true
 }
 
+# False when the engine is installed but does not answer (the Podman machine, Colima, Docker Desktop or
+# the daemon not started); true when it answers or is not installed (it holds no container then)
+engine_answers() {
+  ! engine_cli || "$ENGINE" volume ls -q --filter "label=com.docker.compose.project=$(stack_project)" >/dev/null 2>&1
+}
+
 # True when the generated files differ from what the current settings would
 # produce (settings changed after generating, or the files were edited by hand).
 settings_stale() {
@@ -2207,16 +2387,509 @@ settings_stale() {
     for var in MONGO_INITDB_ROOT_PASSWORD MINIO_ROOT_PASSWORD RABBITMQ_DEFAULT_PASS NPM_ADMIN_PASSWORD; do
       printf -v "$var" '%s' "$(env_value "$var")"
     done
+    CATALOG_HOSTNAME="$(catalog_hostname "$ENV_FILE")"
+    MONGO_WT_CACHE_GB="$(mongo_cache_written)"
     ENV_FILE="$tmp_env"
     COMPOSE_FILE="$tmp_compose"
     write_env_file
     write_compose_file
   )
+  # a .env without the cache of MongoDB gets it at the start (mongo_cache_refresh)
+  if ! grep -q '^MONGO_WT_CACHE_GB=' "$ENV_FILE"; then
+    sed -i '/^MONGO_WT_CACHE_GB=/d' "$tmp_env"
+  fi
   if [ "$(cat "$tmp_env")" != "$(cat "$ENV_FILE")" ] || [ "$(cat "$tmp_compose")" != "$(cat "$COMPOSE_FILE")" ]; then
     rc=0
   fi
   rm -f "$tmp_env" "$tmp_compose"
   return "$rc"
+}
+
+###############################################################################
+# Memory
+###############################################################################
+
+# The cache of MongoDB in .env (MONGO_WT_CACHE_GB): MONGO_CACHE_GB, else automatic from the memory of the engine
+MONGO_WT_CACHE_GB=""
+# "yes" while an import runs again after an out-of-memory stop: the memory was asked about already
+MEM_ASKED=""
+ERREXIT_RC=0
+# Seconds the engine has to answer again after a restart of its VM (brew services starts Colima in the background)
+MEM_ENGINE_WAIT=180
+
+# Memory the containers can use, in MB: the engine's (on macOS its Linux VM), else MemTotal of this server on
+# Linux; empty when unknown
+engine_mem_mb() {
+  local b=""
+  if engine_cli; then
+    if [ "$ENGINE" = "docker" ]; then
+      b="$(docker info --format '{{.MemTotal}}' 2>/dev/null)" || b=""
+    else
+      b="$(podman info --format '{{.Host.MemTotal}}' 2>/dev/null)" || b=""
+    fi
+    b="${b%%$'\n'*}"
+  fi
+  if [[ "$b" =~ ^[1-9][0-9]*$ ]]; then
+    printf '%s' "$((b / 1048576))"
+  elif [ "$OS_KIND" != "Darwin" ]; then
+    b="$(awk '$1 == "MemTotal:" { print $2; exit }' /proc/meminfo 2>/dev/null)" || b=""
+    if [[ "$b" =~ ^[1-9][0-9]*$ ]]; then
+      printf '%s' "$((b / 1024))"
+    fi
+  fi
+}
+
+# mem_gb MB -> whole GB, as the VM or the server was given them (a VM of 14 GB shows 13928 MB: its kernel keeps some)
+mem_gb() {
+  printf '%s' "$((($1 + 1023) / 1024))"
+}
+
+# mem_low MB -> true below MEM_RECOMMENDED_GB; 92 % of it counts as enough (the kernel keeps some)
+mem_low() {
+  [ $(($1 * 100)) -lt $((MEM_RECOMMENDED_GB * 1024 * 92)) ]
+}
+
+# mongo_cache_valid VALUE -> true for a cache size of MongoDB: GB with up to two decimals, at least 0.25
+mongo_cache_valid() {
+  local f
+  if ! [[ "$1" =~ ^(0|[1-9][0-9]{0,3})(\.([0-9]{1,2}))?$ ]]; then
+    return 1
+  fi
+  f="${BASH_REMATCH[3]}00"
+  [ $((BASH_REMATCH[1] * 100 + 10#${f:0:2})) -ge 25 ]
+}
+
+# mongo_cache_gb [MB] -> the cache of MongoDB in GB: MONGO_CACHE_GB, else (memory of the engine - 10 GB) / 2, at
+# least 1 - about 10 GB stay for catalog-web, the workers, OpenSearch, RabbitMQ and MinIO (14 GB: 2, 24 GB: 7,
+# 32 GB: 11). Empty when it is automatic and the memory is unknown.
+mongo_cache_gb() {
+  local mb h
+  if [ -n "${MONGO_CACHE_GB:-}" ]; then
+    printf '%s' "$MONGO_CACHE_GB"
+    return 0
+  fi
+  if [ $# -gt 0 ]; then
+    mb="$1"
+  else
+    mb="$(engine_mem_mb)"
+  fi
+  if [ -z "$mb" ]; then
+    return 0
+  fi
+  h=$(($(mem_gb "$mb") - 10))
+  if [ "$h" -lt 2 ]; then
+    printf '1'
+  elif [ $((h % 2)) -eq 0 ]; then
+    printf '%s' "$((h / 2))"
+  else
+    printf '%s.5' "$((h / 2))"
+  fi
+}
+
+# The cache of MongoDB that .env has for the current settings, without asking the engine: MONGO_CACHE_GB, else
+# the automatic value in .env (it is written again at every start)
+mongo_cache_written() {
+  if [ -n "${MONGO_CACHE_GB:-}" ]; then
+    printf '%s' "$MONGO_CACHE_GB"
+  else
+    env_value MONGO_WT_CACHE_GB
+  fi
+}
+
+# Before a start: the cache of MongoDB in .env for the memory the engine has now (a VM that got more memory gives
+# MongoDB more). Compose creates only mongo again when it changed.
+mongo_cache_refresh() {
+  local want have
+  if [ ! -f "$ENV_FILE" ] || ! grep -q 'wiredTigerCacheSizeGB' "$COMPOSE_FILE" 2>/dev/null; then
+    return 0
+  fi
+  want="$(mongo_cache_gb)"
+  have="$(env_value MONGO_WT_CACHE_GB)"
+  if [ -z "$want" ] || ! mongo_cache_valid "$want" || { [ "$want" = "$have" ] && grep -q '^MONGO_WT_CACHE_GB=' "$ENV_FILE"; }; then
+    return 0
+  fi
+  if grep -q '^MONGO_WT_CACHE_GB=' "$ENV_FILE"; then
+    sed -i "s/^MONGO_WT_CACHE_GB=.*/MONGO_WT_CACHE_GB=$want/" "$ENV_FILE"
+  elif grep -q '^MONGO_PORT_HOST=' "$ENV_FILE"; then
+    sed -i "/^MONGO_PORT_HOST=/a MONGO_WT_CACHE_GB=$want" "$ENV_FILE"
+  else
+    printf '\nMONGO_WT_CACHE_GB=%s\n' "$want" >> "$ENV_FILE"
+  fi
+  info "MongoDB gets a cache of $want GB${have:+ (was $have GB)}$(if [ -z "${MONGO_CACHE_GB:-}" ]; then printf ' for the memory of %s' "$ENGINE_NAME"; fi)."
+}
+
+# A note when the files of this installation do not limit the cache of MongoDB yet (an older installer wrote them)
+mongo_cache_note() {
+  if [ -f "$COMPOSE_FILE" ] && ! grep -q 'wiredTigerCacheSizeGB' "$COMPOSE_FILE"; then
+    echo "  $COMPOSE_FILE does not limit the cache of MongoDB yet, which takes"
+    echo "  about half of the memory: $(hint 2 generate) writes the files again."
+  fi
+}
+
+# CPUs of the Colima VM (its colima.yaml), else those a new VM gets
+mac_colima_cpus() {
+  local c
+  c="$(sed -n 's/^cpu:[[:space:]]*\([0-9][0-9]*\).*/\1/p' "$(mac_colima_yaml)" 2>/dev/null | head -n 1)" || c=""
+  if [ -z "$c" ]; then
+    read -r c _ <<< "$(mac_vm_size 2>/dev/null)"
+  fi
+  printf '%s' "$c"
+}
+
+# True when brew services has Colima: its colima start -f starts the VM at login. While the VM runs, a new
+# colima start -f ends at once and launchd starts it again, so a colima stop does not last.
+mac_colima_service() {
+  local s
+  s="$(brew services list 2>/dev/null | awk '$1 == "colima" { print $2 }')" || s=""
+  [ -n "$s" ] && [ "$s" != "none" ]
+}
+
+# mem_vm_cmds podman|colima [MACHINE] -> the commands that give the Linux VM on macOS MEM_RECOMMENDED_GB GB: the
+# Podman machine while it is stopped; Colima through colima.yaml when brew services starts it
+mem_vm_cmds() {
+  if [ "$1" = "colima" ]; then
+    if mac_colima_service; then
+      echo "      brew services stop colima; colima stop"
+      echo "      memory: $MEM_RECOMMENDED_GB in $(mac_colima_yaml)"
+      echo "      brew services start colima"
+    else
+      echo "      colima stop && colima start --cpu $(mac_colima_cpus) --memory $MEM_RECOMMENDED_GB"
+    fi
+  else
+    echo "      podman machine stop ${2:-}"
+    echo "      podman machine set --memory $((MEM_RECOMMENDED_GB * 1024)) ${2:-}"
+    echo "      podman machine start ${2:-}"
+  fi
+}
+
+# How the containers get more memory: the Linux VM on macOS (macOS gives it memory only as it uses it), the
+# server itself on Linux
+mem_hint() {
+  case "$OS_KIND:$ENGINE_KIND" in
+    Darwin:podman)
+      echo "  More memory for the Podman machine (macOS gives it only what it uses):"
+      mem_vm_cmds podman "$(mac_machine)"
+      ;;
+    Darwin:colima)
+      echo "  More memory for the Colima VM (macOS gives it only what it uses):"
+      mem_vm_cmds colima
+      ;;
+    Darwin:*) echo "  Docker Desktop: Settings > Resources > Memory - $MEM_RECOMMENDED_GB GB, then Apply & restart." ;;
+    *)
+      echo "  The memory of this server has to be raised by whoever runs it"
+      echo "  (VM settings or hardware); MONGO_CACHE_GB (option 1) lowers MongoDB's part."
+      ;;
+  esac
+}
+
+# mem_oom_stops [SINCE] -> the containers of this stack the kernel stopped for lack of memory. Podman keeps
+# OOMKilled when the restart policy starts the container again (only a new container clears it): SERVICE|RESTARTS,
+# a new stop shows as more restarts. Docker clears it at that start: the SERVICE of each oom event since SINCE
+# (seconds; else the last 24 hours - the daemon keeps only its last 256 events).
+mem_oom_stops() {
+  local ids
+  if ! engine_cli; then
+    return 0
+  fi
+  ids="$("$ENGINE" ps -aq --filter "label=com.docker.compose.project=$(stack_project)" 2>/dev/null)" || ids=""
+  if [ -z "$ids" ]; then
+    return 0
+  fi
+  if [ "$ENGINE" = "docker" ]; then
+    docker events --since "${1:-24h}" --until "$(date +%s)" --filter type=container --filter event=oom \
+      --filter "label=com.docker.compose.project=$(stack_project)" \
+      --format '{{index .Actor.Attributes "com.docker.compose.service"}}' 2>/dev/null || true
+  else
+    # shellcheck disable=SC2086
+    "$ENGINE" container inspect --format '{{.State.OOMKilled}}|{{index .Config.Labels "com.docker.compose.service"}}|{{.RestartCount}}' $ids 2>/dev/null | sed -n 's/^true|//p' || true
+  fi
+}
+
+# Before an import: what mem_oom_report counts from - with Podman the stops so far, with Docker the time (@SECONDS)
+mem_oom_marks() {
+  if [ "$ENGINE" = "docker" ]; then
+    printf '@%s\n' "$(date +%s)"
+  else
+    mem_oom_stops
+  fi
+}
+
+# mem_oom_report [MARKS] -> names the containers of this stack the kernel stopped for lack of memory - only those
+# since MARKS (mem_oom_marks of before) - and how the engine gets more; fails when there is none
+mem_oom_report() {
+  local marks="${1:-}" since="" line svc found="" mb
+  if [[ "$marks" == @* ]]; then
+    since="${marks#@}"
+  fi
+  while IFS= read -r line; do
+    if [ -n "$line" ] && ! grep -qxF -- "$line" <<< "$marks" && [[ " $found " != *" ${line%%|*} "* ]]; then
+      found="$found ${line%%|*}"
+    fi
+  done <<< "$(mem_oom_stops "$since")"
+  if [ -z "$found" ]; then
+    return 1
+  fi
+  for svc in $found; do
+    case "$svc" in
+      mongo) svc="MongoDB" ;;
+      opensearch) svc="OpenSearch" ;;
+      rabbitmq) svc="RabbitMQ" ;;
+      minio) svc="MinIO" ;;
+    esac
+    warn "$svc was stopped by the kernel: out of memory."
+  done
+  mb="$(engine_mem_mb)"
+  if [ -n "$mb" ] && ! mem_low "$mb"; then
+    echo "  The engine has $(mem_gb "$mb") GB of memory."
+    echo "  MONGO_CACHE_GB (option 1) lowers the part MongoDB takes."
+  else
+    if [ -n "$mb" ]; then
+      echo "  The engine has $(mem_gb "$mb") GB of memory; at least $MEM_RECOMMENDED_GB GB is recommended."
+    else
+      echo "  At least $MEM_RECOMMENDED_GB GB of memory is recommended."
+    fi
+    mem_hint
+  fi
+  mongo_cache_note
+}
+
+# Waits until the engine answers again after a restart of its VM (at most MEM_ENGINE_WAIT seconds)
+mem_wait_engine() {
+  local start="$SECONDS"
+  until "$ENGINE" info >/dev/null 2>&1; do
+    if [ $((SECONDS - start)) -ge "$MEM_ENGINE_WAIT" ]; then
+      return 1
+    fi
+    sleep 2
+  done
+}
+
+# After a start of the Podman machine: waits (at most 2 minutes) while its podman-restart.service still starts the
+# containers of before - Compose would otherwise create mongo again in the middle of it
+mac_restart_wait() {
+  local start="$SECONDS" s
+  while true; do
+    s="$(podman machine ssh "$1" systemctl is-active podman-restart.service 2>/dev/null)" || true
+    if [ "${s//[^a-z]/}" != "activating" ] || [ $((SECONDS - start)) -ge 120 ]; then
+      return 0
+    fi
+    sleep 2
+  done
+}
+
+# mem_raise wizard|confirm -> on macOS after a yes: MEM_RECOMMENDED_GB GB for the Podman machine or the Colima VM,
+# when the Mac keeps 8 GB for itself (the VM restarts; a running Catalog is started again and waited for); with
+# Docker Desktop where it is set. 0: raised, 1: not raised, 2: stopped (0 in the wizard), 3: the VM or the
+# Catalog does not run cleanly again (yet)
+mem_raise() {
+  local how="$1" ram what q ans=0 rc=0 m="" running="" mb yaml
+  if [ "$OS_KIND" != "Darwin" ]; then
+    return 1
+  fi
+  if [ "$ENGINE_KIND" = "docker" ]; then
+    mem_hint
+    return 1
+  fi
+  ram="$(sysctl -n hw.memsize 2>/dev/null)" || ram=""
+  ram="${ram//[^0-9]/}"
+  if [ "${ram:-0}" -lt $(((MEM_RECOMMENDED_GB + 8) * 1073741824)) ]; then
+    echo "  This Mac has $((${ram:-0} / 1073741824)) GB: not enough to give the containers $MEM_RECOMMENDED_GB GB"
+    echo "  and keep 8 GB for macOS."
+    return 1
+  fi
+  what="Podman machine"
+  if [ "$ENGINE_KIND" = "colima" ]; then
+    what="Colima VM"
+  fi
+  if [ -n "$(job_running_ids)" ]; then
+    echo "  A job is running (J): the $what gets more memory with a restart,"
+    echo "  when the job is done."
+    return 1
+  fi
+  if [ -f "$ENV_FILE" ] && [ -f "$COMPOSE_FILE" ] && detect_compose >/dev/null 2>&1 && [ -n "$(compose ps -q catalog-web 2>/dev/null)" ]; then
+    running="yes"
+  fi
+  echo "  macOS gives the $what memory only as it uses it."
+  echo "  The ${what##* } restarts (about a minute)${running:+, and the Catalog with it}."
+  q="Give the $what $MEM_RECOMMENDED_GB GB now?"
+  if [ "$how" = "wizard" ]; then
+    wiz_yes_no "$q" y || ans=$?
+  else
+    confirm "$q" y || ans=1
+  fi
+  if [ "$ans" -ne 0 ]; then
+    return "$ans"
+  fi
+  info "The $what restarts with $MEM_RECOMMENDED_GB GB:"
+  if [ "$ENGINE_KIND" = "colima" ]; then
+    mem_vm_cmds colima
+    if mac_colima_service; then
+      # the colima start -f of brew services would start the VM again with its old memory: the memory goes into
+      # colima.yaml, and brew services starts the VM with it
+      brew services stop colima >/dev/null 2>&1 || true
+      if colima status >/dev/null 2>&1 && ! colima stop; then
+        err "Colima did not stop - its memory stays as it is."
+        brew services start colima >/dev/null 2>&1 || true
+        return 1
+      fi
+      yaml="$(mac_colima_yaml)"
+      if grep -q '^memory:' "$yaml" 2>/dev/null; then
+        sed -i "s/^memory:.*/memory: $MEM_RECOMMENDED_GB/" "$yaml"
+      else
+        printf 'memory: %s\n' "$MEM_RECOMMENDED_GB" >> "$yaml"
+      fi
+      if ! brew services start colima >/dev/null; then
+        err "Colima did not start again - start it: brew services start colima"
+        return 3
+      fi
+    else
+      m="$(mac_colima_cpus)"
+      if ! colima stop; then
+        err "Colima did not stop - its memory stays as it is."
+        return 1
+      fi
+      if ! colima start --cpu "$m" --memory "$MEM_RECOMMENDED_GB"; then
+        err "Colima did not start again with $MEM_RECOMMENDED_GB GB (see above) - start it: colima start"
+        return 3
+      fi
+    fi
+    mac_docker_pin
+  else
+    m="$(mac_machine)"
+    mem_vm_cmds podman "$m"
+    if ! podman machine stop "$m"; then
+      err "The Podman machine did not stop - its memory stays as it is."
+      return 1
+    fi
+    podman machine set --memory "$((MEM_RECOMMENDED_GB * 1024))" "$m" || ans=1
+    if ! podman machine start "$m"; then
+      err "The Podman machine did not start again - start it:"
+      echo "      podman machine start $m"
+      return 3
+    fi
+  fi
+  if ! mem_wait_engine; then
+    err "$ENGINE_NAME does not answer after the restart:"
+    echo "  $(engine_down_hint)."
+    return 3
+  fi
+  if [ "$ENGINE_KIND" = "podman" ]; then
+    mac_restart_wait "$m"
+  fi
+  if [ "$ans" -ne 0 ]; then
+    err "The memory of the Podman machine could not be changed (see above)."
+  else
+    mb="$(engine_mem_mb)"
+    if [ -n "$mb" ] && mem_low "$mb"; then
+      warn "The $what still has $(mem_gb "$mb") GB of memory."
+    elif [ -n "$mb" ]; then
+      ok "The $what has $(mem_gb "$mb") GB of memory now."
+    fi
+  fi
+  if [ -n "$running" ]; then
+    run_job "Start the Catalog again" -- install_start || rc=$?
+    if [ "$rc" -ne 0 ]; then
+      warn "The Catalog does not run cleanly again yet."
+      if [ "$rc" -eq 3 ]; then
+        echo "  Its start goes on in the background (J)."
+      fi
+      return 3
+    fi
+  fi
+  [ "$ans" -eq 0 ]
+}
+
+# mem_ask wizard|confirm [import] -> below MEM_RECOMMENDED_GB: says so (before an import also when the files do
+# not limit the cache of MongoDB yet), offers more memory for the Linux VM on macOS, then asks whether to go on
+# with less. 0: go on, 1: no, 2: stopped (0 or the end of input in the wizard). Outside the menu without a
+# terminal only the warning, then on.
+mem_ask() {
+  local how="$1" mb rc=0
+  if [ "$MEM_ASKED" = "yes" ]; then
+    return 0
+  fi
+  mb="$(engine_mem_mb)"
+  if [ -z "$mb" ] || ! mem_low "$mb"; then
+    return 0
+  fi
+  warn "This engine has $(mem_gb "$mb") GB of memory; at least $MEM_RECOMMENDED_GB GB is recommended."
+  if [ "${2:-}" = "import" ]; then
+    mongo_cache_note
+  fi
+  if [ "$INTERACTIVE" != "true" ] && [ ! -t 0 ]; then
+    return 0
+  fi
+  mem_raise "$how" || rc=$?
+  case "$rc" in
+    0)
+      mb="$(engine_mem_mb)"
+      if [ -z "$mb" ] || ! mem_low "$mb"; then
+        return 0
+      fi
+      ;;
+    2) return 2 ;;
+    3) return 1 ;;
+  esac
+  if [ "$how" = "wizard" ]; then
+    rc=0
+    wiz_yes_no "Continue with $(mem_gb "$mb") GB anyway?" n || rc=$?
+    return "$rc"
+  fi
+  confirm "Continue with $(mem_gb "$mb") GB anyway?" n
+}
+
+# mem_import_again RC JOB MARKS file|chain|daily -> after an import that failed (RC; JOB yes: it ran as a job,
+# whose log names the reason) because the kernel stopped a container for lack of memory (since MARKS, see
+# mem_oom_marks): the reason, more memory for the VM on macOS, then whether to import the file or the chain
+# again - a daily snapshot builds on the data before, it is not offered again. True when it should run again.
+mem_import_again() {
+  local rc="$1" job="$2" marks="$3" what="$4" mb ans=0
+  if [ "$rc" -eq 0 ] || [ "$rc" -eq 3 ]; then
+    return 1
+  fi
+  if [ "$job" = "yes" ]; then
+    mem_oom_report "$marks" >/dev/null 2>&1 || return 1
+  else
+    mem_oom_report "$marks" || return 1
+  fi
+  if [ "$INTERACTIVE" != "true" ] && [ ! -t 0 ]; then
+    return 1
+  fi
+  echo
+  mb="$(engine_mem_mb)"
+  # Docker Desktop: mem_oom_report named where its memory is set
+  if [ -n "$mb" ] && mem_low "$mb" && [ "$ENGINE_KIND" != "docker" ]; then
+    mem_raise confirm || ans=$?
+    if [ "$ans" -eq 3 ]; then
+      return 1
+    fi
+  fi
+  case "$what" in
+    daily)
+      echo "  A daily snapshot builds on the day before: import again from a full snapshot"
+      echo "  on (option 19, a chain from option 17)."
+      return 1
+      ;;
+    chain) what="the chain" ;;
+    *) what="the same file" ;;
+  esac
+  echo "  A snapshot import replaces the data, so the half import does no harm."
+  confirm "Import $what again?" y
+}
+
+# errexit_rc FUNCTION ARGS... -> ERREXIT_RC: the exit code of FUNCTION, which runs in a subshell with errexit as
+# here (called left of || or in an if, a function runs without errexit)
+errexit_rc() {
+  ERREXIT_RC=0
+  case "$-" in
+    *e*)
+      set +e
+      ( set -e; "$@" )
+      ERREXIT_RC=$?
+      set -e
+      ;;
+    *) "$@" || ERREXIT_RC=$? ;;
+  esac
 }
 
 ###############################################################################
@@ -2531,7 +3204,7 @@ select_version() {
   info "Reading the available versions from Docker Hub..."
   if ! fetch_hub_versions; then
     err "Could not read the versions from Docker Hub (no internet access, a proxy is needed, or the images are not on Docker Hub)."
-    echo "CATALOG_VERSION can still be changed by hand with option 1."
+    echo "CATALOG_VERSION can still be changed by hand with option 1; $(hint 26 network-check) checks the internet access."
     return 1
   fi
   count="$(count_lines "$HUB_VERSIONS")"
@@ -2661,6 +3334,8 @@ UPD_KEYS=(opensearch mongo rabbitmq minio npm)
 declare -A SERIES_ALLOWED=([mongo]="8.0" [opensearch]="2" [rabbitmq]="3" [npm]="2" [minio]="")
 # The moving tag inside each series, for when the registry cannot be read (empty: the tag stays)
 declare -A SERIES_TAG=([mongo]="8.0" [opensearch]="2" [rabbitmq]="3.13-management-alpine" [npm]="2" [minio]="")
+# Memory the containers should have: a full snapshot import loads MongoDB, the Catalog and OpenSearch at the same time
+MEM_RECOMMENDED_GB=24
 declare -A UPD_VERSIONS=() UPD_RESOLVED=()
 UPD_MONGO_HERE=""
 UPD_CATALOG_OK="0"
@@ -3359,6 +4034,7 @@ reload_settings() {
       *) printf -v "$name" '%s' "$value" ;;
     esac
   done < <(settings_pairs "$SCRIPT_PATH")
+  proxy_load
 }
 
 do_updates() {
@@ -3637,7 +4313,7 @@ choose_versions() {
     fi
   done
   if [ "$hub_down" = "yes" ]; then
-    warn "Docker Hub could not be read (no internet access, or a proxy is needed): the Catalog stays $CATALOG_VERSION."
+    warn "Docker Hub could not be read (no internet access, or a proxy is needed - $(hint 26 network-check) checks it): the Catalog stays $CATALOG_VERSION."
   fi
   if [ -n "$reg_down" ]; then
     reg_down="${reg_down#, }"
@@ -4523,6 +5199,11 @@ bundle_build() {
     set_setting CHECK_FOR_UPDATES false "$dir/$installer"
     # the engine of this machine is not the one of the target: there the installer finds it
     set_setting CONTAINER_ENGINE "" "$dir/$installer"
+    # the proxy, its internal names, PAC file and company certificate belong to the network of this machine
+    set_setting INTERNET_PROXY "" "$dir/$installer"
+    set_setting INTERNET_NO_PROXY "" "$dir/$installer"
+    set_setting INTERNET_PROXY_PAC "" "$dir/$installer"
+    set_setting INTERNET_PROXY_CA_FILE "" "$dir/$installer"
     chmod +x "$dir/$installer"
   fi
   write_import_script "$dir/import-images.sh" "${installer:-rn1-technology-catalog-installer.sh}"
@@ -5194,9 +5875,13 @@ snapshot_fetch() {
 ###############################################################################
 
 LOCAL_AUTH=""
+LOCAL_REFRESH=""
+LOCAL_AUTH_AT=0
+LOCAL_AUTH_TTL=1800
 LOCAL_STATE=""
 LOCAL_ADMIN="no"
 LOCAL_CODE=""
+LOCAL_USER=""
 
 local_url() {
   printf 'http://localhost:%s' "$(setting CATALOG_WEB_PORT)"
@@ -5235,8 +5920,20 @@ json_field() {
   sed -n "s/.*\"$1\" *: *\"\\{0,1\\}\\([^\",}]*\\).*/\\1/p" "$2" | head -n 1
 }
 
-# Checks LOCAL_AUTH: LOCAL_STATE valid / invalid / unreachable / error, LOCAL_ADMIN yes / no. A new
-# catalog has no synchronization settings yet and answers 204 (no content) - for an administrator too.
+# json_text NAME FILE -> the whole text of NAME (json_field ends at a comma), escaped quotes undone
+json_text() {
+  local s re
+  re='"'"$1"'" *: *"(([^"\\]|\\.)*)"'
+  s="$(tr -d '\r\n' < "$2")"
+  if [[ "$s" =~ $re ]]; then
+    s="${BASH_REMATCH[1]//\\\"/\"}"
+    printf '%s' "${s//\\\\/\\}"
+  fi
+}
+
+# Checks LOCAL_AUTH: LOCAL_STATE valid / invalid / unlicensed / unreachable / error, LOCAL_ADMIN yes / no.
+# A new catalog has no synchronization settings yet and answers 204 (no content) - for an administrator
+# too. Without a valid license the Catalog answers 520 to everything that needs one.
 local_auth_check() {
   local out code
   out="$(mktemp)"
@@ -5248,9 +5945,25 @@ local_auth_check() {
     200|204) LOCAL_STATE="valid"; LOCAL_ADMIN="yes" ;;
     403) LOCAL_STATE="valid" ;;
     401) LOCAL_STATE="invalid" ;;
+    520) LOCAL_STATE="unlicensed" ;;
     000) LOCAL_STATE="unreachable" ;;
     *) LOCAL_STATE="error" ;;
   esac
+}
+
+# Where the Catalog is activated: option 25 in the menu and in a job (its log is read in the menu), else
+# the command
+license_how() {
+  if [ "$INTERACTIVE" != "true" ] && [ -z "$JOB_DIR" ]; then
+    printf "'%s license'" "$0"
+  else
+    printf 'option 25'
+  fi
+}
+
+# The answer to HTTP 520 of the local catalog
+report_unlicensed() {
+  err "The Catalog is not activated yet (no valid license) - $(license_how) activates it."
 }
 
 report_local_state() {
@@ -5263,30 +5976,44 @@ report_local_state() {
       fi
       ;;
     invalid) err "The local catalog rejected the key or login." ;;
+    unlicensed) report_unlicensed ;;
     unreachable) err "The local catalog is not reachable at $(local_url) - is the stack running (option 6)?" ;;
     *) err "Unexpected answer from the local catalog (HTTP ${LOCAL_CODE:-?})." ;;
   esac
 }
 
+# local_login [DEFAULT-USER] -> LOCAL_AUTH with the token of a login and LOCAL_REFRESH with its refresh
+# token (with a default user, 0 cancels). 1: failed, 2: cancelled
 local_login() {
-  local user pw body resp code token
-  read -r -p "  Local catalog user name: " user || user=""
-  if [ -z "$user" ]; then
-    info "Cancelled."
-    return 1
+  local def="${1:-}" user="" pw body resp code token refresh ttl
+  if read -r -p "  Local catalog user name${def:+ [$def]}: " user; then
+    user="${user:-$def}"
+  else
+    user=""
   fi
+  if [ -z "$user" ] || { [ -n "$def" ] && [ "$user" = "0" ]; }; then
+    info "Cancelled."
+    return 2
+  fi
+  LOCAL_USER="$user"
   read -r -s -p "  Password (input hidden): " pw || pw=""
   echo
   body="$(mktemp)"
   resp="$(mktemp)"
+  # Ctrl+C removes the file with the password too
+  trap "rm -f -- $(printf '%q ' "$body" "$resp"); exit 130" INT TERM
   (umask 077 && printf '{"username":"%s","password":"%s","fingerprint":"%s","rememberMe":false}' \
     "$(json_escape "$user")" "$(json_escape "$pw")" "$(new_uuid)" > "$body")
   pw=""
   LOCAL_AUTH=""
+  LOCAL_REFRESH=""
   code="$(local_call POST /v1/authentication/request "$resp" -H 'Content-Type: application/json' --data-binary "@$body")"
   rm -f -- "$body"
   token="$(json_field access_token "$resp")"
+  refresh="$(json_field refresh_token "$resp")"
+  ttl="$(json_field expires_in "$resp")"
   rm -f -- "$resp"
+  trap - INT TERM
   case "$code" in
     200)
       if [ -z "$token" ]; then
@@ -5294,6 +6021,11 @@ local_login() {
         return 1
       fi
       LOCAL_AUTH="Authorization: Bearer $token"
+      LOCAL_REFRESH="$refresh"
+      LOCAL_AUTH_AT="$SECONDS"
+      if [[ "$ttl" =~ ^[1-9][0-9]*$ ]]; then
+        LOCAL_AUTH_TTL="$ttl"
+      fi
       ok "Logged in to the local catalog."
       ;;
     401) err "Wrong user name or password (the account is locked after 5 failed logins)."; return 1 ;;
@@ -5307,6 +6039,7 @@ local_login() {
 local_auth_obtain() {
   local mode="${1:-interactive}" key choice
   LOCAL_AUTH=""
+  LOCAL_REFRESH=""
   key=""
   if [ -s "$LOCAL_KEY_FILE" ]; then
     key="$(tr -d ' \r\n\t' < "$LOCAL_KEY_FILE")"
@@ -5331,6 +6064,7 @@ local_auth_obtain() {
   echo "   1) API key of the local catalog (web interface: API keys; role Synchronizer or Admin)"
   echo "   2) Log in with a local administrator (the password is not stored)"
   echo "   0) Cancel"
+  echo "  An API key does not expire - the better choice for long imports."
   read -r -p "  Select [1]: " choice || choice="0"
   case "${choice:-1}" in
     1)
@@ -5357,6 +6091,10 @@ local_auth_obtain() {
     2)
       local_login || return 1
       local_auth_check
+      if [ "$LOCAL_STATE" = "unlicensed" ]; then
+        report_local_state
+        return 1
+      fi
       ;;
     *)
       info "Cancelled."
@@ -5365,46 +6103,503 @@ local_auth_obtain() {
   esac
 }
 
-# Follows a local operation until it ends.
-watch_operation() {
-  local opid="$1" out code status progress message path="/v1/operation/$1" waited=0
-  out="$(mktemp)"
-  info "Import running (operation $opid) - the progress is checked every 5 seconds."
-  while [ "$waited" -lt 14400 ]; do
-    code="$(local_call GET "$path" "$out")"
-    if [ "$code" = "403" ] && [ "$path" = "/v1/operation/$opid" ]; then
-      path="/v1/synchronizationHistory/progress/$opid"
-      continue
+# local_refresh -> renews a login with its refresh token: a new access token (LOCAL_AUTH) and its lifetime;
+# the Catalog gives a new refresh token only in the last 30 minutes of its 12 hours (see local_auth_renew).
+# The tokens stay in memory: curl gets the refresh token through its stdin config and prints the answer.
+local_refresh() {
+  local body resp code re token="" refresh="" ttl=""
+  if [ -z "$LOCAL_REFRESH" ] || [[ "$LOCAL_AUTH" != "Authorization: Bearer "* ]]; then
+    return 1
+  fi
+  body="{\"refreshToken\":\"$(json_escape "$LOCAL_REFRESH")\"}"
+  body="${body//\\/\\\\}"
+  resp="$(printf 'data-binary = "%s"\n' "${body//\"/\\\"}" | curl -sS -K - -X POST -H 'Accept: application/json' \
+    -H 'Content-Type: application/json' --connect-timeout 5 --max-time 60 -w '%{http_code}' "$(local_url)/v1/authentication/refresh" 2>/dev/null)" || true
+  code="${resp: -3}"
+  re='"access_token" *: *"([^"]+)"'
+  if [[ "$resp" =~ $re ]]; then
+    token="${BASH_REMATCH[1]}"
+  fi
+  re='"refresh_token" *: *"([^"]+)"'
+  if [[ "$resp" =~ $re ]]; then
+    refresh="${BASH_REMATCH[1]}"
+  fi
+  re='"expires_in" *: *([1-9][0-9]*)'
+  if [[ "$resp" =~ $re ]]; then
+    ttl="${BASH_REMATCH[1]}"
+  fi
+  if [ "$code" != "200" ] || [ -z "$token" ]; then
+    return 1
+  fi
+  LOCAL_AUTH="Authorization: Bearer $token"
+  LOCAL_REFRESH="${refresh:-$LOCAL_REFRESH}"
+  LOCAL_AUTH_AT="$SECONDS"
+  LOCAL_AUTH_TTL="${ttl:-$LOCAL_AUTH_TTL}"
+}
+
+# local_auth_renew -> renews a login after five sixths of the lifetime of its access token (30 minutes): a
+# renewal in each such span reaches the last 30 minutes of the refresh token too, where the Catalog gives a
+# new one, so the login lasts as long as the follow-up. A failed renewal is tried again a minute later.
+local_auth_renew() {
+  local due=$((LOCAL_AUTH_TTL * 5 / 6))
+  if [ -n "$LOCAL_REFRESH" ] && [ $((SECONDS - LOCAL_AUTH_AT)) -ge "$due" ]; then
+    local_refresh || LOCAL_AUTH_AT=$((SECONDS - due + 60))
+  fi
+}
+
+# local_call_kept METHOD PATH OUTFILE [curl args...] -> LOCAL_CODE of local_call; a login the Catalog no
+# longer accepts (HTTP 401) is renewed once and the call repeated
+local_call_kept() {
+  LOCAL_CODE="$(local_call "$@")"
+  if [ "$LOCAL_CODE" = "401" ] && local_refresh; then
+    LOCAL_CODE="$(local_call "$@")"
+  fi
+}
+
+# The credentials a job gets through its secret: LOCAL_AUTH and, for a login, its refresh token and the
+# lifetime of its access token
+local_auth_secret() {
+  printf '%s' "$LOCAL_AUTH"
+  if [[ "$LOCAL_AUTH" == "Authorization: Bearer "* ]] && [ -n "$LOCAL_REFRESH" ]; then
+    printf '\n%s\n%s' "$LOCAL_REFRESH" "$LOCAL_AUTH_TTL"
+  fi
+}
+
+# Worker: LOCAL_AUTH, LOCAL_REFRESH and LOCAL_AUTH_TTL from the job secret (outside a job they stay as they are)
+local_auth_take() {
+  local secret ttl
+  secret="$(job_secret_take)"
+  if [ -n "$secret" ]; then
+    LOCAL_AUTH="${secret%%$'\n'*}"
+    LOCAL_REFRESH=""
+    LOCAL_AUTH_AT="$SECONDS"
+    if [[ "$secret" == *$'\n'* ]]; then
+      secret="${secret#*$'\n'}"
+      LOCAL_REFRESH="${secret%%$'\n'*}"
+      ttl="${secret#*$'\n'}"
+      if [[ "$ttl" =~ ^[1-9][0-9]*$ ]]; then
+        LOCAL_AUTH_TTL="$ttl"
+      fi
     fi
-    status="$(json_field status "$out")"
-    progress="$(json_field progress "$out")"
-    message="$(json_field message "$out")"
-    if [[ "$progress" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
-      job_progress "$progress" "Import ${status:-running}${message:+: $message}"
-    else
-      job_progress "" "Import ${status:-running}${message:+: $message}"
+  fi
+}
+
+FOLLOW_CID=""
+FOLLOW_SINCE=""
+FOLLOW_SEEN=""
+FOLLOW_KEEP=0
+FOLLOW_TIME=""
+FOLLOW_STEP=""
+FOLLOW_FAILED=""
+FOLLOW_CANCEL=""
+FOLLOW_STARTED=""
+
+# Before a line of a follow-up: a terminal outside a job has the progress in its last line
+follow_clear() {
+  if [ -z "$JOB_DIR" ] && [ -t 1 ]; then
+    printf '\r\033[K'
+  fi
+}
+
+# Container of catalog-web (empty where the engine cannot be asked)
+catalog_web_id() {
+  if engine_cli && detect_compose 2>/dev/null; then
+    compose ps -q catalog-web 2>/dev/null | head -n 1 || true
+  fi
+}
+
+# follow_mark -> where the log of catalog-web stands before an import or a synchronization is started: the
+# follow-up shows what comes after it (FOLLOW_CID empty where the engine cannot be asked)
+follow_mark() {
+  FOLLOW_CID="$(catalog_web_id)"
+  FOLLOW_SINCE=""
+  FOLLOW_SEEN=""
+  FOLLOW_KEEP=0
+  FOLLOW_TIME=""
+  if [ -n "$FOLLOW_CID" ]; then
+    catalog_log_steps "" mark || true
+  fi
+}
+
+# catalog_log_steps OPID [mark] -> prints the new lines of the log of catalog-web about a running import or
+# synchronization as "HH:MM:SS message": the steps of its snapshot services and of its operation, errors, a
+# full disk, and the text of an exception with the line it belongs to (never its stack); true when there
+# was one (FOLLOW_STEP: the last). Where the next look starts comes from the time stamps of the engine
+# (FOLLOW_SINCE), not from the clock of this host, which may differ (the virtual machine on macOS);
+# FOLLOW_SEEN keeps the lines of that last second from being shown twice; FOLLOW_KEEP and FOLLOW_TIME carry
+# the line a following line without a time belongs to. It notes what the log says about the operation:
+# FOLLOW_STARTED, FOLLOW_FAILED (the reason) and FOLLOW_CANCEL (26.x cancels a synchronization while
+# another one runs; that line names no operation). With "mark" it only notes where the log stands; a log
+# that cannot be read then is not read during this follow-up.
+catalog_log_steps() {
+  local opid="$1" mark="${2:-}" out line new=1 since="" seen="" tail=5000
+  local -a args=(logs --timestamps)
+  if [ -n "$FOLLOW_SINCE" ]; then
+    args+=(--since "$FOLLOW_SINCE")
+  fi
+  if [ -n "$mark" ]; then
+    tail=100
+  fi
+  # --tail spares the engine reading a long log from its start
+  if ! out="$("$ENGINE" "${args[@]}" --tail "$tail" "$FOLLOW_CID" 2>&1 \
+    | FL_OPID="$opid" FL_MARK="$mark" FL_SEEN="$FOLLOW_SEEN" FL_KEEP="$FOLLOW_KEEP" FL_TIME="$FOLLOW_TIME" FL_NOW="$(date +%H:%M:%S)" awk '
+      BEGIN {
+        opid = ENVIRON["FL_OPID"]; mark = ENVIRON["FL_MARK"]; keep = ENVIRON["FL_KEEP"] + 0; tm = ENVIRON["FL_TIME"]
+        n = split(ENVIRON["FL_SEEN"], a, "\n")
+        for (i = 1; i <= n; i++) seen[a[i]] = 1
+        fail = "Operation [" opid "] failed: "
+      }
+      # a line of the container: the time stamp of the engine, then the line of log4net
+      /^[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9][^ ]* / {
+        sub(/\r$/, "")
+        st = substr($0, 1, index($0, " ") - 1)
+        u = substr($0, length(st) + 2)
+        sub(/^[ \t]+/, "", u)
+        last = st
+        ev = ""
+        timed = (u ~ /^[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9][ T][0-9][0-9]:[0-9][0-9]:[0-9][0-9]/)
+        if (timed) {
+          # date time level logger.method : message
+          tm = substr(u, 12, 8)
+          r = substr(u, 20)
+          sub(/^[,.0-9]*[ \t]+/, "", r)
+          lv = r
+          sub(/[ \t].*/, "", lv)
+          r = substr(r, length(lv) + 1)
+          sub(/^[ \t]+/, "", r)
+          i = index(r, " : ")
+          lg = (i > 0) ? substr(r, 1, i - 1) : ""
+          msg = (i > 0) ? substr(r, i + 3) : r
+          keep = (lg ~ /DatabaseSnapshotDataTransferService|SnapshotServiceBase|\.SynchronizationService\./ || lv == "ERROR" || lv == "FATAL" || index(msg, "No space left on device") > 0)
+          if (lg ~ /LegacyOperationBridge/) {
+            keep = (opid != "" && index(msg, opid) > 0)
+            if (index(msg, "was cancelled, because synchronization is currently being processed") > 0) {
+              keep = 1
+              ev = "C"
+            }
+            if (keep && index(msg, "Starting the synchronization operation") == 1) ev = "B"
+            if (keep && index(msg, fail) == 1) {
+              f = substr(msg, length(fail) + 1)
+              sub(/\.$/, "", f)
+              ev = "F " f
+            }
+          }
+          # the answer to an expired login
+          if (index(msg, "Authorization failed") > 0 || index(msg, "Failed to validate the token") > 0) keep = 0
+          if (lv != "INFO" && lv != "DEBUG") msg = lv " " msg
+          if (msg ~ /^Extracted archive to \//) msg = "Extracted archive"
+          show = keep
+        } else {
+          # a line of an exception: shown with the line it belongs to (a full disk always), its stack never
+          if (u == "" || u ~ /^at / || u ~ /^--- End of / || u ~ /SecurityToken[A-Za-z]*Exception|IDX10223/) next
+          msg = u
+          show = (keep || index(u, "No space left on device") > 0)
+        }
+        if (show || !timed) {
+          k++
+          cand[k] = $0
+          cst[k] = st
+        }
+        if (($0 in seen) || mark) next
+        if (ev != "") print ev
+        if (show) print "L " (tm != "" ? tm : ENVIRON["FL_NOW"]) " " msg
+      }
+      END {
+        if (last != "") {
+          print "S " last
+          for (i = 1; i <= k; i++) if (substr(cst[i], 1, 19) == substr(last, 1, 19)) print "E " cand[i]
+        }
+        print "K " keep
+        print "T " tm
+      }' | sed -E "/^L /s#([ '\"(])/([^/ ]+/)+([^/ '\"]+)#\\1.../\\3#g")"; then
+    if [ -n "$mark" ]; then
+      FOLLOW_CID=""
+    fi
+    return 1
+  fi
+  while IFS= read -r line; do
+    case "$line" in
+      "L "*)
+        follow_clear
+        printf '%s\n' "${line#L }"
+        FOLLOW_STEP="${line:11}"
+        new=0
+        ;;
+      "S "*) since="${line#S }" ;;
+      "E "*) seen="$seen${line#E }"$'\n' ;;
+      "K "*) FOLLOW_KEEP="${line#K }" ;;
+      "T "*) FOLLOW_TIME="${line#T }" ;;
+      "F "*) FOLLOW_FAILED="${line#F }" ;;
+      C) FOLLOW_CANCEL="yes" ;;
+      B) FOLLOW_STARTED="yes" ;;
+    esac
+  done <<< "$out"
+  if [ -n "$since" ]; then
+    FOLLOW_SINCE="$since"
+    FOLLOW_SEEN="$seen"
+  fi
+  return "$new"
+}
+
+# import_step PERCENT -> what a snapshot import does at this progress of its synchronization history (the
+# Catalog sets it before each step)
+import_step() {
+  local p="$1" step="" entry
+  local -a steps=("2 importing AppCompat" "6 importing the CPE dictionary" "10 importing CVE" "14 importing CWE"
+    "18 importing UNSPSC" "22 importing vulnerability metadata" "26 importing manufacturers"
+    "30 importing license classification metadata" "34 importing function metadata" "36 caching metadata"
+    "38 importing relationships" "40 importing products" "42 importing hardware products" "46 importing versions"
+    "50 importing hardware models" "54 importing fingerprints" "58 importing hardware fingerprints"
+    "62 importing license classifications" "66 importing functions" "70 importing storage files"
+    "74 importing normalization rules" "78 importing hardware normalization rules" "82 importing product numbers"
+    "84 importing product URL patterns" "87 importing ECCN" "89 importing fingerprint vulnerabilities"
+    "92 importing fingerprint CPE strings" "96 importing cached vulnerabilities" "99 finishing")
+  # Catalog 25.x imports the products at 38 (26.x the relationships first)
+  if [[ "$CATALOG_VERSION" =~ ^([0-9]+)\. ]] && [ "${BASH_REMATCH[1]}" -le 25 ]; then
+    steps[10]="38 importing products"
+  fi
+  for entry in "${steps[@]}"; do
+    if [ "$p" -lt "${entry%% *}" ]; then
+      break
+    fi
+    step="${entry#* }"
+  done
+  printf '%s' "$step"
+}
+
+# follow_get PATH OUTFILE WHAT -> LOCAL_CODE of a GET of a follow-up (without curl's messages: the progress
+# line says when the Catalog does not answer); fails, with the reason said, when the follow-up cannot go
+# on: the login expired and could not be renewed (4), no license (1)
+follow_get() {
+  local_call_kept GET "$1" "$2" 2>/dev/null
+  case "$LOCAL_CODE" in
+    401)
+      follow_clear
+      job_step "Stopped following - it goes on in the Catalog"
+      if [[ "$LOCAL_AUTH" == "Authorization: Bearer "* ]]; then
+        warn "The login has expired; the $3 goes on in the Catalog - its progress: option 10 (logs) or the web interface"
+      else
+        warn "The Catalog no longer accepts the API key; the $3 goes on in the Catalog - its progress: option 10 (logs) or the web interface"
+      fi
+      job_unfollowed
+      return 4
+      ;;
+    520)
+      follow_clear
+      report_unlicensed
+      return 1
+      ;;
+  esac
+}
+
+# The end of a follow-up: the lines the Catalog logged since the last look
+follow_end() {
+  if [ -n "$FOLLOW_CID" ]; then
+    catalog_log_steps "$1" || true
+  fi
+  follow_clear
+}
+
+# follow_index OUTFILE ADMIN -> after an import the Catalog rebuilds its search index in an operation of its
+# own (an administrator can read it)
+follow_index() {
+  local status=""
+  if [ "$2" = "yes" ]; then
+    local_call_kept GET "/v1/operation/recent?type=index&maxItems=1" "$1" 2>/dev/null
+    if [ "$LOCAL_CODE" = "200" ]; then
+      status="$(json_field status "$1")"
+      case "${status,,}" in
+        pending|accepted|started) status="${status,,}" ;;
+        *) status="" ;;
+      esac
+    fi
+  fi
+  info "The Catalog now rebuilds its search index in a separate operation${status:+ ($status)} - searches can be incomplete until it ends."
+}
+
+# Follows a local operation (a snapshot import or a synchronization) until it ends: the progress of its
+# synchronization history (what the web interface shows), the status of the operation (only Admin and
+# SiteAdmin may read it) and the steps the Catalog logs after follow_mark.
+# watch_operation OPID LABEL -> 0 finished, 1 failed, 4 not followed to the end (the operation goes on in
+# the Catalog or its end is not known: the login expired, nothing changed for 4 hours, probably cancelled)
+watch_operation() {
+  local out rc=0
+  out="$(mktemp)"
+  watch_loop "$out" "$1" "$2" || rc=$?
+  rm -f -- "$out"
+  return "$rc"
+}
+
+# watch_loop OUTFILE OPID LABEL (see watch_operation)
+watch_loop() {
+  local out="$1" opid="$2" label="$3" what pct="" p status="" message="" step prepare doing gone="no"
+  local hist="yes" op="yes" polls=0 t0="$SECONDS" quiet="$SECONDS" said="no" older="no" others=0 cancels=0
+  what="${label,,}"
+  if [ "$label" = "Import" ]; then
+    prepare="the Catalog copies the snapshot and unpacks it"
+    doing="copying and unpacking the snapshot"
+  else
+    prepare="the Catalog downloads the data and unpacks it"
+    doing="downloading and unpacking the data"
+  fi
+  # Catalog 25.x lets a second synchronization wait, 26.x cancels it
+  if [[ "$CATALOG_VERSION" =~ ^([0-9]+)\. ]] && [ "${BASH_REMATCH[1]}" -le 25 ]; then
+    older="yes"
+  fi
+  FOLLOW_STEP=""
+  FOLLOW_FAILED=""
+  FOLLOW_CANCEL=""
+  FOLLOW_STARTED=""
+  info "$label running (operation $opid) - the progress is checked every 5 seconds."
+  while true; do
+    polls=$((polls + 1))
+    local_auth_renew
+    if [ "$hist" = "yes" ]; then
+      follow_get "/v1/synchronizationHistory/progress/$opid" "$out" "$what" || return $?
+      gone="no"
+      case "$LOCAL_CODE" in
+        200)
+          p="$(tr -dc '0-9' < "$out")"
+          if [ -n "$p" ] && [ "$p" != "$pct" ]; then
+            pct="$p"
+            quiet="$SECONDS"
+          fi
+          ;;
+        403) hist="no" ;;
+        000) gone="yes" ;;
+      esac
+    fi
+    if [ "$op" = "yes" ]; then
+      follow_get "/v1/operation/$opid" "$out" "$what" || return $?
+      case "$LOCAL_CODE" in
+        200)
+          p="$(json_field status "$out")"
+          if [ "${p,,}" != "$status" ]; then
+            status="${p,,}"
+            quiet="$SECONDS"
+          fi
+          message="$(json_text message "$out")"
+          ;;
+        403) op="no" ;;
+        000) gone="yes" ;;
+      esac
+    fi
+    if [ "$hist" = "no" ] && [ "$op" = "no" ]; then
+      follow_clear
+      ok "$label started - this login may not read its progress: follow it in the Catalog web interface."
+      return 0
+    fi
+    if [ -n "$FOLLOW_CID" ] && catalog_log_steps "$opid"; then
+      quiet="$SECONDS"
     fi
     case "$status" in
-      finished|Finished)
-        echo
-        rm -f -- "$out"
-        ok "Import finished."
+      finished)
+        follow_end "$opid"
+        ok "$label finished."
+        follow_index "$out" "$op"
         return 0
         ;;
-      failed|Failed|cancelled|Cancelled|rejected|Rejected)
-        echo
-        rm -f -- "$out"
-        err "Import $status${message:+: $message}"
+      failed|rejected)
+        follow_end "$opid"
+        err "$label $status${message:+: $message}"
+        return 1
+        ;;
+      cancelled)
+        follow_end "$opid"
+        err "$label cancelled${message:+: $message}"
+        echo "  The Catalog cancels it while another synchronization runs - start it again when that one has ended."
         return 1
         ;;
     esac
+    # without the right to read the operation: its synchronization history tells the end and the result
+    if [ "$op" = "no" ] && [ "$pct" = "100" ]; then
+      follow_get /v1/synchronizationHistory/lastSynchronizationHistory "$out" "$what" || return $?
+      if [ "$LOCAL_CODE" != "200" ] || [ "$(json_field operationId "$out")" != "$opid" ]; then
+        follow_end "$opid"
+        ok "$label finished (100%)."
+        follow_index "$out" "$op"
+        return 0
+      fi
+      message="$(json_text summaryDetails "$out")"
+      case "$(json_field synchronizationStatus "$out")" in
+        3)
+          follow_end "$opid"
+          ok "$label finished.${message:+ $message}"
+          follow_index "$out" "$op"
+          return 0
+          ;;
+        4)
+          follow_end "$opid"
+          err "$label failed${message:+: $message}"
+          return 1
+          ;;
+      esac
+    fi
+    # ... and the Catalog's log a failure before the history has a record (a full disk while it copies the snapshot)
+    if [ "$op" = "no" ] && [ -n "$FOLLOW_FAILED" ]; then
+      follow_end "$opid"
+      err "$label failed: $FOLLOW_FAILED"
+      return 1
+    fi
+    # 26.x cancels it while another synchronization runs: it never starts and gets no history record. The log
+    # says so (naming no operation); without the log the newest history record is another one that runs -
+    # which a Catalog stopped during a synchronization also leaves behind, so that is only a guess.
+    if [ "$op" = "no" ] && [ "${pct:-0}" = "0" ] && [ "$older" = "no" ] && [ -z "$FOLLOW_STARTED" ]; then
+      if [ -n "$FOLLOW_CANCEL" ]; then
+        cancels=$((cancels + 1))
+        if [ "$cancels" -ge 2 ]; then
+          follow_end "$opid"
+          err "$label cancelled: another synchronization runs in the Catalog (its log says so)."
+          echo "  Start it again when that one has ended (the web interface shows it)."
+          return 1
+        fi
+      elif [ $((polls % 3)) -eq 2 ]; then
+        follow_get /v1/synchronizationHistory/lastSynchronizationHistory "$out" "$what" || return $?
+        p="$(json_field operationId "$out")"
+        if [ "$LOCAL_CODE" = "200" ] && [ "$(json_field synchronizationStatus "$out")" = "2" ] && [ -n "$p" ] && [ "$p" != "$opid" ]; then
+          others=$((others + 1))
+        else
+          others=0
+        fi
+        if [ "$others" -ge 2 ]; then
+          follow_end "$opid"
+          warn "Another synchronization runs in the Catalog - this $what was probably cancelled: check the web interface."
+          job_unfollowed
+          return 4
+        fi
+      fi
+    fi
+    if [ $((SECONDS - quiet)) -ge 14400 ]; then
+      follow_clear
+      warn "Nothing has changed for 4 hours - not followed any further: check the Catalog web interface."
+      job_unfollowed
+      return 4
+    fi
+    if [ "$gone" = "yes" ]; then
+      job_progress "" "Catalog Web does not answer at $(local_url)" "$(fmt_duration $((SECONDS - t0)))"
+    elif [ "$status" = "pending" ] || [ "$status" = "accepted" ]; then
+      job_progress "" "$label waiting for the Catalog to start it ($status)" "$(fmt_duration $((SECONDS - t0)))"
+    elif [ "$hist" = "no" ]; then
+      job_progress "" "$label ${status:-running}${message:+: $message}" "$(fmt_duration $((SECONDS - t0)))"
+    elif [ "${pct:-0}" -eq 0 ] || { [ "$label" != "Import" ] && [ "$pct" -lt 50 ]; }; then
+      if [ "$said" = "no" ]; then
+        follow_clear
+        info "Preparing: $prepare (it reports no progress for this; a full snapshot can take a long time)."
+        said="yes"
+      fi
+      job_progress "" "Preparing: $doing" "$(fmt_duration $((SECONDS - t0)))"
+    else
+      p="$pct"
+      if [ "$label" != "Import" ]; then
+        # a synchronization reports the import of what it downloaded as 50 to 100
+        p=$(((pct - 50) * 2))
+      fi
+      step="$(import_step "$p")"
+      step="${step:-${FOLLOW_STEP//|//}}"
+      job_progress "$pct" "$label $pct% $UI_SEP ${step:-running} $UI_SEP $(fmt_duration $((SECONDS - t0)))"
+    fi
     sleep 5
-    waited=$((waited + 5))
   done
-  echo
-  rm -f -- "$out"
-  warn "Still running after 4 hours - check the Catalog web interface."
-  return 1
 }
 
 # catalog_fixed_upload_limit VERSION -> true for Catalog 25.x and older: 10 GB per upload, not configurable
@@ -5462,7 +6657,7 @@ upload_fits() {
 
 # import_chain CHAINFILE -> uploads the files of a downloaded chain, in order, each after the previous one finished
 import_chain() {
-  local chainfile="$1" mode="${2:-interactive}" type date size file
+  local chainfile="$1" mode="${2:-interactive}" type date size file rc job="no" marks
   local -a files=()
   if [ -z "$chainfile" ] || [ ! -f "$chainfile" ]; then
     err "No downloaded chain${chainfile:+ at $chainfile} - download one with option 17 ('Full + all changes up to today')."
@@ -5481,26 +6676,53 @@ import_chain() {
     err "$chainfile lists no snapshot."
     return 1
   fi
+  if ! mem_ask confirm import; then
+    info "Cancelled."
+    return 0
+  fi
   local_auth_obtain "$mode" || return 1
   if [ "${#files[@]}" -gt 1 ] && [[ "$LOCAL_AUTH" == "Authorization: Bearer "* ]]; then
-    warn "A login stays valid for about one hour - for a long chain store a local API key (option 18)."
+    info "The login is renewed while the chain is imported; a local API key (option 18) does not expire."
   fi
+  rc=0
+  marks="$(mem_oom_marks)"
   if [ "$mode" = "interactive" ] && [ -n "$SCRIPT_PATH" ]; then
-    run_job "Snapshot import (${#files[@]} files up to $(tail -n 1 "$chainfile" | cut -f2))" "$LOCAL_AUTH" -- import_chain_run "${files[@]}"
+    job="yes"
+    run_job "Snapshot import (${#files[@]} files up to $(tail -n 1 "$chainfile" | cut -f2))" "$(local_auth_secret)" -- import_chain_run "${files[@]}" || rc=$?
   else
-    import_chain_run "${files[@]}"
+    errexit_rc import_chain_run "${files[@]}"
+    rc="$ERREXIT_RC"
   fi
+  if mem_import_again "$rc" "$job" "$marks" chain; then
+    MEM_ASKED="yes" import_chain "$chainfile" "$mode"
+    return
+  fi
+  return "$rc"
 }
 
-# Worker: import_chain_run FILE... - one upload after the other; stops at the first failure
+# Worker: import_chain_run FILE... - one upload after the other; stops at the first failure (4: an import
+# not followed to its end, it goes on in the Catalog)
 import_chain_run() {
-  local file n=0
+  local file n=0 rc
+  local_auth_take
   for file in "$@"; do
     n=$((n + 1))
     echo
     info "[$n/$#] $(basename -- "$file")"
     job_step "[$n/$#] Importing $(basename -- "$file")"
-    if ! import_upload "$file"; then
+    # the import before may have taken longer than the access token of a login lasts
+    if [ "$n" -gt 1 ] && [ -n "$LOCAL_REFRESH" ] && ! local_refresh; then
+      err "The login has expired - $(basename -- "$file") and the files after it were not imported."
+      return 1
+    fi
+    rc=0
+    import_upload "$file" || rc=$?
+    if [ "$rc" -eq 4 ]; then
+      if [ "$n" -lt "$#" ]; then
+        warn "The files after $(basename -- "$file") were not imported."
+      fi
+      return 4
+    elif [ "$rc" -ne 0 ]; then
       err "Import stopped at $(basename -- "$file") - the files after it were not imported."
       return 1
     fi
@@ -5510,7 +6732,7 @@ import_chain_run() {
 
 # import_snapshot FILE [interactive|cli]
 import_snapshot() {
-  local file="$1" mode="${2:-interactive}" size
+  local file="$1" mode="${2:-interactive}" size rc job="no" marks
   if [ ! -f "$file" ]; then
     err "File not found: $file"
     return 1
@@ -5528,26 +6750,40 @@ import_snapshot() {
       return 0
     fi
   fi
-  local_auth_obtain "$mode" || return 1
-  if [ "$mode" = "interactive" ] && [ -n "$SCRIPT_PATH" ]; then
-    run_job "Snapshot import ($(basename -- "$file"))" "$LOCAL_AUTH" -- import_upload "$file"
-  else
-    import_upload "$file"
+  if ! mem_ask confirm import; then
+    info "Cancelled."
+    return 0
   fi
+  local_auth_obtain "$mode" || return 1
+  rc=0
+  marks="$(mem_oom_marks)"
+  if [ "$mode" = "interactive" ] && [ -n "$SCRIPT_PATH" ]; then
+    job="yes"
+    run_job "Snapshot import ($(basename -- "$file"))" "$(local_auth_secret)" -- import_upload "$file" || rc=$?
+  else
+    errexit_rc import_upload "$file"
+    rc="$ERREXIT_RC"
+  fi
+  if mem_import_again "$rc" "$job" "$marks" "$(if [[ "$(basename -- "$file")" == *-daily.tar.gz ]]; then printf daily; else printf file; fi)"; then
+    MEM_ASKED="yes" import_snapshot "$file" "$mode"
+    return
+  fi
+  return "$rc"
 }
 
 # Worker: import_upload FILE (credentials from the job secret or LOCAL_AUTH)
 import_upload() {
-  local file="$1" resp code opid size pid codefile auth base
-  auth="$(job_secret_take)"
-  auth="${auth:-$LOCAL_AUTH}"
+  local file="$1" resp code opid size pid codefile base
+  local_auth_take
   size="$(stat -c %s -- "$file")"
   info "Uploading $(basename -- "$file") ($(human_size "$size")) to $(local_url)"
   resp="$(mktemp)"
   codefile="$(mktemp)"
   base="$(minio_volume_bytes)" || base=""
-  curl -sS -K - -H 'Accept: application/json' --connect-timeout 5 -F "file=@$file;type=application/gzip" \
-    -o "$resp" -w '%{http_code}' "$(local_url)/v1/synchronization/snapshot" <<< "header = \"$auth\"" > "$codefile" &
+  follow_mark
+  # the credentials through a pipe: a here-string of bash 4.2 to 5.0 is a temporary file
+  printf 'header = "%s"\n' "$LOCAL_AUTH" | curl -sS -K - -H 'Accept: application/json' --connect-timeout 5 \
+    -F "file=@$file;type=application/gzip" -o "$resp" -w '%{http_code}' "$(local_url)/v1/synchronization/snapshot" > "$codefile" &
   pid=$!
   if [ -r /proc/self/io ]; then
     job_watch_bytes "$pid" "rchar:$pid" "$size" "Uploading" until-total
@@ -5562,17 +6798,18 @@ import_upload() {
   code="$(cat -- "$codefile")"
   opid="$(json_field operationId "$resp")"
   rm -f -- "$resp" "$codefile"
-  LOCAL_AUTH="$auth"
   case "$code" in
     202)
       if [ -z "$opid" ]; then
         ok "Upload accepted - follow the import in the Catalog web interface."
         return 0
       fi
-      watch_operation "$opid"
+      # its own return: bash 4.2 leaves a function that errexit stops with 1, not with its code
+      watch_operation "$opid" Import || return $?
       ;;
     200) err "The catalog received no file." ; return 1 ;;
     401|403) err "The local catalog refused the upload (HTTP $code) - the key or user needs the Synchronizer or Admin role."; return 1 ;;
+    520) report_unlicensed; return 1 ;;
     413) err "The file is larger than the upload limit - raise Synchronization__MaxUploadFileSize for catalog-web."; return 1 ;;
     415) err "The catalog does not accept this file type."; return 1 ;;
     000) err "The local catalog is not reachable at $(local_url) - is the stack running (option 6)?"; return 1 ;;
@@ -5636,6 +6873,12 @@ import_snapshot_menu() {
 # (daily by AUTOSYNC_CRON afterwards).
 local_self_sync() {
   local key cur body out code
+  # without a license the Catalog refuses everything: no need to ask for the online key first
+  license_status
+  if [ "$LICENSE_STATE" = "invalid" ]; then
+    report_unlicensed
+    return 1
+  fi
   key="$(api_key_stored)"
   if [ -z "$key" ]; then
     echo "  The local catalog needs your API key for $CATALOG_CLOUD_URL."
@@ -5660,8 +6903,7 @@ local_self_sync() {
   if [ "$LOCAL_ADMIN" != "yes" ]; then
     if [ "$LOCAL_STATE" = "valid" ] && [[ "$LOCAL_AUTH" == "Authorization: Bearer "* ]]; then
       err "The local catalog refused to change the synchronization settings (HTTP ${LOCAL_CODE:-403})."
-      echo "  The user needs the Admin role. An administrator is refused too while the Catalog has no valid"
-      echo "  license yet: load the license file in the web interface ($(local_url)), then try again."
+      echo "  The user needs the Admin role (for example admin or root)."
     elif [ "$LOCAL_STATE" = "valid" ]; then
       err "Changing the synchronization settings needs a local administrator."
     else
@@ -5676,30 +6918,18 @@ local_self_sync() {
   code="$(local_call GET /v1/databaseconfiguration/synchronization "$cur")"
   if [ "$code" != "200" ] && [ "$code" != "204" ]; then
     rm -f -- "$cur" "$body" "$out"
-    err "Could not read the synchronization settings (HTTP $code)."
+    if [ "$code" = "520" ]; then
+      report_unlicensed
+    else
+      err "Could not read the synchronization settings (HTTP $code)."
+    fi
     return 1
   fi
-  # a new catalog has none yet (204, or null)
-  if [ ! -s "$cur" ] || [ "$(tr -d ' \r\n\t' < "$cur")" = "null" ]; then
-    printf '{}' > "$cur"
-  fi
   chmod 600 "$body"
-  if command -v jq >/dev/null 2>&1; then
-    jq --arg u "$CATALOG_CLOUD_URL" --rawfile k <(printf '%s' "$key") \
-      '(if type == "object" then . else {} end) + {parentInstanceUrl: $u, parentInstanceKey: $k}' "$cur" > "$body"
-  elif command -v python3 >/dev/null 2>&1; then
-    printf '%s' "$key" | python3 -c '
-import json, sys
-cur = json.load(open(sys.argv[1]))
-cur = cur if isinstance(cur, dict) else {}
-cur["parentInstanceUrl"] = sys.argv[2]
-cur["parentInstanceKey"] = sys.stdin.read()
-print(json.dumps(cur))
-' "$cur" "$CATALOG_CLOUD_URL" > "$body"
-  else
-    warn "jq or python3 not found - other synchronization settings (e.g. the proxy) may be reset."
-    printf '{"parentInstanceUrl":"%s","parentInstanceKey":"%s"}' "$(json_escape "$CATALOG_CLOUD_URL")" "$(json_escape "$key")" > "$body"
-  fi
+  # only the online catalog and its key, as the web interface sends them: the other settings stay as the
+  # Catalog keeps them - sent back, the masked password of its synchronization proxy would replace the real
+  # one (and a proxy without its port fails)
+  printf '{"parentInstanceUrl":"%s","parentInstanceKey":"%s"}' "$(json_escape "$CATALOG_CLOUD_URL")" "$(json_escape "$key")" > "$body"
   rm -f -- "$cur"
   code="$(local_call POST /v1/databaseconfiguration/synchronization "$out" -H 'Content-Type: application/json' --data-binary "@$body")"
   rm -f -- "$body"
@@ -5708,6 +6938,7 @@ print(json.dumps(cur))
       ok "The local catalog now synchronizes from $CATALOG_CLOUD_URL (automatically: AUTOSYNC_CRON \"$(setting AUTOSYNC_CRON)\")."
       wiz_mark sync
       ;;
+    520) rm -f -- "$out"; report_unlicensed; return 1 ;;
     *) rm -f -- "$out"; err "Saving the synchronization settings failed (HTTP $code)."; return 1 ;;
   esac
 
@@ -5717,7 +6948,7 @@ print(json.dumps(cur))
   fi
   rm -f -- "$out"
   if [ -n "$SCRIPT_PATH" ]; then
-    run_job "Synchronization from the online catalog" "$LOCAL_AUTH" -- self_sync_run
+    run_job "Synchronization from the online catalog" "$(local_auth_secret)" -- self_sync_run
   else
     self_sync_run
   fi
@@ -5725,12 +6956,12 @@ print(json.dumps(cur))
 
 # Worker: starts the synchronization of the local catalog and follows it.
 self_sync_run() {
-  local tmp out code opid auth
-  auth="$(job_secret_take)"
-  LOCAL_AUTH="${auth:-$LOCAL_AUTH}"
+  local tmp out code opid
+  local_auth_take
   tmp="$(mktemp)"
   out="$(mktemp)"
   printf -- '--rvcboundary--\r\n' > "$tmp"
+  follow_mark
   code="$(local_call POST /v1/synchronization/synchronize "$out" -H 'Content-Type: multipart/form-data; boundary=rvcboundary' --data-binary "@$tmp")"
   rm -f -- "$tmp"
   case "$code" in
@@ -5738,7 +6969,7 @@ self_sync_run() {
       opid="$(json_field operationId "$out")"
       rm -f -- "$out"
       if [ -n "$opid" ]; then
-        watch_operation "$opid"
+        watch_operation "$opid" Synchronization || return $?
       else
         ok "Synchronization started - follow it in the Catalog web interface."
       fi
@@ -5746,8 +6977,803 @@ self_sync_run() {
     304) rm -f -- "$out"; ok "The local catalog is already up to date." ;;
     503) rm -f -- "$out"; warn "A synchronization is already running." ;;
     403) rm -f -- "$out"; err "The local catalog refused the synchronization (HTTP 403) - the online key may lack the Synchronizer role."; return 1 ;;
+    520) rm -f -- "$out"; report_unlicensed; return 1 ;;
     *) rm -f -- "$out"; err "Starting the synchronization failed (HTTP $code)."; return 1 ;;
   esac
+}
+
+###############################################################################
+# License of the local catalog (option 25)
+###############################################################################
+
+LICENSE_STATE=""
+LICENSE_CODE=""
+LICENSE_STATUS=""
+LICENSE_ADMIN="no"
+LICENSE_HOST=""
+LICENSE_MSG=""
+LICENSE_MSG_KIND=""
+LICENSE_FILE=""
+
+# license_status [CURL ARGS...] -> LICENSE_STATE valid / invalid / unreachable / error (GET
+# /v1/license/isValid, no login); --max-time N waits less than local_call (no answer in time: unreachable)
+license_status() {
+  local out body
+  out="$(mktemp)"
+  LICENSE_CODE="$(local_call GET /v1/license/isValid "$out" "$@" 2>/dev/null)"
+  body="$(tr -d ' \r\n\t' < "$out")"
+  rm -f -- "$out"
+  case "$LICENSE_CODE:$body" in
+    200:true) LICENSE_STATE="valid" ;;
+    200:false) LICENSE_STATE="invalid" ;;
+    000:*) LICENSE_STATE="unreachable" ;;
+    *) LICENSE_STATE="error" ;;
+  esac
+}
+
+report_license_state() {
+  case "$LICENSE_STATE" in
+    valid) ok "The Catalog is activated (valid license)." ;;
+    invalid) warn "The Catalog is not activated yet (no valid license)." ;;
+    unreachable) err "Catalog Web does not answer at $(local_url) - is the stack running (option 6)?" ;;
+    *) err "Unexpected answer of Catalog Web to the license check (HTTP ${LICENSE_CODE:-?})." ;;
+  esac
+}
+
+# After a restart of the stack (upgrade, patch update): a license the new start does not accept is named
+license_recheck() {
+  license_status
+  if [ "$LICENSE_STATE" = "invalid" ]; then
+    warn "The Catalog has no valid license after the restart - $(license_how) shows why."
+    echo "  A license for an older Catalog version or another host name of catalog-web"
+    echo "  stops working at an upgrade."
+  fi
+}
+
+# Before a job that writes the files of an older installer again: catalog-web gets its fixed host name. A
+# licensed Catalog keeps the one it has (do_generate decides); a CATALOG_HOSTNAME of the settings that
+# differs from it needs a license for the new name.
+license_host_note() {
+  local running
+  if [ ! -f "$ENV_FILE" ] || [ -n "$(env_hostname)" ]; then
+    return 0
+  fi
+  if [ -z "$CATALOG_HOSTNAME" ]; then
+    info "catalog-web gets a fixed host name now (CATALOG_HOSTNAME): a licensed"
+    echo "  Catalog keeps the one it has, so its license stays valid."
+    return 0
+  fi
+  running="$(running_hostname)"
+  if [ "$running" = "$CATALOG_HOSTNAME" ]; then
+    return 0
+  fi
+  warn "catalog-web gets the fixed host name $CATALOG_HOSTNAME now (CATALOG_HOSTNAME)."
+  echo "  The Catalog binds its license to its host name: afterwards it needs a license"
+  echo "  for the new name ($(hint 25 license) shows its hardware ID)."
+}
+
+# The Catalog version of this installation (a license names the newest one it is for)
+license_catalog_version() {
+  local v
+  v="$(env_value CATALOG_IMAGE)"
+  v="${v##*:}"
+  printf '%s' "${v:-$CATALOG_VERSION}"
+}
+
+# license_message FILE -> LICENSE_MSG, the text of an error answer: a JSON string (LICENSE_MSG_KIND text),
+# or the title of a problem object of the Catalog's own checks of the request (problem)
+license_message() {
+  local m
+  m="$(tr -d '\r\n' < "$1" 2>/dev/null)" || m=""
+  LICENSE_MSG_KIND="text"
+  case "$m" in
+    \"*) m="$(printf '%s' "$m" | sed 's/^"//; s/"$//; s/\\"/"/g; s/\\\\/\\/g')" ;;
+    \{*) m="$(json_field title "$1")"; LICENSE_MSG_KIND="problem" ;;
+  esac
+  LICENSE_MSG="${m:0:300}"
+}
+
+# license_version FILE -> the newest Catalog version the license is for ("26.3"; a string or an object)
+license_version() {
+  local v
+  v="$(json_field version "$1")"
+  if [ "$v" = "{" ]; then
+    v="$(json_field major "$1").$(json_field minor "$1")"
+  fi
+  if [ "$v" = "." ]; then
+    v=""
+  fi
+  printf '%s' "$v"
+}
+
+# The hardware ID of a license comes from the host name of catalog-web
+license_host_hint() {
+  local host="${LICENSE_HOST:-$(env_hostname)}"
+  if [ -n "$host" ]; then
+    echo "  The Catalog takes it from the host name of catalog-web: $host"
+    echo "  A license made for another name works with that name in CATALOG_HOSTNAME"
+    if [ "$INTERACTIVE" = "true" ]; then
+      echo "  (option 1, then 2 and 6). The order number gets a license for this name."
+    else
+      echo "  (at the top of $SCRIPT_NAME, then '$0 generate' and '$0 up')."
+      echo "  The order number gets a license for this name."
+    fi
+  else
+    echo "  The Catalog takes it from the host name of catalog-web, which changes with"
+    echo "  every new container in the files of older installers: $(hint 2 generate)"
+    echo "  writes them with a fixed one (CATALOG_HOSTNAME), $(hint 6 up) applies them."
+  fi
+}
+
+license_text_hint() {
+  echo "  Use the file or the text exactly as Raynet sent it - the text from its first"
+  echo "  line (LICENSE STARTS HERE) to its last line (LICENSE ENDS HERE)."
+}
+
+license_net_hint() {
+  echo "  catalog-web needs HTTPS (port 443) to licenses.raynet.de, through a proxy"
+  echo "  where the network has one. Without it: the license file or the e-mail text."
+  echo "  The internet access of this server is checked by $(hint 26 network-check)."
+}
+
+license_not_admin() {
+  err "${LOCAL_USER:-The user} is not a site administrator: only the role SiteAdmin activates."
+  echo "  root is one; admin is not enough."
+}
+
+# license_explain STATUS -> what a license status of the Catalog means, and what helps
+license_explain() {
+  case "$1" in
+    Ok|NotPresent|"") ;;
+    InvalidHardwareId)
+      warn "The license is for another server: the hardware ID does not match."
+      license_host_hint
+      ;;
+    Expired) warn "The license has expired - Raynet makes a new one." ;;
+    AnotherProduct) warn "The license is for another Raynet product, not the Technology Catalog." ;;
+    OldVersion)
+      warn "The license is for an older Catalog - this one is $(license_catalog_version)."
+      echo "  Ask Raynet for a license for this version, or go back to the licensed version."
+      ;;
+    *) warn "License status: $1" ;;
+  esac
+}
+
+# license_why WAY MESSAGE [KIND] -> why the Catalog refused an activation (WAY: order, file or mail; KIND
+# problem: its own checks of the request refused it), and what helps
+license_why() {
+  local way="$1" m="$2" other="the license file or the e-mail text"
+  if [ "${3:-}" = "problem" ]; then
+    err "The Catalog refused the request: ${m:-no reason given}"
+    return 0
+  fi
+  case "$m" in
+    license.messages.invalid-hardware-id)
+      err "This license is for another server: the hardware ID does not match."
+      license_host_hint
+      ;;
+    license.messages.license-expired) err "This license has expired - Raynet makes a new one." ;;
+    license.messages.another-product) err "This license is for another Raynet product, not the Technology Catalog." ;;
+    license.messages.wrong-version)
+      err "This license is for an older Catalog - this one is $(license_catalog_version)."
+      echo "  Ask Raynet for a license for this version."
+      ;;
+    "Unable to connect to activation server (server error"*)
+      err "Raynet's license server failed${m#Unable to connect to activation server}"
+      echo "  Try again later - or use $other."
+      ;;
+    license.messages.check-connection|"Unable to connect to activation server"*|"Could not connect to the activation server"*)
+      err "Catalog Web could not reach Raynet's license server (licenses.raynet.de)."
+      license_net_hint
+      ;;
+    "The license could not be activated.")
+      # the request for the license got no answer (the login before it did)
+      err "Raynet's license server (licenses.raynet.de) did not answer."
+      license_net_hint
+      ;;
+    "The license could not be activated"*)
+      err "Raynet's license server failed${m#The license could not be activated}"
+      echo "  Try again later - or use $other."
+      ;;
+    license.messages.invalid-license)
+      err "Raynet's license server refused the request."
+      echo "  Check the order number and the other fields."
+      echo "  Another way: $other."
+      ;;
+    license.messages.unknown-issue)
+      err "The Catalog could not activate the license (it gives no reason)."
+      echo "  The log of catalog-web: $(hint 10 "logs catalog-web")."
+      ;;
+    *"Unknown order number"*)
+      if [ "$way" = "order" ]; then
+        err "Raynet's license server has no license for this order number."
+        echo "  Check the order number on the order confirmation of Raynet."
+      else
+        err "This is not a license the Catalog can read."
+        license_text_hint
+      fi
+      ;;
+    "The license is malformed."*)
+      err "The license is damaged or incomplete:${m#The license is malformed.}"
+      license_text_hint
+      ;;
+    *Base-64*|*base64*|*Base64*)
+      err "The license text is damaged: it is not the text as Raynet sent it."
+      license_text_hint
+      ;;
+    "This license is not valid"*)
+      err "The Catalog does not accept this license:"
+      echo "  $m"
+      ;;
+    "File must be uploaded.") err "The Catalog received no file." ;;
+    "") err "The activation failed (HTTP 400, no reason given)." ;;
+    *)
+      if [ "$way" = "order" ]; then
+        err "Raynet's license server: $m"
+      else
+        err "The Catalog refused the license: $m"
+      fi
+      ;;
+  esac
+}
+
+# license_show FILE -> the license in an answer of the Catalog (GET /v1/license, or an activation)
+license_show() {
+  local status edition version expires hid host text
+  status="$(json_field status "$1")"
+  edition="$(json_field edition "$1")"
+  version="$(license_version "$1")"
+  expires="$(json_field expirationDate "$1")"
+  hid="$(json_field yourHardwareId "$1")"
+  host="${LICENSE_HOST:-$(env_hostname)}"
+  case "$status" in
+    Ok) text="$C_GRN${UI_OK}$C_RST valid" ;;
+    NotPresent) text="none yet" ;;
+    *) text="$C_YLW${UI_NO}$C_RST not valid ($status)" ;;
+  esac
+  printf '  %-13s %s\n' "License" "$text"
+  if [ -n "$edition" ]; then
+    printf '  %-13s %s\n' "Edition" "$edition"
+  fi
+  if [ -n "$version" ]; then
+    printf '  %-13s %s\n' "For" "Catalog up to $version"
+  fi
+  if [ "$status" != "NotPresent" ]; then
+    printf '  %-13s %s\n' "Expires" "$(if [ -n "$expires" ] && [ "$expires" != "null" ]; then printf '%s' "${expires:0:10}"; else printf 'no expiration date'; fi)"
+  fi
+  if [ -n "$hid" ]; then
+    printf '  %-13s %s\n' "Hardware ID" "$hid${host:+ (host name $host)}"
+    if [ "$status" != "Ok" ]; then
+      echo "  Raynet makes a license file or e-mail text for this hardware ID."
+    fi
+  fi
+  license_explain "$status"
+}
+
+# license_details [show] -> GET /v1/license with LOCAL_AUTH: LICENSE_STATUS, LICENSE_ADMIN (yes: the
+# answer has the hardware ID, which the Catalog gives only to site administrators; unknown: the Catalog
+# could not read its license); show prints it
+license_details() {
+  local out code
+  out="$(mktemp)"
+  code="$(local_call GET /v1/license "$out")"
+  LICENSE_STATUS=""
+  LICENSE_ADMIN="no"
+  case "$code" in
+    200) ;;
+    401) rm -f -- "$out"; err "The Catalog did not accept the login (HTTP 401) - log in again."; return 1 ;;
+    000) rm -f -- "$out"; err "Catalog Web does not answer at $(local_url)."; return 1 ;;
+    *)
+      # a damaged license can make the Catalog fail here: the activation replaces it
+      rm -f -- "$out"
+      warn "The license could not be read (HTTP $code) - an activation replaces it."
+      LICENSE_ADMIN="unknown"
+      return 0
+      ;;
+  esac
+  LICENSE_STATUS="$(json_field status "$out")"
+  if [ -n "$(json_field yourHardwareId "$out")" ]; then
+    LICENSE_ADMIN="yes"
+  fi
+  if [ "${1:-}" = "show" ]; then
+    license_show "$out"
+  fi
+  rm -f -- "$out"
+}
+
+# license_login [show] -> LOCAL_AUTH of a site administrator, who alone may activate; show prints the
+# license. 1: failed, 2: cancelled
+license_login() {
+  local rc=0
+  echo "  Activation needs a site administrator (role SiteAdmin: root, not admin)."
+  echo "  A new Catalog has the user root with the password root."
+  local_login root || rc=$?
+  if [ "$rc" -ne 0 ]; then
+    return "$rc"
+  fi
+  if ! license_details "${1:-}"; then
+    LOCAL_AUTH=""
+    return 1
+  fi
+  if [ "$LICENSE_ADMIN" = "no" ]; then
+    license_not_admin
+    LOCAL_AUTH=""
+    return 1
+  fi
+}
+
+# Temporary files of an activation (the order data, the license, the answer): Ctrl+C (or TERM) removes them
+# before it stops. license_tmp_guard FILE... adds files, license_tmp_done removes them all.
+LICENSE_TMP=()
+license_tmp_guard() {
+  LICENSE_TMP+=("$@")
+  trap 'rm -rf -- ${LICENSE_TMP[@]+"${LICENSE_TMP[@]}"}; exit 130' INT TERM
+}
+
+license_tmp_done() {
+  rm -rf -- ${LICENSE_TMP[@]+"${LICENSE_TMP[@]}"}
+  LICENSE_TMP=()
+  trap - INT TERM
+}
+
+# license_send WAY [curl args...] -> sends a license to Catalog Web (WAY: order, file or mail) and says
+# what came of it; 0 when the Catalog took it
+license_send() {
+  local way="$1" out code
+  shift
+  out="$(mktemp)"
+  license_tmp_guard "$out"
+  code="$(local_call POST "/v1/license/activate/$way" "$out" "$@")"
+  case "$code" in
+    200)
+      echo
+      ok "The Catalog took the license:"
+      license_show "$out"
+      rm -f -- "$out"
+      license_status
+      if [ "$LICENSE_STATE" = "valid" ]; then
+        ok "Catalog Web confirms it: the license is valid."
+        return 0
+      fi
+      warn "Catalog Web does not confirm the license (license check: $LICENSE_STATE)."
+      echo "  $(license_how) shows it."
+      return 1
+      ;;
+    400)
+      license_message "$out"
+      license_why "$way" "$LICENSE_MSG" "$LICENSE_MSG_KIND"
+      # the Catalog answers so too when it took the license but could not save it
+      if [ "$LICENSE_MSG" = "license.messages.unknown-issue" ]; then
+        license_status
+        if [ "$LICENSE_STATE" = "valid" ]; then
+          warn "The Catalog took the license, but could not save it in its volume"
+          echo "  catalog_license: the license is lost at the next restart of catalog-web."
+        fi
+      fi
+      ;;
+    401) err "The Catalog did not accept the login any more (HTTP 401) - log in again."; LOCAL_AUTH="" ;;
+    403) license_not_admin; LOCAL_AUTH="" ;;
+    000)
+      license_status
+      case "$LICENSE_STATE" in
+        valid)
+          ok "Catalog Web confirms it: the license is valid."
+          rm -f -- "$out"
+          return 0
+          ;;
+        unreachable) err "Catalog Web does not answer at $(local_url) any more." ;;
+        *)
+          if [ "$way" = "order" ]; then
+            err "Catalog Web got no license from Raynet's license server in time."
+            license_net_hint
+          else
+            err "Catalog Web did not answer the activation in time."
+          fi
+          ;;
+      esac
+      ;;
+    *) err "The activation failed (HTTP $code)." ;;
+  esac
+  rm -f -- "$out"
+  return 1
+}
+
+# Activation by order number: Catalog Web fetches the license from Raynet's license server.
+# 0 activated, 1 failed, 2 cancelled
+license_order() {
+  local order="" user="" company="" email="" def="" body rc
+  echo "  Catalog Web fetches the license from Raynet's license server"
+  echo "  (licenses.raynet.de): it needs internet access. The order number, your name,"
+  echo "  company and e-mail address go to Raynet."
+  ui_ask order "Order number:" || order=""
+  if [ -n "$order" ] && [ "$order" != "0" ]; then
+    ui_ask user "User name (your name, for Raynet):" || user=""
+  fi
+  if [ -n "$user" ] && [ "$user" != "0" ]; then
+    ui_ask company "Company name:" || company=""
+  fi
+  if [ -n "$company" ] && [ "$company" != "0" ]; then
+    if email_valid "$NPM_ADMIN_EMAIL"; then
+      def="$NPM_ADMIN_EMAIL"
+    fi
+    while ui_ask email "E-mail address${def:+ [$def]}:"; do
+      email="${email:-$def}"
+      if [ -z "$email" ] || [ "$email" = "0" ] || email_valid "$email"; then
+        break
+      fi
+      err "Give an e-mail address, e.g. it@example.com."
+      email=""
+    done
+  fi
+  if [ -z "$email" ] || [ "$email" = "0" ]; then
+    info "Cancelled."
+    return 2
+  fi
+  body="$(mktemp)"
+  # Ctrl+C (the call can take minutes) removes the order data too
+  license_tmp_guard "$body"
+  (umask 077 && printf '{"orderNumber":"%s","userName":"%s","companyName":"%s","email":"%s"}' \
+    "$(json_escape "$order")" "$(json_escape "$user")" "$(json_escape "$company")" "$(json_escape "$email")" > "$body")
+  order=""
+  info "Catalog Web asks Raynet's license server - this can take a few minutes..."
+  rc=0
+  license_send order -H 'Content-Type: application/json' --data-binary "@$body" --max-time 450 || rc=$?
+  license_tmp_done
+  return "$rc"
+}
+
+# license_file_check PATH -> LICENSE_FILE: PATH without quotes around it and with ~/ expanded; fails (and
+# says why) when it is no readable, non-empty file
+license_file_check() {
+  local path="$1"
+  case "$path" in
+    \"*\"|\'*\') path="${path:1:${#path}-2}" ;;
+  esac
+  case "$path" in
+    "~/"*) path="$HOME/${path#\~/}" ;;
+  esac
+  LICENSE_FILE="$path"
+  if [ ! -f "$path" ]; then
+    err "No license file at $path."
+    return 1
+  fi
+  if [ ! -r "$path" ]; then
+    err "$path cannot be read - run the installer as its owner, or copy it here."
+    return 1
+  fi
+  if [ ! -s "$path" ]; then
+    err "$path is empty."
+    return 1
+  fi
+}
+
+# license_file [PATH] -> activation by the license file of Raynet (.rswl), uploaded as it is.
+# 0 activated, 1 failed, 2 cancelled
+license_file() {
+  local path="${1:-}" dir rc
+  if [ -z "$path" ]; then
+    ui_ask path "Path of the license file (.rswl):" || path=""
+    if [ -z "$path" ] || [ "$path" = "0" ]; then
+      info "Cancelled."
+      return 2
+    fi
+  fi
+  license_file_check "$path" || return 1
+  path="$LICENSE_FILE"
+  # a copy with a plain name: curl -F takes ; and , in a file name for options
+  dir="$(mktemp -d)"
+  license_tmp_guard "$dir"
+  if ! (umask 077 && cp -- "$path" "$dir/license.rswl"); then
+    license_tmp_done
+    err "$path could not be copied to $dir (disk full?)."
+    return 1
+  fi
+  info "Uploading $(basename -- "$path") to $(local_url)"
+  rc=0
+  license_send file -F "file=@$dir/license.rswl" || rc=$?
+  license_tmp_done
+  return "$rc"
+}
+
+# Activation by e-mail: the license text of Raynet's e-mail, pasted - from its line LICENSE STARTS HERE
+# (text before it, a greeting, is dropped) to its line LICENSE ENDS HERE, two empty lines or the end of the
+# input; a text without these lines ends at an empty line. Quotes of an e-mail client (> ) and indentation
+# are dropped, the line breaks kept; in a terminal, what the paste brought after the text is dropped too.
+# 0 activated, 1 failed, 2 cancelled
+license_text() {
+  local file line t n=0 rc started="no" empty=0 skipped=0 eof="no"
+  echo "  Paste the license text of Raynet's e-mail, from its line LICENSE STARTS HERE"
+  echo "  to its line LICENSE ENDS HERE (0 cancels):"
+  file="$(mktemp)"
+  license_tmp_guard "$file"
+  chmod 600 "$file"
+  while [ "$eof" = "no" ]; do
+    line=""
+    IFS= read -r line || eof="yes"
+    line="${line#"${line%%[![:space:]>]*}"}"
+    t="${line//[[:space:]]/}"
+    if [ -z "$t" ]; then
+      empty=$((empty + 1))
+      if [ "$n" -gt 0 ] && { [ "$started" = "no" ] || [ "$empty" -ge 2 ]; }; then
+        break
+      fi
+      continue
+    fi
+    empty=0
+    if [ "$n" -eq 0 ] && [ "$t" = "0" ]; then
+      license_tmp_done
+      info "Cancelled."
+      return 2
+    fi
+    if [[ "$line" == *"LICENSE STARTS HERE"* ]]; then
+      : > "$file"
+      n=0
+      started="yes"
+    elif [ "$started" = "no" ] && [ "$n" -eq 0 ] && { [ "${#t}" -lt 16 ] || ! [[ "$t" =~ ^[A-Za-z0-9+/=]+$ ]]; }; then
+      # text before the license (a greeting) is not part of it
+      skipped=$((skipped + 1))
+      continue
+    fi
+    printf '%s\n' "$line" >> "$file"
+    n=$((n + 1))
+    if [[ "$line" == *"LICENSE ENDS HERE"* ]]; then
+      break
+    fi
+  done
+  if [ "$eof" = "no" ] && [ -t 0 ]; then
+    while IFS= read -r -t 0.3 _; do
+      :
+    done
+  fi
+  if [ "$n" -eq 0 ]; then
+    license_tmp_done
+    if [ "$skipped" -gt 0 ]; then
+      err "No license text found: its line LICENSE STARTS HERE is missing."
+      license_text_hint
+      return 1
+    fi
+    info "Cancelled."
+    return 2
+  fi
+  info "Sending the license text ($n lines) to $(local_url)"
+  rc=0
+  license_send mail -H 'Content-Type: text/plain' --data-binary "@$file" || rc=$?
+  license_tmp_done
+  return "$rc"
+}
+
+# Host name of the running catalog-web container as the Catalog sees it, up to the first dot (empty when
+# it does not run or the engine does not answer)
+running_hostname() {
+  local id host=""
+  if ! engine_cli || ! detect_compose >/dev/null 2>&1; then
+    return 0
+  fi
+  id="$(compose ps -q catalog-web 2>/dev/null | head -n 1)" || id=""
+  if [ -n "$id" ]; then
+    host="$("$ENGINE" container inspect --format '{{.Config.Hostname}}' "$id" 2>/dev/null)" || host=""
+  fi
+  printf '%s' "${host%%.*}"
+}
+
+# Host name of the catalog-web container of this Compose project, running or stopped, as the Catalog sees
+# it: up to the first dot (empty when there is none or the engine does not answer); the files are not
+# needed
+web_container_hostname() {
+  local ids host=""
+  if ! engine_cli; then
+    return 0
+  fi
+  ids="$("$ENGINE" ps -aq --filter "label=com.docker.compose.project=$(stack_project)" --filter "label=com.docker.compose.service=catalog-web" 2>/dev/null)" || ids=""
+  if [ -n "$ids" ]; then
+    host="$("$ENGINE" container inspect --format '{{.Config.Hostname}}' "${ids%%$'\n'*}" 2>/dev/null)" || host=""
+  fi
+  printf '%s' "${host%%.*}"
+}
+
+# The host name catalog-web keeps when the files get their fixed one for the first time: the one its
+# container has now (in the files of older installers its container ID), when the Catalog holds a valid
+# license bound to it or does not answer (stopped, starting: it may hold one). Empty without data volumes
+# (VOLUMES, the volumes of the project), without a container, or when Catalog Web answers that it has no
+# valid license (nothing to lose). Fails, with that name, when it cannot be a fixed host name: the license
+# the Catalog may hold is lost then. license_kept_hostname VOLUMES
+license_kept_hostname() {
+  local host
+  if [ -z "$1" ]; then
+    return 0
+  fi
+  host="$(web_container_hostname)"
+  if [ -z "$host" ]; then
+    return 0
+  fi
+  # not long: a Catalog Web that hangs counts as one that does not answer
+  license_status --max-time 15
+  if [ "$LICENSE_STATE" = "invalid" ]; then
+    return 0
+  fi
+  printf '%s' "$host"
+  hostname_valid "$host"
+}
+
+# The license is bound to the host name catalog-web runs with. Writing the files keeps it when they have
+# no fixed one yet (an older installer: a licensed Catalog keeps its name); a fixed one that differs
+# (CATALOG_HOSTNAME of the files, or of the settings) ends a license activated now when the files are
+# applied. Sets LICENSE_HOST; fails when the activation should wait. license_host_check [menu|wizard]
+license_host_check() {
+  local mode="${1:-menu}" fixed next running
+  LICENSE_HOST=""
+  if [ ! -f "$ENV_FILE" ]; then
+    return 0
+  fi
+  fixed="$(env_hostname)"
+  next="${CATALOG_HOSTNAME:-$fixed}"
+  running="$(running_hostname)"
+  LICENSE_HOST="${running:-$fixed}"
+  if [ -z "$next" ] || [ -z "$running" ] || [ "$running" = "$next" ]; then
+    return 0
+  fi
+  warn "catalog-web still runs with the host name $running."
+  echo "  A license activated now stops working when the files with the fixed host name"
+  echo "  $next (CATALOG_HOSTNAME) are applied."
+  if [ "$mode" = "wizard" ]; then
+    echo "  The repair of I (choice 1) writes and applies them - activate then."
+  elif [ "$next" != "$fixed" ]; then
+    echo "  $(hint 2 generate) writes them, $(hint 6 up) applies them - activate then."
+  else
+    echo "  $(hint 6 up) applies them - activate then."
+  fi
+  confirm "Activate anyway?" n
+}
+
+# license_activate [menu|wizard] -> shows the license and activates one: by order number, license file or
+# the text of Raynet's e-mail. 1: failed. Wizard: 0 when the Catalog has a valid license at the end, 2 later.
+license_activate() {
+  local mode="${1:-menu}" choice rc fails=0 later="cancel"
+  LOCAL_AUTH=""
+  license_status
+  case "$LICENSE_STATE" in
+    unreachable|error)
+      report_license_state
+      return 1
+      ;;
+  esac
+  if [ "$mode" = "wizard" ]; then
+    if [ "$LICENSE_STATE" = "valid" ]; then
+      report_license_state
+      return 0
+    fi
+    later="later $UI_SEP option 25 activates it"
+    echo "  The Catalog needs a license from Raynet: without one it takes no data."
+    if ! license_host_check wizard; then
+      info "Later: option 25 activates the Catalog."
+      return 2
+    fi
+  else
+    echo
+    report_license_state
+    if ! license_host_check; then
+      info "Cancelled."
+      return 0
+    fi
+    rc=0
+    license_login show || rc=$?
+    case "$rc" in
+      0) ;;
+      2) return 0 ;;
+      *) return 1 ;;
+    esac
+    if [ "$LICENSE_STATE" = "valid" ] && ! confirm "Activate again?" n; then
+      return 0
+    fi
+  fi
+  while true; do
+    echo
+    printf '   %s %s  %s\n' "${C_BLD}1$C_RST" "$(menu_icon run)" "By order number $C_DIM(Catalog Web fetches it from Raynet: internet)$C_RST"
+    printf '   %s %s  %s\n' "${C_BLD}2$C_RST" "$(menu_icon run)" "By license file $C_DIM(the .rswl file of Raynet)$C_RST"
+    printf '   %s %s  %s\n' "${C_BLD}3$C_RST" "$(menu_icon run)" "By e-mail $C_DIM(paste the license text of Raynet's e-mail)$C_RST"
+    printf '   %s    %s\n' "${C_BLD}0$C_RST" "$C_DIM$later$C_RST"
+    echo
+    ui_ask choice "Select [0]:" || choice="0"
+    choice="${choice:-0}"
+    case "$choice" in
+      1|2|3) ;;
+      0)
+        if [ "$mode" = "wizard" ]; then
+          info "Later: option 25 activates the Catalog."
+          return 2
+        fi
+        info "Cancelled."
+        return 0
+        ;;
+      *) warn "Unknown choice: $choice"; continue ;;
+    esac
+    echo
+    rc=0
+    if [ -z "$LOCAL_AUTH" ]; then
+      license_login show || rc=$?
+      if [ "$rc" -eq 0 ]; then
+        echo
+      fi
+    fi
+    if [ "$rc" -eq 0 ]; then
+      case "$choice" in
+        1) license_order || rc=$? ;;
+        2) license_file || rc=$? ;;
+        3) license_text || rc=$? ;;
+      esac
+    fi
+    case "$rc" in
+      0) return 0 ;;
+      2) ;;
+      *) fails=$((fails + 1)) ;;
+    esac
+    if [ "$fails" -ge 3 ]; then
+      warn "Stopped after $fails failed attempts - $(license_how) tries again."
+      return 1
+    fi
+    if [ "$rc" -ne 2 ]; then
+      echo "  Another way below, or 0."
+    fi
+  done
+}
+
+# license [status|file PATH|order|text] on the command line; without an argument as option 25
+license_cli() {
+  local path="${2:-}"
+  case "${1:-}" in
+    "") license_activate menu ;;
+    status)
+      license_status
+      report_license_state
+      [ "$LICENSE_STATE" = "valid" ]
+      ;;
+    file|order|text)
+      # a wrong path is named before the login
+      if [ "$1" = "file" ]; then
+        if [ -z "$path" ]; then
+          err "Give the license file: $0 license file PATH"
+          return 2
+        fi
+        if [[ "$path" != /* ]] && [ -e "$CALL_DIR/$path" ]; then
+          path="$CALL_DIR/$path"
+        fi
+        license_file_check "$path" || return 1
+        path="$LICENSE_FILE"
+      fi
+      license_status
+      case "$LICENSE_STATE" in
+        unreachable|error) report_license_state; return 1 ;;
+      esac
+      report_license_state
+      license_host_check || return 1
+      license_login || return 1
+      case "$1" in
+        file) license_file "$path" ;;
+        order) license_order ;;
+        text) license_text ;;
+      esac
+      ;;
+    *)
+      err "Unknown option for license: $1 (status, file PATH, order or text)"
+      return 2
+      ;;
+  esac
+}
+
+# Step of the install task: the license, which the data needs. A valid one is named in the data step.
+install_license() {
+  local n="$1" rc=0
+  shift
+  license_status
+  if [ "$LICENSE_STATE" = "valid" ]; then
+    return 0
+  fi
+  wiz_head "Install" "$n" "$@"
+  wiz_run license_activate wizard || rc=$?
+  # the outcome (a failure too) stays on the screen until a key; later goes on at once
+  if [ "$rc" -ne 2 ]; then
+    ui_pause_tty
+  fi
 }
 
 ###############################################################################
@@ -5905,6 +7931,23 @@ install_note() {
   fi
 }
 
+# install_differs NAME SETTING VALUE -> true when the setting NAME (SETTING) would change the VALUE the
+# installation has. An empty CATALOG_HOSTNAME is automatic: the next generate keeps the host name .env has,
+# so a valid one there is no difference (only a backup with another name than .env is - the license is
+# bound to it); MONGO_WT_CACHE_GB of .env is derived (MONGO_CACHE_GB, else the memory), never a setting.
+install_differs() {
+  case "$1" in
+    CATALOG_HOSTNAME)
+      if [ -z "$2" ]; then
+        hostname_valid "$3" && [ "$(env_hostname)" != "$3" ]
+        return
+      fi
+      ;;
+    MONGO_CACHE_GB|MONGO_WT_CACHE_GB) return 1 ;;
+  esac
+  [ "$2" != "$3" ]
+}
+
 # The values of the installation in this folder (its env file, see install_env) that the settings would
 # change, the versions aside (newer ones are an update, older ones are install_note's): "The settings
 # differ from the installation in CATALOG_WEB_PORT, TZ" (empty: none). A new download of the installer
@@ -5922,7 +7965,7 @@ install_diff_note() {
     case "$name" in
       ""|CATALOG_VERSION|*_TAG) continue ;;
     esac
-    if [ "${!name-}" != "$value" ]; then
+    if install_differs "$name" "${!name-}" "$value"; then
       n=$((n + 1))
       if [ "$n" -le 3 ]; then
         names="$names${names:+, }$name"
@@ -6019,8 +8062,16 @@ install_takeover() {
       theirs["$name"]="$value"
     fi
   done <<< "$(install_values "$src")"
+  # the env file of an older installer has no host name: catalog-web runs with its container ID, to which a
+  # license may be bound - the name of the current .env (not the installation's) would end it
+  if [ "$src" != "$ENV_FILE" ] && [ -z "${theirs[CATALOG_HOSTNAME]+set}" ]; then
+    value="$(license_kept_hostname "$(project_volumes)")" || value=""
+    if [ -n "$value" ]; then
+      theirs[CATALOG_HOSTNAME]="$value"
+    fi
+  fi
   while IFS='|' read -r name ours; do
-    if [ -n "$name" ] && [ -n "${theirs[$name]+set}" ] && [ "${theirs[$name]}" != "$ours" ]; then
+    if [ -n "$name" ] && [ -n "${theirs[$name]+set}" ] && install_differs "$name" "$ours" "${theirs[$name]}"; then
       diffs+=("$name|$ours|${theirs[$name]}")
       specs+=("$name|${theirs[$name]}")
     fi
@@ -6366,6 +8417,7 @@ offer_patch_updates() {
     ok "No updates of MongoDB, OpenSearch, RabbitMQ, MinIO or Nginx Proxy Manager inside their series."
     return 0
   fi
+  license_host_note
   while true; do
     echo
     ui_box "$(ui_width)" "Patch updates" "Inside the series Raynet runs: fixes and minor steps, no major versions"
@@ -6453,7 +8505,10 @@ patch_apply() {
   info "Recreating the changed services"
   compose up -d --remove-orphans
   PATCH_STAGE=""
-  stack_health
+  if ! stack_health; then
+    return 1
+  fi
+  license_recheck
 }
 
 patch_cleanup() {
@@ -6541,6 +8596,7 @@ do_upgrade() {
  It runs as a background job: closing the SSH session does not stop it, and a cancel
  before step 3 changes nothing while a cancel after it goes back to $installed.
 EOF
+    license_host_note
     if ! confirm "Upgrade the Catalog to $target now? (the Catalog is offline during steps 3 to 6)" n; then
       info "Cancelled - nothing was changed."
       return 0
@@ -6623,6 +8679,7 @@ upgrade_run() {
   info "Pulling the images of $target"
   if ! compose pull catalog-web worker-recognition-1 worker-recognition-2 worker-other worker-search; then
     err "Pulling the images failed - the running version was not touched."
+    net_offer_check "Pulling the images"
     upgrade_revert_settings
     UPG_STAGE=""
     return 1
@@ -6637,6 +8694,7 @@ upgrade_run() {
   if stack_health && [ "$(running_tag catalog-web)" = "$target" ]; then
     UPG_STAGE=""
     ok "Catalog upgraded: $installed -> $target."
+    license_recheck
     return 0
   fi
   UPG_STAGE=""
@@ -6708,6 +8766,7 @@ update_installer() {
   if ! head -n 1 "$tmp" | grep -q '^#!/usr/bin/env bash' || ! settings_section "$tmp" >/dev/null || ! "$BASH" -n "$tmp" 2>/dev/null; then
     rm -f -- "$tmp"
     err "The download failed or is not a valid installer."
+    net_offer_check "The download of the installer"
     return 1
   fi
   new_names="$(settings_pairs "$tmp" | cut -d'|' -f1)"
@@ -7200,6 +9259,7 @@ adopt_installation() {
     return 1
   fi
   ok "Imported $imported settings from $envf; passwords kept in $ENV_FILE."
+  net_adopt "$dir" "$envf"
   if [ -n "$skipped" ]; then
     warn "Not imported (special characters):$skipped"
   fi
@@ -7275,6 +9335,42 @@ if [ -n "$C_RST" ]; then
   C_MAG=$'\033[1;35m'
   C_HRT=$'\033[31m'
 fi
+
+# The logo above the menu (4 rows): the mark and TECHNOLOGY up to column 48, CATALOG after it
+UI_LOGO_SPLIT=48
+if [ "$UI_UTF" = "true" ]; then
+  UI_LOGO=(
+    ' ___     ___  _  _           _      _   __'
+    '|  / \    |  |  /  | | |\ | / \ |  / \ /   \ /  ▄▀▀ ▄▀▄ ▀█▀ ▄▀▄ █   ▄▀▄ ▄▀▀'
+    '| <   >   |  |- |  |-| | \| | | |  | | | _  |   █   █▄█  █  █▄█ █   █ █ █ ▄'
+    '|  \ /    |  |_ \_ | | |  | \_/ |_ \_/ \_|  |   ▀▄▄ █ █  █  █ █ █▄▄ ▀▄▀ ▀▄█'
+  )
+else
+  UI_LOGO=(
+    ' ___     ___  _  _           _      _   __      ###  #  ###  #  #   ### ###'
+    '|  / \    |  |  /  | | |\ | / \ |  / \ /   \ /  #   # #  #  # # #   # # #'
+    '| <   >   |  |- |  |-| | \| | | |  | | | _  |   #   ###  #  ### #   # # # #'
+    '|  \ /    |  |_ \_ | | |  | \_/ |_ \_/ \_|  |   ### # #  #  # # ### ### ###'
+  )
+fi
+
+# ui_logo COLS -> the logo centred as one block (one left margin from the widest row), CATALOG in bold
+ui_logo() {
+  local cols="$1" line w=0 pad rest
+  for line in "${UI_LOGO[@]}"; do
+    if [ "${#line}" -gt "$w" ]; then
+      w="${#line}"
+    fi
+  done
+  pad=$(( (cols - w) / 2 ))
+  if [ "$pad" -lt 0 ]; then
+    pad=0
+  fi
+  for line in "${UI_LOGO[@]}"; do
+    rest="${line:$UI_LOGO_SPLIT}"
+    printf '%*s%s%s\n' "$pad" '' "${line:0:$UI_LOGO_SPLIT}" "${rest:+$C_BLD$rest$C_RST}"
+  done
+}
 
 # Width of sub-screens: the terminal, at most 118 columns.
 ui_width() {
@@ -7405,22 +9501,26 @@ ui_repeat() {
   printf '%s' "$s"
 }
 
-# Visible length of a string (ANSI color codes do not count).
+# Visible length of a string (ANSI color codes do not count). The codes are removed in bash, without a
+# process: a job view pads many lines each time it is drawn.
 ui_len() {
-  local s
-  s="$(printf '%s' "$1" | sed 's/\x1b\[[0-9;]*m//g')"
+  local s="$1" re=$'\e''\[[0-9;]*m'
+  while [[ "$s" =~ $re ]]; do
+    s="${s/"${BASH_REMATCH[0]}"/}"
+  done
   printf '%s' "${#s}"
 }
 
 # ui_pad TEXT WIDTH -> TEXT cut or padded to exactly WIDTH visible characters
 ui_pad() {
-  local text="$1" width="$2" len
-  len="$(ui_len "$text")"
-  if [ "$len" -gt "$width" ]; then
-    text="$(printf '%s' "$text" | sed 's/\x1b\[[0-9;]*m//g')"
-    printf '%s' "${text:0:$((width - 1))}~"
+  local text="$1" width="$2" plain="$1" re=$'\e''\[[0-9;]*m'
+  while [[ "$plain" =~ $re ]]; do
+    plain="${plain/"${BASH_REMATCH[0]}"/}"
+  done
+  if [ "${#plain}" -gt "$width" ]; then
+    printf '%s' "${plain:0:$((width - 1))}~"
   else
-    printf '%s%s' "$text" "$(ui_repeat ' ' $((width - len)))"
+    printf '%s%*s' "$text" $((width - ${#plain})) ''
   fi
 }
 
@@ -7511,25 +9611,81 @@ ui_hold_line() {
   fi
 }
 
-# The live panel of one job.
+# The live panel of one job: its progress and the last lines of its log, wrapped at the width of the panel,
+# as many as the terminal has room for. A job that has ended shows every line from its first step on (a
+# line that starts with a time, e.g. of an import), however long: nothing draws over it any more.
 ui_job_panel() {
-  local id="$1" state="$2" pct="$3" text="$4" width last badge
+  local id="$1" state="$2" pct="$3" text="$4" width badge n w i j first line cut word room
+  local -a lines=() part=() rev=() shown=()
   width="$(ui_cols)"
   if [ "$width" -gt 100 ]; then
     width=100
   fi
   UI_PANEL_W="$width"
-  last="$(grep -v '^[[:space:]]*$' "$JOBS_DIR/$id/log" 2>/dev/null | tail -n 1 | sed 's/\x1b\[[0-9;]*m//g; s/\r.*//; s/^==> //')" || last=""
+  # the rest of the panel takes 5 lines, the cursor one below it
+  n=$(($(ui_rows) - 6))
+  if [ "$n" -lt 1 ]; then
+    n=1
+  fi
+  w=$((width - 6))
+  if [ "$w" -lt 10 ]; then
+    w=10
+  fi
+  mapfile -t lines < <(tail -n 200 -- "$JOBS_DIR/$id/log" 2>/dev/null | grep -v '^[[:space:]]*$' | sed 's/\x1b\[[0-9;]*m//g; s/\r.*//; s/^==> //')
+  if [ "${#lines[@]}" -eq 0 ]; then
+    lines=("...")
+  fi
+  first=${#lines[@]}
+  if [ "$state" != "running" ]; then
+    for i in "${!lines[@]}"; do
+      if [[ "${lines[i]}" =~ ^[0-9][0-9]:[0-9][0-9]:[0-9][0-9]\  ]]; then
+        first="$i"
+        break
+      fi
+    done
+  fi
+  # from the newest line back; a line that does not fit any more keeps its start
+  for ((i = ${#lines[@]} - 1; i >= 0 && (${#rev[@]} < n || i >= first); i--)); do
+    line="${lines[i]}"
+    part=()
+    while [ "${#line}" -gt "$w" ]; do
+      # at the last space, unless that leaves less than half a line
+      cut="${line:0:$w}"
+      word="${cut% *}"
+      if [ "${#word}" -ge $((w / 2)) ]; then
+        cut="$word"
+      fi
+      part+=("$cut")
+      line="${line:${#cut}}"
+      line="${line# }"
+    done
+    part+=("$line")
+    room=$((n - ${#rev[@]}))
+    if [ "$i" -lt "$first" ] && [ "${#part[@]}" -gt "$room" ]; then
+      part=("${part[@]:0:$room}")
+    fi
+    for ((j = ${#part[@]} - 1; j >= 0; j--)); do
+      if [ "$i" -eq $((${#lines[@]} - 1)) ] && [ "$j" -eq 0 ]; then
+        rev+=("$C_DIM$UI_ARROW ${part[j]}$C_RST")
+      else
+        rev+=("$C_DIM  ${part[j]}$C_RST")
+      fi
+    done
+  done
+  for ((i = ${#rev[@]} - 1; i >= 0; i--)); do
+    shown+=("${rev[i]}")
+  done
   case "$state" in
     running) badge="$C_CYN$UI_DOT running$C_RST" ;;
     done) badge="$C_GRN$UI_OK done$C_RST" ;;
     cancelled) badge="$C_YLW$UI_NO cancelled$C_RST" ;;
+    unfollowed) badge="$C_YLW$UI_NO result unknown$C_RST" ;;
     *) badge="$C_RED$UI_NO $state$C_RST" ;;
   esac
   ui_box "$width" "Job #$id $UI_SEP $(cat -- "$JOBS_DIR/$id/title")" \
     "$badge   $(if [ -n "$pct" ]; then printf '%s %5s%%' "$(ui_bar "$pct" $((width - 30)))" "$pct"; else printf '%s' "${text:-working}"; fi)" \
     "$(if [ -n "$pct" ]; then printf '%s' "$text"; else printf '%s' ""; fi)" \
-    "$C_DIM$UI_ARROW ${last:-...}$C_RST" \
+    "${shown[@]}" \
     "$(ui_hold_line)"
 }
 
@@ -7550,6 +9706,7 @@ ui_processes_box() {
       lines+=("")
       case "$state" in
         done) lines+=("$C_GRN$UI_OK #$id $title$C_RST" "  ${C_DIM}finished $UI_SEP J shows the result$C_RST") ;;
+        unfollowed) lines+=("$C_YLW$UI_NO #$id $title$C_RST" "  ${C_DIM}result unknown $UI_SEP J shows the log$C_RST") ;;
         *) lines+=("$C_RED$UI_NO #$id $title$C_RST" "  ${C_DIM}$state $UI_SEP J shows the log$C_RST") ;;
       esac
     else
@@ -7615,6 +9772,13 @@ job_progress() {
 job_step() {
   if [ -n "$JOB_DIR" ]; then
     job_progress "" "$1"
+  fi
+}
+
+# The job stops following a task that goes on elsewhere (an import in the Catalog): it ends without a result.
+job_unfollowed() {
+  if [ -n "$JOB_DIR" ] && [ -d "$JOB_DIR" ]; then
+    : > "$JOB_DIR/unfollowed"
   fi
 }
 
@@ -7691,6 +9855,7 @@ import_wait_store() {
   info "Upload finished - the Catalog now copies the snapshot into its file storage (MinIO); the import starts when that is done."
   job_step "Storing the snapshot in the Catalog"
   while kill -0 "$pid" 2>/dev/null; do
+    local_auth_renew
     now=$((SECONDS - t0))
     cur=""
     if [ -n "$base" ]; then
@@ -7810,6 +9975,7 @@ job_start() {
   echo "running" > "$dir/state"
   echo "|starting" > "$dir/progress"
   job_class "$1" > "$dir/class"
+  if [ "$(cat -- "$dir/class")" = "import" ]; then mem_oom_marks > "$dir/oom-marks"; fi
   if [ -n "$secret" ]; then
     (umask 077 && printf '%s' "$secret" > "$dir/secret")
   fi
@@ -7852,14 +10018,20 @@ job_on_signal() {
 job_finish() {
   local rc=$? state
   trap '' TERM INT HUP
+  # the root-only proxy file of a step that was running (it holds the proxy login)
+  proxy_run_end
   if [ "$rc" -ne 0 ] && [ -n "$JOB_CLEANUP" ]; then
     job_progress "" "cleaning up"
     $JOB_CLEANUP || true
   fi
+  if [ "$rc" -ne 0 ] && [ "$JOB_CANCELLED" != "true" ] && [ "$(cat -- "$JOB_DIR/class" 2>/dev/null)" = "import" ]; then mem_oom_report "$(cat -- "$JOB_DIR/oom-marks" 2>/dev/null)" || true; fi
   if [ "$JOB_CANCELLED" = "true" ]; then
     state="cancelled"
   elif [ "$rc" -eq 0 ]; then
     state="done"
+  elif [ -f "$JOB_DIR/unfollowed" ]; then
+    # the job stopped following a task that goes on elsewhere (job_unfollowed)
+    state="unfollowed"
   else
     state="failed"
   fi
@@ -7975,7 +10147,7 @@ job_follow() {
       sleep 1
     done
     job_report "$id"
-    [ "$(job_state "$id")" = "done" ]
+    job_rc "$id"
     return
   fi
   tput civis 2>/dev/null || true
@@ -8017,9 +10189,19 @@ job_follow() {
   tput cnorm 2>/dev/null || true
   ui_echo
   job_report "$id"
-  [ "$(job_state "$id")" = "done" ]
+  job_rc "$id"
 }
 
+# job_rc ID -> how a followed job ended: 0 done, 3 its task goes on elsewhere (job_unfollowed), 1 otherwise
+job_rc() {
+  case "$(job_state "$1")" in
+    done) return 0 ;;
+    unfollowed) return 3 ;;
+    *) return 1 ;;
+  esac
+}
+
+# The result of a job below its log (the live view shows the last lines of the log in its panel)
 job_report() {
   local id="$1" dir="$JOBS_DIR/$1" state
   state="$(job_state "$id")"
@@ -8027,13 +10209,8 @@ job_report() {
   case "$state" in
     done) ok "Job #$id finished: $(cat -- "$dir/title")" ;;
     cancelled) warn "Job #$id was cancelled: $(cat -- "$dir/title")" ;;
-    *)
-      err "Job #$id $state: $(cat -- "$dir/title")"
-      if ui_fancy; then
-        echo "  Last lines of its log:"
-        tail -n 15 "$dir/log" | sed 's/^/    /'
-      fi
-      ;;
+    unfollowed) warn "Job #$id ended without a result: $(cat -- "$dir/title") - its last lines say why." ;;
+    *) err "Job #$id $state: $(cat -- "$dir/title")" ;;
   esac
   touch "$dir/seen"
 }
@@ -8042,7 +10219,7 @@ job_state_color() {
   case "$1" in
     running) printf '%s' "$C_CYN" ;;
     done) printf '%s' "$C_GRN" ;;
-    cancelled) printf '%s' "$C_YLW" ;;
+    cancelled|unfollowed) printf '%s' "$C_YLW" ;;
     *) printf '%s' "$C_RED" ;;
   esac
 }
@@ -9563,7 +11740,7 @@ check_settings() {
     err "COMPOSE_PROJECT_NAME may only contain lower-case letters, digits, - and _ (is \"$COMPOSE_PROJECT_NAME\")."
     problems=$((problems + 1))
   fi
-  for name in CATALOG_DOMAIN NPM_ADMIN_EMAIL; do
+  for name in CATALOG_DOMAIN NPM_ADMIN_EMAIL CATALOG_HOSTNAME INTERNET_PROXY INTERNET_NO_PROXY INTERNET_PROXY_CA_FILE INTERNET_PROXY_PAC; do
     if [ -n "${!name:-}" ] && ! value="$(settings_check "$name" "${!name}" "")"; then
       err "$name: $value"
       problems=$((problems + 1))
@@ -9579,6 +11756,10 @@ check_settings() {
   fi
   if ! [[ "${HEALTH_TIMEOUT:-}" =~ ^[1-9][0-9]{0,5}$ ]]; then
     err "HEALTH_TIMEOUT must be a number of seconds, e.g. 600 (is \"${HEALTH_TIMEOUT:-}\")."
+    problems=$((problems + 1))
+  fi
+  if [ -n "${MONGO_CACHE_GB:-}" ] && ! mongo_cache_valid "$MONGO_CACHE_GB"; then
+    err "MONGO_CACHE_GB must be GB like 4 or 2.5 (at least 0.25) or empty (is \"$MONGO_CACHE_GB\")."
     problems=$((problems + 1))
   fi
   for name in ENV_FILE COMPOSE_FILE; do
@@ -9623,6 +11804,7 @@ MONGO_INITDB_ROOT_PASSWORD=${MONGO_INITDB_ROOT_PASSWORD}
 MONGO_INITDB_DATABASE=${MONGO_INITDB_DATABASE}
 MONGO_AUTH_DATABASE=${MONGO_AUTH_DATABASE}
 MONGO_PORT_HOST=${MONGO_PORT_HOST}
+MONGO_WT_CACHE_GB=${MONGO_WT_CACHE_GB}
 
 # MinIO
 MINIO_ROOT_USER=${MINIO_ROOT_USER}
@@ -9639,6 +11821,7 @@ RABBITMQ_UI_PORT=${RABBITMQ_UI_PORT}
 
 # Catalog / App
 CATALOG_WEB_PORT=${CATALOG_WEB_PORT}
+CATALOG_HOSTNAME=${CATALOG_HOSTNAME}
 CATALOG_LICENSE_PATH=${CATALOG_LICENSE_PATH}
 
 # OpenSearch
@@ -9676,6 +11859,7 @@ EOF
   if [ -n "$COMPOSE_PROJECT_NAME" ]; then
     printf '\nCOMPOSE_PROJECT_NAME=%s\n' "$COMPOSE_PROJECT_NAME" >> "$ENV_FILE"
   fi
+  net_env_block >> "$ENV_FILE"
 }
 
 write_compose_file() {
@@ -9740,6 +11924,7 @@ EOF
 
   mongo:
     image: mongo:${MONGO_TAG}
+    command: ["--wiredTigerCacheSizeGB", "${MONGO_WT_CACHE_GB:-1}"]
     restart: always
     depends_on:
       - opensearch-dashboards
@@ -9793,6 +11978,7 @@ EOF
 
   catalog-web:
     image: ${CATALOG_IMAGE}
+    hostname: ${CATALOG_HOSTNAME}
     depends_on:
       - mongo
       - minio
@@ -9988,6 +12174,7 @@ EOF
   if [ "$OS_KIND" = "Darwin" ] && [ "$(engine_arch)" = "arm64" ]; then
     sed -i 's#^    image: ${CATALOG\(_WORKER\)\{0,1\}_IMAGE}$#&\n    platform: linux/amd64#' "$COMPOSE_FILE"
   fi
+  net_compose_edit "$COMPOSE_FILE"
 }
 
 # do_generate [ask|keep|new] [show-next|no-next]
@@ -9995,7 +12182,7 @@ EOF
 #   keep : keep the passwords of the existing env file (or of its newest backup)
 #   new  : always generate new passwords
 do_generate() {
-  local mode="${1:-ask}" next="${2:-show-next}" choice var value pw_file="" volumes sib npm_new="false"
+  local mode="${1:-ask}" next="${2:-show-next}" choice var value pw_file="" volumes sib npm_new="false" host host_from old_host bad_host named kept lost
   GENERATE_CANCELLED="false"
   reload_settings
   tz_name_warning
@@ -10006,6 +12193,23 @@ do_generate() {
   fi
   if ! downgrade_guard settings; then
     GENERATE_CANCELLED="true"
+    return 1
+  fi
+
+  # the host name of catalog-web in the env file (else in its newest backup). Files without one keep the
+  # one of a licensed catalog-web (below), which only the engine can tell: nothing is written without it
+  host_from="$ENV_FILE"
+  if [ ! -f "$host_from" ]; then
+    host_from="$(newest_env_backup)"
+  fi
+  old_host=""
+  if [ -n "$host_from" ] && [ -f "$host_from" ]; then
+    old_host="$(env_hostname "$host_from")"
+  fi
+  if [ -z "$CATALOG_HOSTNAME" ] && [ -n "$host_from" ] && [ -z "$old_host" ] && ! engine_answers; then
+    err "$ENGINE_NAME does not answer - $(engine_down_hint)."
+    echo "  Nothing was written: catalog-web gets a fixed host name now, and a licensed"
+    echo "  Catalog keeps the one its container has, which only $ENGINE_NAME can tell."
     return 1
   fi
 
@@ -10115,11 +12319,42 @@ do_generate() {
     fi
     printf -v "$var" '%s' "$value"
   done
+  # the host name of catalog-web stays as it was (the license is bound to it). Files that get one for the
+  # first time keep the one a licensed catalog-web has, else they get the name of this server; another
+  # one (CATALOG_HOSTNAME) needs a license for the new name.
+  host="$(catalog_hostname "$host_from")"
+  bad_host=""
+  if [ -z "$CATALOG_HOSTNAME" ] && [ -n "$old_host" ] && ! hostname_valid "$old_host"; then
+    bad_host="$old_host"
+  fi
+  named="$CATALOG_HOSTNAME"
+  volumes=""
+  if [ "$old_host" != "$host" ]; then
+    volumes="$(project_volumes)"
+  fi
+  kept=""
+  lost=""
+  if [ -z "$named" ] && [ -z "$old_host" ]; then
+    if kept="$(license_kept_hostname "$volumes")"; then
+      host="${kept:-$host}"
+    else
+      lost="$kept"
+      kept=""
+    fi
+  fi
+  local CATALOG_HOSTNAME="$host"
+  # the cache of MongoDB for the memory of the engine; while the engine does not answer, the one of before
+  local MONGO_WT_CACHE_GB
+  MONGO_WT_CACHE_GB="$(mongo_cache_gb)"
+  if [ -z "$MONGO_WT_CACHE_GB" ] && [ -n "$host_from" ] && [ -f "$host_from" ]; then
+    MONGO_WT_CACHE_GB="$(sed -n 's/^MONGO_WT_CACHE_GB=//p' "$host_from" | tail -n 1)"
+  fi
 
   echo "Writing ${ENV_FILE}..."
   write_env_file
   echo "Writing ${COMPOSE_FILE}..."
   write_compose_file
+  net_ca_bundle_write || true
   if [ "$npm_new" = "true" ]; then
     npm_login_note reset
   fi
@@ -10129,7 +12364,48 @@ do_generate() {
   echo
   show_credentials
   echo "  Nginx enabled  : $INSTALL_NGINX_PROXY_MANAGER"
+  echo "  Host name      : $host (catalog-web; the license is bound to it)"
+  if [ -n "$MONGO_WT_CACHE_GB" ]; then
+    echo "  MongoDB cache  : $MONGO_WT_CACHE_GB GB ($(if [ -n "${MONGO_CACHE_GB:-}" ]; then printf 'MONGO_CACHE_GB'; else printf 'automatic, for the memory of %s' "$ENGINE_NAME"; fi))"
+  else
+    echo "  MongoDB cache  : set at the start ($ENGINE_NAME does not answer yet)"
+  fi
   echo
+  if [ -n "$bad_host" ]; then
+    warn "CATALOG_HOSTNAME in $host_from is no usable host name: $bad_host"
+    echo "  catalog-web gets $host instead (letters, digits and -, no dots)."
+  fi
+  if [ -n "$kept" ]; then
+    ok "catalog-web keeps its host name $host: the Catalog's license"
+    echo "  is bound to it (CATALOG_HOSTNAME in $ENV_FILE)."
+    echo
+  elif [ -z "$lost" ] && [ -z "$old_host" ] && [ -z "$named" ] && [ -n "$volumes" ]; then
+    info "catalog-web now has the fixed host name $host (CATALOG_HOSTNAME)."
+    echo "  The Catalog binds its license to it and holds no valid license now: none is"
+    echo "  lost. After the next start, $(hint 25 license) activates one for this name."
+    echo
+  elif [ -n "$lost" ] || { [ "$old_host" != "$host" ] && [ -n "$volumes" ] && [ "$host" != "$(web_container_hostname)" ]; }; then
+    # a name catalog-web does not have yet (with the one it has, the license stays valid), or one it
+    # cannot keep
+    if [ -n "$lost" ]; then
+      warn "catalog-web gets another host name: $host (before: $lost)."
+      echo "  $lost cannot be a fixed host name (letters, digits and -, at most 63"
+      echo "  characters, no service name). The Catalog binds its license to its host"
+      echo "  name: after the next start it needs a license for $host."
+    elif [ -z "$old_host" ]; then
+      warn "catalog-web now has the fixed host name $host (CATALOG_HOSTNAME)."
+      echo "  The Catalog binds its license to its host name, which changed with every new"
+      echo "  container so far: after the next start it needs a license for $host."
+    else
+      warn "catalog-web gets another host name: $host (before: $old_host)."
+      echo "  The Catalog binds its license to its host name: after the next start it"
+      echo "  needs a license for $host."
+    fi
+    echo "  The license activated before does not fit the new name. $(hint 25 license)"
+    echo "  shows the hardware ID: the order number fetches a license for it from"
+    echo "  Raynet, or Raynet makes a license file or e-mail text for it."
+    echo
+  fi
 
   if [ "$next" = "show-next" ]; then
     if [ "$INTERACTIVE" = "true" ]; then
@@ -10167,6 +12443,9 @@ show_credentials() {
     else
       echo "  NPM login      : as set up in Nginx Proxy Manager (its admin was not created from $ENV_FILE)"
     fi
+  fi
+  if [ -n "$(proxy_login)" ]; then
+    echo "  Proxy login    : $(proxy_login_user) (password saved in $(basename -- "$PROXY_LOGIN_FILE"), mode 600)"
   fi
 }
 
@@ -10207,13 +12486,13 @@ show_access_info() {
   printf '  %-24s http://%s:%s\n' "MinIO console" "$addr" "$(setting MINIO_CONSOLE_PORT_HOST)"
   printf '  %-24s http://%s:%s\n' "OpenSearch Dashboards" "$addr" "$(setting OPENSEARCH_DASHBOARDS_PORT)"
   if [ "$ENGINE" = "docker" ]; then
-    echo "Note: these ports are published on all network interfaces, and Docker-published ports are"
-    echo "      NOT filtered by ufw/firewalld. OpenSearch Dashboards has no login - restrict access to it"
-    echo "      (network firewall or the DOCKER-USER iptables chain)."
+    echo "Note: these ports are published on all network interfaces, and Docker-published"
+    echo "      ports are NOT filtered by ufw/firewalld. OpenSearch Dashboards has no login -"
+    echo "      restrict access to it (network firewall or the DOCKER-USER iptables chain)."
   else
-    echo "Note: these ports are published on all network interfaces, and Podman forwards them before"
-    echo "      ufw/firewalld see them. OpenSearch Dashboards has no login - restrict access to it"
-    echo "      (network firewall)."
+    echo "Note: these ports are published on all network interfaces, and Podman forwards"
+    echo "      them before ufw/firewalld see them. OpenSearch Dashboards has no login -"
+    echo "      restrict access to it (network firewall)."
   fi
   echo
 
@@ -10276,6 +12555,7 @@ do_up() {
   require_engine || return 1
   engine_guard || return 1
   downgrade_guard files || return 1
+  net_ca_bundle_ensure
   if mongo_kernel_problem; then
     warn "MongoDB $(setting MONGO_TAG) refuses to start on kernel $(engine_kernel) without a workaround (SERVER-121912)."
     warn "Regenerate the files ($(hint 2 generate)): MongoDB then starts with GLIBC_TUNABLES=glibc.pthread.rseq=1."
@@ -10299,6 +12579,7 @@ do_up() {
       return 0
     fi
   fi
+  mongo_cache_refresh
   info "Validating configuration..."
   compose config --quiet
   ok "Configuration is valid."
@@ -10342,6 +12623,7 @@ do_status() {
   elif note="$(install_diff_note)" && [ -n "$note" ]; then
     warn "$note - $(hint 23 "adopt .") takes the installation's values over, $(hint 2 generate) writes the settings."
   fi
+  mem_oom_report || true
 }
 
 do_logs() {
@@ -10384,7 +12666,10 @@ do_logs() {
 do_pull() {
   require_files || return 1
   require_engine || return 1
-  compose pull
+  if ! compose pull; then
+    net_offer_check "The download of the images"
+    return 1
+  fi
   ok "Images pulled. Apply them with $(hint 6 up)."
 }
 
@@ -10432,7 +12717,7 @@ do_reset() {
 }
 
 do_check() {
-  local problems=0 name port mmc host_tz v where=""
+  local problems=0 name port mmc host_tz v where="" mb
   info "Checking prerequisites..."
   echo "  Container engine: $ENGINE_NAME$(if [ -z "$CONTAINER_ENGINE" ]; then printf ' (CONTAINER_ENGINE is empty: the one found on this server)'; fi)"
 
@@ -10636,6 +12921,15 @@ do_check() {
     fi
   fi
 
+  mb="$(engine_mem_mb)"
+  if [ -n "$mb" ] && mem_low "$mb"; then
+    warn "Memory: $(mem_gb "$mb") GB for the containers - at least $MEM_RECOMMENDED_GB GB is recommended"
+    echo "      A full snapshot import loads MongoDB, the Catalog and OpenSearch at once."
+  elif [ -n "$mb" ]; then
+    ok "Memory: $(mem_gb "$mb") GB for the containers - enough for a full snapshot import"
+  fi
+  mem_oom_report || true
+
   if command -v ss >/dev/null 2>&1 || command -v lsof >/dev/null 2>&1; then
     for name in $(port_settings); do
       port="${!name}"
@@ -10684,6 +12978,9 @@ do_check() {
       warn "Docker Hub is not reachable - the version list (option 8) will not work."
     fi
   fi
+  if net_enabled; then
+    net_check_line
+  fi
 
   echo
   if [ "$problems" -eq 0 ]; then
@@ -10692,6 +12989,3804 @@ do_check() {
     err "$problems problem(s) found."
     return 1
   fi
+}
+
+###############################################################################
+# Internet access (option 26): the sites the installation needs, their check, the proxy
+###############################################################################
+
+# The proxy the shell gave this run (before proxy_load exports the one of the settings). RN1_PROXY_SET: an
+# earlier run of the installer exported the proxy - a job or a restarted menu inherits that one, it is not
+# the shell's.
+NET_SHELL_PROXY=""
+NET_SHELL_NAME=""
+NET_SHELL_NO=""
+if [ -z "${RN1_PROXY_SET:-}" ]; then
+  for NET_SHELL_NAME in https_proxy HTTPS_PROXY http_proxy HTTP_PROXY all_proxy ALL_PROXY ""; do
+    if [ -n "$NET_SHELL_NAME" ] && [ -n "${!NET_SHELL_NAME:-}" ]; then
+      NET_SHELL_PROXY="${!NET_SHELL_NAME}"
+      break
+    fi
+  done
+  NET_SHELL_NO="${no_proxy:-${NO_PROXY:-}}"
+fi
+# The login of the proxy (percent-encoded user:password, mode 600) and the copy of the company's root
+# certificate - never in the script, which may be passed on
+PROXY_LOGIN_FILE="$WORK_DIR/.proxy_login"
+PROXY_CA_COPY="$WORK_DIR/proxy-ca.pem"
+# The folders of the system files the check reads (/etc) and of the files of one run (/run)
+NET_ETC="${RN1_ETC_DIR:-/etc}"
+NET_RUN="${RN1_RUN_DIR:-/run}"
+# The last check, for the menu header and option 16: fresh for NET_CACHE_TTL seconds
+NET_CACHE="$JOBS_DIR/internet-check"
+NET_CACHE_TTL="${RN1_NET_CACHE_TTL:-900}"
+# Written when this server has no internet (choice 5 of option 26): the menu start checks nothing
+NET_OFFLINE_FILE="$JOBS_DIR/internet-offline"
+# Seconds each request of the check may take to connect and in total
+NET_CT=8
+NET_MT=20
+NET_BG_PID=""
+# When the menu last started the check in the background (SECONDS), and the process it watches: the check
+# stops when that process has ended (the menu quit)
+NET_BG_AT=""
+NET_WATCH=""
+NET_LOADED=""
+# The proxy the check goes through, with its login (empty: direct), and how it is named on the screen
+NET_VIA=""
+NET_VIA_TEXT=""
+# The names the check reaches directly while it goes through NET_VIA (comma-separated, as curl takes them)
+NET_VIA_NO=""
+# The engine the sites are for while an engine is set up (empty: net_engine decides)
+NET_ENGINE_KIND=""
+NET_TMP=""
+NET_TOOL=""
+NET_R=""
+NET_CODE=""
+NET_EFF=""
+NET_HOST=""
+NET_SCHEMES=""
+NET_LOGIN=""
+NET_NEW_NO=""
+NET_NODNS=""
+NET_LIMIT=""
+NET_SECS=0
+NET_REQ_BAD=0
+NET_OPT_BAD=0
+NET_TOTAL=0
+NET_C_REQ=0
+NET_C_OPT=0
+NET_C_TOTAL=0
+# The rows of the last check (same index everywhere)
+NET_KEYS=()
+NET_HOSTS=()
+NET_PORTS=()
+NET_LEVELS=()
+NET_WHAT=()
+NET_URLS=()
+NET_STATUS=()
+NET_DETAIL=()
+# The files of one run for the steps that run as root (see proxy_run_begin)
+NET_RUN_ENV=""
+NET_RUN_APT=""
+NET_RUN_DNF=""
+
+# True unless the automatic internet checks are off: RN1_NET_CHECK=off (menu start, new installation,
+# option 16, engine setup; option 26 and network-check still check)
+net_enabled() {
+  [ "${RN1_NET_CHECK:-on}" != "off" ]
+}
+
+# net_encode TEXT -> TEXT percent-encoded byte by byte, all but A-Za-z0-9._~- : a login in a proxy address
+# then needs no quoting anywhere (URLs, env files, .env, YAML)
+net_encode() {
+  (
+    LC_ALL=C
+    s="$1"
+    out=""
+    for ((i = 0; i < ${#s}; i++)); do
+      c="${s:i:1}"
+      case "$c" in
+        [A-Za-z0-9._~-]) out="$out$c" ;;
+        *)
+          printf -v c '%%%02X' "'$c"
+          out="$out$c"
+          ;;
+      esac
+    done
+    printf '%s' "$out"
+  )
+}
+
+# net_decode TEXT -> TEXT with its %XX sequences decoded
+net_decode() {
+  local s="$1" out="" i=0 c
+  while [ "$i" -lt "${#s}" ]; do
+    c="${s:i:1}"
+    if [ "$c" = "%" ] && [[ "${s:i+1:2}" =~ ^[0-9A-Fa-f][0-9A-Fa-f]$ ]]; then
+      printf -v c "\\x${s:i+1:2}"
+      i=$((i + 3))
+    else
+      i=$((i + 1))
+    fi
+    out="$out$c"
+  done
+  printf '%s' "$out"
+}
+
+# net_sq TEXT -> TEXT in single quotes for sh
+net_sq() {
+  printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"
+}
+
+# The login of the proxy as saved: percent-encoded user:password (empty when there is none). The file names
+# the proxy it belongs to (a line proxy=ADDRESS): for another INTERNET_PROXY it is no login - a proxy changed
+# in option 1 never gets the password of the one before. A file without that line (written by hand) counts.
+proxy_login() {
+  local l="" line p="" pset="no"
+  if [ -r "$PROXY_LOGIN_FILE" ]; then
+    while IFS= read -r line || [ -n "$line" ]; do
+      line="${line//[[:space:]]/}"
+      case "$line" in
+        "") ;;
+        proxy=*) p="${line#proxy=}"; pset="yes" ;;
+        *) if [ -z "$l" ]; then l="$line"; fi ;;
+      esac
+    done < "$PROXY_LOGIN_FILE"
+  fi
+  if [ "$pset" = "yes" ] && [ "$p" != "$INTERNET_PROXY" ]; then
+    l=""
+  fi
+  printf '%s' "$l"
+}
+
+# The user name of the saved login, as typed (DOMAIN\user)
+proxy_login_user() {
+  local l
+  l="$(proxy_login)"
+  if [ -n "$l" ]; then
+    net_decode "${l%%:*}"
+  fi
+}
+
+# proxy_login_save LOGIN -> .proxy_login (percent-encoded user:password) for the proxy of INTERNET_PROXY,
+# readable only by its owner
+proxy_login_save() {
+  if ! (umask 077 && printf 'proxy=%s\n%s\n' "$INTERNET_PROXY" "$1" > "$PROXY_LOGIN_FILE") || ! chmod 600 "$PROXY_LOGIN_FILE"; then
+    err "Cannot write $PROXY_LOGIN_FILE."
+    return 1
+  fi
+}
+
+# net_parse ADDRESS -> NP_SCHEME, NP_HOST, NP_PORT and NP_LOGIN (user:password as typed) of a proxy address:
+# host:port, IPv4:port or [IPv6]:port, optionally with http://, https://, socks5:// or socks5h:// in front and
+# a login; no scheme is http, NP_PORT is empty when the address has none. 1 when ADDRESS is none.
+net_parse() {
+  local a="$1" re6='^\[([0-9A-Fa-f:.]+)\](:([0-9]+))?$' re='^([A-Za-z0-9._-]+)(:([0-9]+))?$'
+  NP_SCHEME="http"
+  NP_HOST=""
+  NP_PORT=""
+  NP_LOGIN=""
+  a="${a//[[:space:]]/}"
+  if [[ "$a" == *://* ]]; then
+    NP_SCHEME="${a%%://*}"
+    NP_SCHEME="${NP_SCHEME,,}"
+    a="${a#*://}"
+  fi
+  case "$NP_SCHEME" in
+    http|https|socks5|socks5h) ;;
+    *) return 1 ;;
+  esac
+  a="${a%/}"
+  if [[ "$a" == *@* ]]; then
+    NP_LOGIN="${a%@*}"
+    a="${a##*@}"
+  fi
+  if [[ "$a" =~ $re6 ]]; then
+    NP_HOST="[${BASH_REMATCH[1]}]"
+    NP_PORT="${BASH_REMATCH[3]}"
+  elif [[ "$a" =~ $re ]]; then
+    NP_HOST="${BASH_REMATCH[1],,}"
+    NP_PORT="${BASH_REMATCH[3]}"
+  else
+    return 1
+  fi
+  if [ -n "$NP_PORT" ]; then
+    if [ "${#NP_PORT}" -gt 5 ] || [ "$((10#$NP_PORT))" -lt 1 ] || [ "$((10#$NP_PORT))" -gt 65535 ]; then
+      return 1
+    fi
+    NP_PORT="$((10#$NP_PORT))"
+  fi
+}
+
+# net_with_login URL [LOGIN] -> URL with the login (percent-encoded user:password; default: the saved one)
+net_with_login() {
+  local url="$1" login="${2-$(proxy_login)}"
+  if [ -z "$login" ] || [[ "$url" != *://* ]]; then
+    printf '%s' "$url"
+  else
+    printf '%s://%s@%s' "${url%%://*}" "$login" "${url#*://}"
+  fi
+}
+
+# net_mask URL -> URL without the password of its login (for the screen)
+net_mask() {
+  local url="$1" rest user
+  if [[ "$url" != *@* ]]; then
+    printf '%s' "$url"
+    return 0
+  fi
+  rest="${url#*://}"
+  user="${rest%@*}"
+  user="${user%%:*}"
+  if [[ "$url" == *://* ]]; then
+    printf '%s://%s:***@%s' "${url%%://*}" "$user" "${rest##*@}"
+  else
+    printf '%s:***@%s' "$user" "${rest##*@}"
+  fi
+}
+
+# INTERNET_NO_PROXY as the tools read it: every name as name and .name (exact and subdomains: .NET takes
+# only these two forms), addresses and ranges as they are; comma-separated
+net_no_list() {
+  local item out=""
+  local -a items=()
+  IFS=',' read -r -a items <<< "$INTERNET_NO_PROXY"
+  for item in ${items[@]+"${items[@]}"}; do
+    item="${item//[[:space:]]/}"
+    case "$item" in
+      "") ;;
+      *:*|*/*|[0-9]*.[0-9]*.[0-9]*.[0-9]*) out="$out,$item" ;;
+      .*) out="$out,${item#.},$item" ;;
+      *) out="$out,$item,.$item" ;;
+    esac
+  done
+  printf '%s' "${out#,}"
+}
+
+# The names of this server: its short name and, when it has one, its full name
+net_server_names() {
+  local h
+  h="$(uname -n 2>/dev/null)" || h=""
+  h="${h,,}"
+  if [ -n "$h" ]; then
+    printf '%s\n' "${h%%.*}"
+    if [[ "$h" == *.* ]]; then
+      printf '%s\n' "$h"
+    fi
+  fi
+}
+
+# The NO_PROXY of this run (and of the programs it starts): this server, its addresses, the domain of the
+# Catalog, INTERNET_NO_PROXY, the shell's own list and the private address ranges (only curl 7.86 or newer,
+# Go and Node read ranges)
+net_no_proxy_session() {
+  local out="localhost,127.0.0.1,::1" a
+  while IFS= read -r a; do
+    case "$a" in
+      ""|127.*|::1|fe80:*) ;;
+      *) out="$out,$a" ;;
+    esac
+  done <<< "$(net_server_names; local_addresses 2>/dev/null || true)"
+  if [ -n "$CATALOG_DOMAIN" ]; then
+    out="$out,$CATALOG_DOMAIN"
+  fi
+  a="$(net_no_list)"
+  if [ -n "$a" ]; then
+    out="$out,$a"
+  fi
+  if [ -n "$NET_SHELL_NO" ]; then
+    out="$out,${NET_SHELL_NO// /}"
+  fi
+  printf '%s,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16' "$out"
+}
+
+# proxy_load -> the proxy of INTERNET_PROXY for this run and the programs it starts (curl, wget, git,
+# Homebrew, the package managers): http_proxy, https_proxy, no_proxy and their upper-case twins, all with
+# the same value and the login of .proxy_login - so the login is in no command line. Without INTERNET_PROXY
+# a proxy of the shell stays as it is.
+proxy_load() {
+  local sig url no
+  sig="$INTERNET_PROXY|$INTERNET_NO_PROXY|$CATALOG_DOMAIN|$(proxy_login)"
+  if [ "$sig" = "$NET_LOADED" ]; then
+    return 0
+  fi
+  NET_LOADED="$sig"
+  if [ -z "$INTERNET_PROXY" ] || ! net_parse "$INTERNET_PROXY" || [ -z "$NP_PORT" ] || [ -n "$NP_LOGIN" ]; then
+    if [ -n "${RN1_PROXY_SET:-}" ]; then
+      unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY no_proxy NO_PROXY RN1_PROXY_SET
+    fi
+    return 0
+  fi
+  url="$(net_with_login "$INTERNET_PROXY")"
+  no="$(net_no_proxy_session)"
+  export http_proxy="$url" https_proxy="$url" HTTP_PROXY="$url" HTTPS_PROXY="$url"
+  export no_proxy="$no" NO_PROXY="$no" RN1_PROXY_SET="yes"
+}
+
+# The proxy of this run as the environment has it (empty: none)
+net_session_proxy() {
+  printf '%s' "${https_proxy:-${HTTPS_PROXY:-${http_proxy:-${HTTP_PROXY:-}}}}"
+}
+
+# net_root_write FILE TEXT -> FILE with TEXT, readable only by root (sudo when needed): the text goes
+# through stdin, so it shows in no process list
+net_root_write() {
+  if [ "${#SUDO[@]}" -gt 0 ]; then
+    "${SUDO[@]}" sh -c 'umask 077 && mkdir -p "${1%/*}" && cat > "$1"' sh "$1" <<< "$2"
+  else
+    (umask 077 && mkdir -p -- "${1%/*}" && printf '%s\n' "$2" > "$1")
+  fi
+}
+
+# The proxy a package manager has in its own configuration, which wins over the environment: apt
+# (Acquire::http(s)::Proxy) or dnf and yum (proxy= of dnf.conf, yum.conf)
+net_apt_proxy() {
+  local v
+  if ! command -v apt-config >/dev/null 2>&1; then
+    return 0
+  fi
+  # awk reads all of it: an early exit would break the pipe
+  v="$(apt-config dump 2>/dev/null | awk 'tolower($1) ~ /^acquire::https?::proxy$/ { gsub(/[";]/, "", $2); if (p == "" && $2 != "" && tolower($2) != "direct" && tolower($2) != "false") p = $2 } END { print p }')" || v=""
+  printf '%s' "$v"
+}
+
+# The proxy= of the [main] section of dnf.conf (or yum.conf) as FILE|PROXY (empty: none)
+net_dnf_conf() {
+  local f v
+  for f in "$NET_ETC/dnf/dnf.conf" "$NET_ETC/yum.conf"; do
+    if [ -r "$f" ]; then
+      v="$(awk -F= '/^\[/ { m = ($0 ~ /^\[main\]/) } m && $1 ~ /^[ \t]*proxy[ \t]*$/ { v = $2; gsub(/[ \t]/, "", v); if (p == "" && v != "" && v != "_none_") p = v } END { print p }' "$f")" || v=""
+      if [ -n "$v" ]; then
+        printf '%s|%s' "$f" "$v"
+        return 0
+      fi
+    fi
+  done
+}
+
+# proxy_run_begin -> the proxy of this run for the steps that run as root. sudo drops the environment, so
+# the values go through stdin into a file only root can read (RUN/rn1-proxy.PID.env), which each step reads
+# first. When INTERNET_PROXY is set and apt or dnf have their own proxy configured (it would win), they get
+# a copy of their configuration with this proxy (apt-get -c, dnf --config=). Nothing is written without a proxy.
+proxy_run_begin() {
+  local p h no conf
+  NET_RUN_ENV=""
+  NET_RUN_APT=""
+  NET_RUN_DNF=""
+  p="$(net_session_proxy)"
+  if [ -z "$p" ]; then
+    return 0
+  fi
+  h="${http_proxy:-${HTTP_PROXY:-$p}}"
+  no="${no_proxy:-${NO_PROXY:-}}"
+  if [ "${#SUDO[@]}" -gt 0 ]; then
+    NET_RUN_ENV="$NET_RUN/rn1-proxy.$$.env"
+    if ! net_root_write "$NET_RUN_ENV" "export http_proxy=$(net_sq "$h") https_proxy=$(net_sq "$p") HTTP_PROXY=$(net_sq "$h") HTTPS_PROXY=$(net_sq "$p") no_proxy=$(net_sq "$no") NO_PROXY=$(net_sq "$no")"; then
+      err "Cannot write $NET_RUN_ENV (the proxy for the steps as root)."
+      proxy_run_end
+      return 1
+    fi
+  fi
+  if [ -z "$INTERNET_PROXY" ]; then
+    return 0
+  fi
+  if [ -n "$(net_apt_proxy)" ] && [ "$(net_apt_proxy)" != "$INTERNET_PROXY" ]; then
+    NET_RUN_APT="$NET_RUN/rn1-apt.$$.conf"
+    if ! net_root_write "$NET_RUN_APT" "Acquire::http::Proxy \"$p\";
+Acquire::https::Proxy \"$p\";"; then
+      err "Cannot write $NET_RUN_APT (the proxy for apt-get)."
+      proxy_run_end
+      return 1
+    fi
+  fi
+  conf="$(net_dnf_conf)"
+  if [ -n "$conf" ] && [ "${conf#*|}" != "$INTERNET_PROXY" ]; then
+    NET_RUN_DNF="$NET_RUN/rn1-dnf.$$.conf"
+    if ! net_root_write "$NET_RUN_DNF" "$(awk '/^\[/ { m = ($0 ~ /^\[main\]/) } m && /^[ \t]*proxy(_username|_password|_auth_method)?[ \t]*=/ { next } { print }' "${conf%%|*}")"; then
+      err "Cannot write $NET_RUN_DNF (the proxy for dnf)."
+      proxy_run_end
+      return 1
+    fi
+  fi
+}
+
+# proxy_run_step STEP -> STEP as it runs as root: with the proxy of this run read first, apt-get and dnf
+# with their copy of the configuration; STEP itself without a proxy
+proxy_run_step() {
+  local s="$1"
+  if [ -n "$NET_RUN_APT" ]; then
+    s="${s//apt-get /apt-get -c $NET_RUN_APT }"
+  fi
+  if [ -n "$NET_RUN_DNF" ]; then
+    s="${s//dnf /dnf --config=$NET_RUN_DNF }"
+    s="${s//yum /yum --config=$NET_RUN_DNF }"
+  fi
+  if [ -n "$NET_RUN_ENV" ]; then
+    s=". $NET_RUN_ENV; $s"
+  fi
+  printf '%s' "$s"
+}
+
+# proxy_run_end -> removes the files of proxy_run_begin
+proxy_run_end() {
+  local f
+  local -a files=()
+  for f in "$NET_RUN_ENV" "$NET_RUN_APT" "$NET_RUN_DNF"; do
+    if [ -n "$f" ]; then
+      files+=("$f")
+    fi
+  done
+  NET_RUN_ENV=""
+  NET_RUN_APT=""
+  NET_RUN_DNF=""
+  if [ "${#files[@]}" -gt 0 ]; then
+    ${SUDO[@]+"${SUDO[@]}"} rm -f -- "${files[@]}" 2>/dev/null || true
+  fi
+}
+
+# True when proxy_run_begin wrote files (the steps then run with them)
+proxy_run_active() {
+  [ -n "$NET_RUN_ENV$NET_RUN_APT$NET_RUN_DNF" ]
+}
+
+# proxy_sudo COMMAND [ARG...] -> COMMAND as root (sudo when needed) with the proxy of this run
+proxy_sudo() {
+  local rc=0 traps stopped=""
+  if [ "${#SUDO[@]}" -eq 0 ] || [ -z "$(net_session_proxy)" ]; then
+    ${SUDO[@]+"${SUDO[@]}"} "$@"
+    return
+  fi
+  proxy_run_begin || return 1
+  # Ctrl+C, a kill or a cancelled job: the root-only file with the login goes first, then the signal
+  # does what it would have done (the caller's trap, or the end of the script)
+  traps="$(trap -p INT TERM HUP)"
+  trap 'stopped="INT"' INT
+  trap 'stopped="TERM"' TERM
+  trap 'stopped="HUP"' HUP
+  "${SUDO[@]}" sh -c '. "$0" && exec "$@"' "$NET_RUN_ENV" "$@" || rc=$?
+  proxy_run_end
+  trap - INT TERM HUP
+  eval "$traps"
+  if [ -n "$stopped" ]; then
+    kill -s "$stopped" "$BASHPID" 2>/dev/null || true
+    return 130
+  fi
+  return "$rc"
+}
+
+# zypper takes its proxy only from /etc/sysconfig/proxy (no setting for one command): what to do when
+# INTERNET_PROXY is not set there
+net_zypper_note() {
+  local f="$NET_ETC/sysconfig/proxy"
+  if [ -z "$INTERNET_PROXY" ] || ! command -v zypper >/dev/null 2>&1; then
+    return 0
+  fi
+  if [ -r "$f" ] && grep -q '^PROXY_ENABLED="yes"' "$f" && grep -qF "$INTERNET_PROXY" "$f"; then
+    return 0
+  fi
+  warn "zypper takes its proxy only from $f: set it there (yast proxy), e.g."
+  echo "      PROXY_ENABLED=\"yes\""
+  echo "      HTTPS_PROXY=\"$INTERNET_PROXY\""
+  echo "      HTTP_PROXY=\"$INTERNET_PROXY\""
+}
+
+# The engine the sites are for: NET_ENGINE_KIND, CONTAINER_ENGINE, else the one installed here (Podman
+# first), else empty - not chosen yet (the first step of the new installation)
+net_engine() {
+  if [ -n "$NET_ENGINE_KIND" ]; then
+    printf '%s' "$NET_ENGINE_KIND"
+  elif [ -n "$CONTAINER_ENGINE" ]; then
+    printf '%s' "$CONTAINER_ENGINE"
+  elif command -v podman >/dev/null 2>&1; then
+    printf 'podman'
+  elif command -v docker >/dev/null 2>&1 && ! docker_is_podman; then
+    printf 'docker'
+  fi
+}
+
+# net_installed KIND -> true when the engine KIND is installed here
+net_installed() {
+  case "$1" in
+    podman) command -v podman >/dev/null 2>&1 ;;
+    colima) command -v colima >/dev/null 2>&1 ;;
+    docker) command -v docker >/dev/null 2>&1 && ! docker_is_podman ;;
+    *) return 1 ;;
+  esac
+}
+
+# net_compose_need KIND -> req when the setup of KIND downloads Docker Compose from GitHub, opt when it
+# only keeps the installer's own up to date, empty when the engine brings it
+net_compose_need() {
+  local v
+  case "$1" in
+    ""|podman|colima)
+      if [ -n "$1" ] && [ -x "$COMPOSE_PROVIDER" ]; then
+        printf 'opt'
+      else
+        printf 'req'
+      fi
+      ;;
+    docker)
+      if [ "$OS_KIND" = "Darwin" ]; then
+        return 0
+      fi
+      if ! net_installed docker; then
+        if docker_from_distro; then
+          printf 'req'
+        fi
+        return 0
+      fi
+      v="$(docker compose version 2>/dev/null)" || v=""
+      if ! compose_v2 "$v"; then
+        printf 'req'
+      elif [ -x "$COMPOSE_PROVIDER" ] && [ ! -L "$COMPOSE_PROVIDER" ]; then
+        printf 'opt'
+      fi
+      ;;
+  esac
+}
+
+# The folder of Docker's repository for this Linux (ubuntu, debian, rhel, centos, fedora); empty when Docker
+# comes from the packages of the distribution (openSUSE, SLES) or the system is not covered
+net_docker_repo() {
+  local id like major
+  id="$(os_release ID)"
+  like=" $(os_release ID_LIKE) "
+  major="$(os_release VERSION_ID)"
+  major="${major%%.*}"
+  case "$id $like" in
+    ubuntu*|*" ubuntu "*) printf 'ubuntu'; return 0 ;;
+    debian*|*" debian "*) printf 'debian'; return 0 ;;
+  esac
+  case "$id" in
+    fedora) printf 'fedora' ;;
+    rhel) printf 'rhel' ;;
+    centos|rocky|almalinux|ol|amzn)
+      if [ "$major" = "8" ]; then
+        printf 'rhel'
+      else
+        printf 'centos'
+      fi
+      ;;
+    *)
+      case "$like" in
+        *" rhel "*|*" centos "*) printf 'centos' ;;
+        *" fedora "*) printf 'fedora' ;;
+      esac
+      ;;
+  esac
+}
+
+# The package repositories of this Linux: KIND|URL|FILE, the URL the check tries. KIND: apt (InRelease of a
+# suite), repomd (repodata/repomd.xml), meta (a metalink or a mirror list), any (only that it answers: the
+# repository needs a certificate or a token, or has variables the check cannot fill in)
+net_repo_urls() {
+  local f kind url file rel major arch h
+  arch="$(uname -m 2>/dev/null)" || arch="x86_64"
+  rel="$(os_release VERSION_ID)"
+  major="${rel%%.*}"
+  # apt: awk writes the lines itself (the URL of InRelease: dists/SUITE/, or a flat suite that ends in /). No
+  # pipe into a while loop with IFS='|' read: in the subshell of a pipe bash 4.2 (CentOS 7) did not split the
+  # lines at |, every field landed in the first variable.
+  for f in "$NET_ETC/apt/sources.list" "$NET_ETC"/apt/sources.list.d/*.list; do
+    if [ -r "$f" ]; then
+      awk -v f="${f##*/}" '
+        function rel(u, s) { sub(/\/$/, "", u); return s ~ /\/$/ ? u "/" s "InRelease" : u "/dists/" s "/InRelease" }
+        $1 == "deb" {
+          i = 2
+          if ($2 ~ /^\[/) { while (i <= NF && $i !~ /\]$/) i++; i++ }
+          if ($i ~ /^https?:\/\// && $(i + 1) != "") print "apt|" rel($i, $(i + 1)) "|" f
+        }' "$f"
+    fi
+  done
+  for f in "$NET_ETC"/apt/sources.list.d/*.sources; do
+    if [ -r "$f" ]; then
+      awk -v f="${f##*/}" '
+        function rel(u, s) { sub(/\/$/, "", u); return s ~ /\/$/ ? u "/" s "InRelease" : u "/dists/" s "/InRelease" }
+        function flush(  a, b, n, m, U, S) {
+          if (en != "no" && types ~ /(^| )deb( |$)/) {
+            n = split(uris, U, " "); m = split(suites, S, " ")
+            for (a = 1; a <= n; a++) for (b = 1; b <= m; b++) if (U[a] ~ /^https?:\/\//) print "apt|" rel(U[a], S[b]) "|" f
+          }
+          types = ""; uris = ""; suites = ""; en = ""
+        }
+        /^[ \t]*$/ { flush(); next }
+        { v = $0; sub(/^[^:]*:[ \t]*/, "", v); k = tolower($1) }
+        k == "types:" { types = v } k == "uris:" { uris = v } k == "suites:" { suites = v } k == "enabled:" { en = tolower(v) }
+        END { flush() }' "$f"
+    fi
+  done
+  while IFS='|' read -r kind url file; do
+    if [ -z "$url" ]; then
+      continue
+    fi
+    if [[ " $(os_release ID) $(os_release ID_LIKE) " == *suse* ]]; then
+      url="${url//\$releasever_major/$major}"
+      url="${url//\$releasever/$rel}"
+    else
+      url="${url//\$releasever_major/$major}"
+      url="${url//\$releasever/$major}"
+    fi
+    url="${url//\$basearch/$arch}"
+    url="${url//\$arch/$arch}"
+    url="${url//\$stream/$major-stream}"
+    case "$url" in
+      http://*|https://*) ;;
+      *) continue ;;
+    esac
+    if [[ "$url" == *\$* ]] || { [ "$kind" = "repomd" ] && [[ "$url" == *\?* ]]; }; then
+      kind="any"
+    fi
+    case "$kind" in
+      repomd) url="${url%/}/repodata/repomd.xml" ;;
+      any)
+        h="${url#*://}"
+        url="${url%%://*}://${h%%[/?]*}/"
+        ;;
+    esac
+    printf '%s|%s|%s\n' "$kind" "$url" "$file"
+  done <<< "$(
+    for f in "$NET_ETC"/yum.repos.d/*.repo "$NET_ETC"/zypp/repos.d/*.repo; do
+      if [ -r "$f" ]; then
+        awk -v f="${f##*/}" '
+          function flush() {
+            if (sec != "" && en != "0" && en != "false" && en != "no") {
+              if (base != "") print (cert != "" ? "any" : "repomd") "|" base "|" f
+              else if (meta != "") print "meta|" meta "|" f
+              else if (mirror != "") print "meta|" mirror "|" f
+            }
+            sec = ""; en = "1"; base = ""; meta = ""; mirror = ""; cert = ""
+          }
+          /^\[/ { flush(); sec = $0; next }
+          { v = $0; sub(/^[^=]*=[ \t]*/, "", v); k = $0; sub(/[ \t]*=.*/, "", k); gsub(/[ \t]/, "", k) }
+          k == "enabled" { en = tolower(v) }
+          k == "baseurl" { split(v, a, /[ \t,]+/); base = a[1] }
+          k == "metalink" { meta = v }
+          k == "mirrorlist" { mirror = v }
+          k == "sslclientcert" { cert = v }
+          END { flush() }' "$f"
+      fi
+    done
+  )"
+}
+
+# The package repositories as rows of net_rows, one per host (at most 6)
+net_repo_rows() {
+  local kind url file host port seen=" " n=0 what
+  while IFS='|' read -r kind url file; do
+    if [ -z "$url" ]; then
+      continue
+    fi
+    host="${url#*://}"
+    host="${host%%[/?]*}"
+    port=443
+    if [[ "$url" == http://* ]]; then
+      port=80
+    fi
+    if [[ "$host" == *:* ]]; then
+      port="${host##*:}"
+      host="${host%:*}"
+    fi
+    if [[ "$seen" == *" $host "* ]]; then
+      continue
+    fi
+    seen="$seen$host "
+    n=$((n + 1))
+    if [ "$n" -gt 6 ]; then
+      break
+    fi
+    what="packages ($file)"
+    printf 'repo%s|%s|%s|req|%s|%s:%s\n' "$n" "$host" "$port" "${what:0:27}" "$kind" "$url"
+  done <<< "$(net_repo_urls)"
+}
+
+# net_rows -> the sites this installation needs, one per line: KEY|HOST|PORT|LEVEL|WHAT|URL. LEVEL: req (the
+# installation stops without it), opt (WHAT does not work without it) or - (not needed here; WHAT says why).
+# Built from the settings, the engine, this system and the domain - never a fixed list.
+net_rows() {
+  local kind installed="no" need repo os="linux" arch="x86_64" h name
+  kind="$(net_engine)"
+  if [ -n "$kind" ] && net_installed "$kind"; then
+    installed="yes"
+  fi
+  name="$(kind_name "${kind:-podman}")"
+  echo "hub|registry-1.docker.io|443|req|images (Docker Hub)|https://registry-1.docker.io/v2/"
+  echo "hubauth|auth.docker.io|443|req|image downloads (token)|https://auth.docker.io/token?service=registry.docker.io&scope=repository:$CATALOG_IMAGE_REPO:pull"
+  echo "hubcdn|production.cloudfront.docker.com|443|req|image layers (Docker Hub)|"
+  echo "ghcr|ghcr.io|443|req|MinIO image|https://ghcr.io/v2/"
+  echo "ghcrcdn|pkg-containers.githubusercontent.com|443|req|MinIO image layers|"
+  if [ "$OS_KIND" != "Darwin" ]; then
+    # the packages of this Linux: only to install the engine
+    if [ "$installed" = "yes" ]; then
+      h="$(net_repo_rows)"
+      h="${h%%$'\n'*}"
+      h="$(printf '%s' "$h" | cut -d'|' -f2)"
+      echo "repo|${h:-package repositories}|443|-|not needed: $name is there|"
+    else
+      net_repo_rows
+    fi
+    repo="$(net_docker_repo)"
+    case "$kind" in
+      "") echo "dockerrepo|download.docker.com|443|opt|Docker Engine (if chosen)|https://download.docker.com/linux/${repo:-centos}/gpg" ;;
+      docker)
+        if [ "$installed" = "yes" ]; then
+          echo "dockerrepo|download.docker.com|443|-|not needed: Docker is there|"
+        elif [ -z "$repo" ]; then
+          echo "dockerrepo|download.docker.com|443|-|not needed: distro Docker|"
+        else
+          echo "dockerrepo|download.docker.com|443|req|Docker Engine packages|https://download.docker.com/linux/$repo/gpg"
+        fi
+        ;;
+      *) echo "dockerrepo|download.docker.com|443|-|not needed: $name|" ;;
+    esac
+  else
+    os="darwin"
+  fi
+  if [ "$(engine_arch)" = "arm64" ]; then
+    arch="aarch64"
+  fi
+  need="$(net_compose_need "$kind")"
+  case "$need" in
+    req)
+      echo "github|github.com|443|req|Docker Compose|https://github.com/docker/compose/releases/latest"
+      echo "ghassets|release-assets.githubusercontent.com|443|req|Docker Compose download|https://github.com/docker/compose/releases/latest/download/docker-compose-$os-$arch.sha256"
+      ;;
+    opt)
+      echo "github|github.com|443|opt|Compose update (optional)|https://github.com/docker/compose/releases/latest"
+      echo "ghassets|release-assets.githubusercontent.com|443|opt|Compose download (optional)|https://github.com/docker/compose/releases/latest/download/docker-compose-$os-$arch.sha256"
+      ;;
+    *) echo "github|github.com|443|-|not needed: has Compose|" ;;
+  esac
+  if [ "$OS_KIND" = "Darwin" ]; then
+    if [ "$installed" = "yes" ]; then
+      echo "brew|formulae.brew.sh|443|-|not needed: $name is there|"
+    else
+      echo "brew|formulae.brew.sh|443|req|Homebrew|https://formulae.brew.sh/api/formula.jws.json"
+    fi
+    case "$kind:$installed" in
+      podman:no) echo "quay|quay.io|443|req|Podman machine image|https://quay.io/v2/" ;;
+      :no) echo "quay|quay.io|443|opt|Podman machine (if chosen)|https://quay.io/v2/" ;;
+      *) echo "quay|quay.io|443|-|not needed: $name|" ;;
+    esac
+    case "$kind:$installed" in
+      docker:no) echo "desktop|desktop.docker.com|443|req|Docker Desktop|https://desktop.docker.com/mac/main/arm64/appcast.xml" ;;
+      :no) echo "desktop|desktop.docker.com|443|opt|Docker Desktop (if chosen)|https://desktop.docker.com/mac/main/arm64/appcast.xml" ;;
+      *) echo "desktop|desktop.docker.com|443|-|not needed: $name|" ;;
+    esac
+  fi
+  echo "hubapi|hub.docker.com|443|opt|version list (optional)|https://hub.docker.com/v2/repositories/$CATALOG_IMAGE_REPO/tags?page_size=1"
+  h="${INSTALLER_URL#*://}"
+  echo "installer|${h%%/*}|443|opt|installer update (optional)|$INSTALLER_URL"
+  h="${CATALOG_CLOUD_URL#*://}"
+  echo "cloud|${h%%/*}|443|opt|catalog data (optional)|${CATALOG_CLOUD_URL%/}/v1/license/isValid"
+  echo "license|licenses.raynet.de|443|opt|license (optional)|https://licenses.raynet.de/Account/Login.aspx"
+  if [ "$INSTALL_NGINX_PROXY_MANAGER" != "true" ]; then
+    echo "acme|acme-v02.api.letsencrypt.org|443|-|not needed: no NPM|"
+    echo "awsip|ip-ranges.amazonaws.com|443|-|not needed: no NPM|"
+    echo "cfip|www.cloudflare.com|443|-|not needed: no NPM|"
+    return 0
+  fi
+  if [ -z "$CATALOG_DOMAIN" ]; then
+    echo "acme|acme-v02.api.letsencrypt.org|443|-|not needed: no domain|"
+  elif domain_private "$CATALOG_DOMAIN"; then
+    echo "acme|acme-v02.api.letsencrypt.org|443|-|not needed: .${CATALOG_DOMAIN##*.} name|"
+  else
+    echo "acme|acme-v02.api.letsencrypt.org|443|req|HTTPS certificate|https://acme-v02.api.letsencrypt.org/directory"
+  fi
+  echo "awsip|ip-ranges.amazonaws.com|443|opt|NPM IP ranges (optional)|https://ip-ranges.amazonaws.com/ip-ranges.json"
+  echo "cfip|www.cloudflare.com|443|opt|NPM IP ranges (optional)|https://www.cloudflare.com/ips-v4"
+}
+
+# The curl config of the proxy of the check (on stdin): its address with the login, and the names it reaches
+# directly (NET_VIA_NO: those of the settings or of a PAC file - never the ones of the environment)
+# An https:// proxy: its certificate is checked whenever the login goes to it (the system's certificates
+# and the company's); only a proxy without a login is taken unchecked
+net_via_config() {
+  printf 'proxy = "%s"\nnoproxy = "%s"\n' "$NET_VIA" "$NET_VIA_NO"
+  case "$NET_VIA" in
+    https://*@*)
+      if [ -n "$INTERNET_PROXY_CA_FILE" ] && [ -r "$PROXY_CA_BUNDLE" ]; then
+        printf 'proxy-cacert = "%s"\n' "$PROXY_CA_BUNDLE"
+      fi
+      ;;
+    https://*) printf 'proxy-insecure\n' ;;
+  esac
+}
+
+# net_curl OUT URL [CURL-OPTION...] -> one request of the check: direct, or through NET_VIA (handed to curl
+# in its config on stdin, so the login is on no command line). The certificate is checked against the
+# certificates of this system (never -k: with it curl loads none, and every site would look inspected); a
+# TLS inspection ends with exit code 60 (or 51) and its verify result. The answer lands in OUT.hdr (the
+# proxy's CONNECT answer included) and OUT.body. Prints: EXIT CODE CONNECT VERIFY EFFECTIVE-URL IP
+net_curl() {
+  local out="$1" url="$2" w="" rc=0 fmt='%{http_code} %{http_connect} %{ssl_verify_result} %{url_effective} %{remote_ip}'
+  shift 2
+  : > "$out.hdr"
+  : > "$out.body"
+  if [ -n "$NET_VIA" ]; then
+    w="$(net_via_config | curl -sS -K - -o "$out.body" -D "$out.hdr" --connect-timeout "$NET_CT" --max-time "$NET_MT" -w "$fmt" "$@" "$url" 2>"$out.err")" || rc=$?
+  else
+    w="$(curl -sS --noproxy '*' -o "$out.body" -D "$out.hdr" --connect-timeout "$NET_CT" --max-time "$NET_MT" -w "$fmt" "$@" "$url" 2>"$out.err")" || rc=$?
+  fi
+  printf '%s %s' "$rc" "${w:-000 000 0 $url}"
+}
+
+# The issuer of the certificate a site presents here (the CA of a TLS inspection); the verbose output of
+# curl stays in memory (it holds the proxy login)
+net_issuer() {
+  local v=""
+  if [ -n "$NET_VIA" ]; then
+    v="$(net_via_config | curl -vks -K - -o /dev/null --connect-timeout "$NET_CT" --max-time "$NET_MT" "$1" 2>&1)" || true
+  else
+    v="$(curl -vks --noproxy '*' -o /dev/null --connect-timeout "$NET_CT" --max-time "$NET_MT" "$1" 2>&1)" || true
+  fi
+  v="$(printf '%s\n' "$v" | sed -n 's/^\*  *issuer: *//p')"
+  v="${v%%$'\n'*}"
+  printf '%s' "${v//|//}"
+}
+
+# The login methods a proxy offers in its answer OUT.hdr (Proxy-Authenticate): Basic, NTLM, Negotiate, Digest
+net_auth_schemes() {
+  tr -d '\r' < "$1" 2>/dev/null | awk 'tolower($1) == "proxy-authenticate:" { s = $2; sub(/,.*/, "", s); if (!seen[s]++) printf "%s%s", (n++ ? " " : ""), s }'
+}
+
+# net_sig OUT SIGNATURE -> true when the answer holds SIGNATURE: B:REGEX in the body, H:REGEX in the
+# headers (extended, any case); empty: always
+net_sig() {
+  case "$2" in
+    "") return 0 ;;
+    B:*) grep -Eqi -- "${2#B:}" "$1.body" 2>/dev/null ;;
+    H:*) grep -Eqi -- "${2#H:}" "$1.hdr" 2>/dev/null ;;
+    *) return 1 ;;
+  esac
+}
+
+# net_class EXIT CODE CONNECT VERIFY IP OUT EXPECT SIGNATURE HOST URL -> STATUS|DETAIL of one answer.
+# STATUS: OK, NO DNS, PROXY DNS, BLOCKED, REFUSED, PROXY LOGIN, DENIED, TLS INSPECTED, CLOCK, TLS RESET,
+# WRONG ANSWER or LIMIT (curl's exit code, the proxy's CONNECT answer, the HTTP code, the certificate check,
+# then the signature: block pages and captive portals also answer 200)
+net_class() {
+  local rc="$1" code="$2" conn="$3" ver="$4" ip="$5" out="$6" expect="$7" sig="$8" host="$9" url="${10}" s
+  case "$rc" in
+    6) echo "NO DNS|the name does not resolve - only a proxy can reach out?"; return 0 ;;
+    5) echo "PROXY DNS|the proxy's own name does not resolve"; return 0 ;;
+    28)
+      if [ -n "$NET_VIA" ]; then
+        echo "BLOCKED|no answer in time - the proxy or a firewall drops it"
+      else
+        echo "BLOCKED|no answer in $NET_CT s - a firewall drops it"
+      fi
+      return 0
+      ;;
+    7)
+      if [ -n "$NET_VIA" ]; then
+        echo "REFUSED|the proxy refuses the connection (wrong port?)"
+      else
+        echo "REFUSED|connection refused (firewall${ip:+, or DNS points at $ip})"
+      fi
+      return 0
+      ;;
+  esac
+  if [ "$conn" = "407" ] || [ "$code" = "407" ]; then
+    s="$(net_auth_schemes "$out.hdr")"
+    echo "PROXY LOGIN|the proxy asks for a login${s:+ ($s)}"
+    return 0
+  fi
+  if [ "$rc" != "0" ] && [ -n "$conn" ] && [ "$conn" != "000" ] && [ "$conn" != "200" ]; then
+    echo "DENIED|the proxy or firewall refuses this site (HTTP $conn)"
+    return 0
+  fi
+  case "$ver" in
+    0|"") ;;
+    9|10)
+      echo "CLOCK|check the server clock (date: $(date '+%Y-%m-%d %H:%M'))"
+      return 0
+      ;;
+    *)
+      s="$(net_issuer "$url")"
+      echo "TLS INSPECTED|certificate from \"${s:-an unknown issuer}\""
+      return 0
+      ;;
+  esac
+  case "$rc" in
+    0) ;;
+    51|60)
+      s="$(net_issuer "$url")"
+      if [[ "$NET_VIA" == https://*@* ]] && [ -z "$s" ]; then
+        echo "TLS INSPECTED|certificate not trusted (of the site, or of the https:// proxy)"
+      else
+        echo "TLS INSPECTED|certificate from \"${s:-an unknown issuer}\""
+      fi
+      return 0
+      ;;
+    35|52|56)
+      echo "TLS RESET|TLS was cut - often a filter on the site name"
+      return 0
+      ;;
+    *)
+      echo "BLOCKED|no answer (curl error $rc)"
+      return 0
+      ;;
+  esac
+  if [ "$code" = "429" ]; then
+    echo "LIMIT|Docker Hub pull limit reached"
+    return 0
+  fi
+  if [[ " $expect " == *" $code "* ]] && net_sig "$out" "$sig"; then
+    echo "OK|"
+    return 0
+  fi
+  if [ "$code" = "403" ] || grep -qi '^x-squid-error' "$out.hdr" 2>/dev/null; then
+    echo "DENIED|the proxy or firewall refuses this site"
+    return 0
+  fi
+  echo "WRONG ANSWER|an answer came (HTTP $code), but not from $host (block or login page?)"
+}
+
+# net_get OUT URL EXPECT SIGNATURE [CURL-OPTION...] -> NET_R (STATUS|DETAIL), NET_CODE and NET_EFF (the URL
+# the answer came from) of one request: EXPECT the HTTP codes that count as the site's answer, SIGNATURE
+# what that answer holds (see net_sig)
+net_get() {
+  local out="$1" url="$2" expect="$3" sig="$4" rc code conn ver eff ip host
+  shift 4
+  if [ "$NET_TOOL" = "wget" ]; then
+    net_get_wget "$out" "$url" "$expect"
+    return 0
+  fi
+  read -r rc code conn ver eff ip <<< "$(net_curl "$out" "$url" "$@")"
+  NET_CODE="${code:-000}"
+  NET_EFF="${eff:-$url}"
+  host="${NET_EFF#*://}"
+  host="${host%%[/:?]*}"
+  NET_R="$(net_class "$rc" "$NET_CODE" "${conn:-000}" "${ver:-0}" "${ip:-}" "$out" "$expect" "$sig" "$host" "$url")"
+}
+
+# net_get with wget, where curl is missing: fewer classes (reachable, refused by the proxy or the site, login,
+# certificate, no answer); the proxy through the environment, as wget reads it
+net_get_wget() {
+  local out="$1" url="$2" expect="$3" rc=0 v code
+  if [ -n "$NET_VIA" ]; then
+    v="$(https_proxy="$NET_VIA" http_proxy="$NET_VIA" no_proxy="" wget --spider -S -T "$NET_MT" -t 1 "$url" 2>&1)" || rc=$?
+  else
+    v="$(wget --no-proxy --spider -S -T "$NET_MT" -t 1 "$url" 2>&1)" || rc=$?
+  fi
+  code="$(printf '%s\n' "$v" | grep -o 'HTTP/[0-9.]* [0-9][0-9][0-9]' | tail -n 1)" || code=""
+  NET_CODE="${code##* }"
+  NET_CODE="${NET_CODE:-000}"
+  NET_EFF="$url"
+  case "$rc" in
+    0) NET_R="OK|" ;;
+    5) NET_R="TLS INSPECTED|the certificate is not trusted (wget tells no more)" ;;
+    4)
+      if [[ "$v" == *"unable to resolve"* ]]; then
+        NET_R="NO DNS|the name does not resolve"
+      else
+        NET_R="BLOCKED|no answer"
+      fi
+      ;;
+    8)
+      if [[ " $expect " == *" $NET_CODE "* ]]; then
+        NET_R="OK|"
+      elif [ "$NET_CODE" = "407" ]; then
+        NET_R="PROXY LOGIN|the proxy asks for a login"
+      elif [ "$NET_CODE" = "403" ]; then
+        NET_R="DENIED|the proxy or firewall refuses this site"
+      else
+        NET_R="WRONG ANSWER|an answer came (HTTP $NET_CODE), but not the expected one"
+      fi
+      ;;
+    *) NET_R="BLOCKED|no answer (wget error $rc)" ;;
+  esac
+}
+
+# The anonymous pull token in the answer OUT.body
+net_token() {
+  local t
+  t="$(grep -o '"token" *: *"[^"]*"' "$1.body" 2>/dev/null)" || t=""
+  t="${t%%$'\n'*}"
+  t="${t%\"}"
+  printf '%s' "${t##*\"}"
+}
+
+# net_probe_layers OUT docker|ghcr -> NET_R and NET_HOST: the host that serves the image layers, learned
+# from the redirect of a layer download (Docker Hub's CDN, GitHub's package host), and whether it answers.
+# Spends no Docker Hub pull: its manifest only as HEAD (which also tells the pulls left), the layer from
+# Docker Hub's tag list.
+net_probe_layers() {
+  local out="$1" reg repo tag token digest="" loc v body
+  if [ "$NET_TOOL" != "curl" ]; then
+    NET_R="NOT TESTED|needs curl"
+    return 0
+  fi
+  if [ "$2" = "docker" ]; then
+    reg="registry-1.docker.io"
+    repo="$CATALOG_IMAGE_REPO"
+    tag="$CATALOG_VERSION"
+    NET_HOST="production.cloudfront.docker.com"
+    net_get "$out.t" "https://auth.docker.io/token?service=registry.docker.io&scope=repository:$repo:pull" "200" 'B:"token"'
+  else
+    component_info minio
+    reg="ghcr.io"
+    repo="${C_IMAGES#ghcr.io/}"
+    tag="$MINIO_TAG"
+    NET_HOST="pkg-containers.githubusercontent.com"
+    net_get "$out.t" "https://ghcr.io/token?scope=repository:$repo:pull&service=ghcr.io" "200" 'B:"token"'
+  fi
+  if [ "${NET_R%%|*}" != "OK" ]; then
+    NET_R="NOT TESTED|needs the login of $reg first"
+    return 0
+  fi
+  token="$(net_token "$out.t")"
+  if [ "$2" = "docker" ]; then
+    net_get "$out.m" "https://$reg/v2/$repo/manifests/$tag" "200" "" -I -H "Authorization: Bearer $token" -H "Accept: $MANIFEST_TYPES"
+    if [ "$NET_CODE" = "429" ]; then
+      NET_R="LIMIT|Docker Hub pull limit reached"
+      return 0
+    fi
+    v="$(tr -d '\r' < "$out.m.hdr" | awk -F': *' 'tolower($1) == "ratelimit-remaining" { r = $2 } tolower($1) == "ratelimit-limit" { l = $2 } END { sub(/;.*/, "", r); sub(/;.*/, "", l); if (r != "" && l != "") print r " " l }')" || v=""
+    if [ -n "$v" ] && [ -n "$NET_TMP" ]; then
+      printf '%s\n' "$v" > "$NET_TMP/hub.limit"
+    fi
+    digest="$(tr -d '\r' < "$out.m.hdr" | awk -F': *' 'tolower($1) == "docker-content-digest" { print $2 }')" || digest=""
+    digest="${digest%%$'\n'*}"
+    net_get "$out.l" "https://hub.docker.com/v2/repositories/$repo/tags/$tag/images" "200" 'B:"layers"'
+    v="$(grep -o '"layers" *: *\[[^]]*' "$out.l.body" 2>/dev/null | grep -o 'sha256:[0-9a-f]\{64\}')" || v=""
+    v="${v%%$'\n'*}"
+    digest="${v:-$digest}"
+  else
+    net_get "$out.m" "https://$reg/v2/$repo/manifests/$tag" "200" 'B:"(layers|manifests)"' -H "Authorization: Bearer $token" -H "Accept: $MANIFEST_TYPES"
+    body="$(tr -d ' \t\r\n' < "$out.m.body" 2>/dev/null)" || body=""
+    if [[ "$body" == *'"manifests"'* ]]; then
+      v="$(printf '%s\n' "$body" | sed 's/},{/}\n{/g' | grep '"amd64"' | grep -o '"digest":"sha256:[0-9a-f]*"')" || v=""
+      if [ -z "$v" ]; then
+        v="$(printf '%s\n' "$body" | grep -o '"digest":"sha256:[0-9a-f]*"')" || v=""
+      fi
+      v="${v%%$'\n'*}"
+      v="${v#\"digest\":\"}"
+      v="${v%\"}"
+      if [ -n "$v" ]; then
+        net_get "$out.m" "https://$reg/v2/$repo/manifests/$v" "200" 'B:"layers"' -H "Authorization: Bearer $token" -H "Accept: $MANIFEST_TYPES"
+        body="$(tr -d ' \t\r\n' < "$out.m.body" 2>/dev/null)" || body=""
+      fi
+    fi
+    v="$(printf '%s\n' "$body" | grep -o '"layers":\[[^]]*' | grep -o 'sha256:[0-9a-f]\{64\}')" || v=""
+    digest="${v%%$'\n'*}"
+  fi
+  if [ -z "$digest" ]; then
+    NET_R="NOT TESTED|no layer of $repo to try"
+    return 0
+  fi
+  net_get "$out.b" "https://$reg/v2/$repo/blobs/$digest" "301 302 303 307 308" 'H:^location:' -H "Authorization: Bearer $token"
+  loc="$(tr -d '\r' < "$out.b.hdr" | sed -n 's/^[Ll][Oo][Cc][Aa][Tt][Ii][Oo][Nn]: *//p')" || loc=""
+  loc="${loc%%$'\n'*}"
+  if [ -z "$loc" ]; then
+    NET_R="NOT TESTED|$reg named no layer host (HTTP $NET_CODE)"
+    return 0
+  fi
+  NET_HOST="${loc#*://}"
+  NET_HOST="${NET_HOST%%[/:?]*}"
+  net_get "$out.c" "$loc" "200 206" "" -r 0-0
+}
+
+# net_probe INDEX -> tests the site of row INDEX (in the background): STATUS|DETAIL|HOST into
+# $NET_TMP/INDEX.res (HOST: the one the answer came from, for the hosts learned from a redirect)
+net_probe() {
+  local i="$1" key="${NET_KEYS[$1]}" url="${NET_URLS[$1]}" host="${NET_HOSTS[$1]}" out="$NET_TMP/$1" h
+  NET_R="BLOCKED|no result"
+  case "$key" in
+    hub) net_get "$out" "$url" "401" 'H:realm="https://auth\.docker\.io/token"' ;;
+    hubauth) net_get "$out" "$url" "200" 'B:"token"' ;;
+    hubcdn) net_probe_layers "$out" docker; host="$NET_HOST" ;;
+    ghcr) net_get "$out" "$url" "401" 'H:realm="https://ghcr\.io/token"' ;;
+    ghcrcdn) net_probe_layers "$out" ghcr; host="$NET_HOST" ;;
+    repo*)
+      case "${url%%:*}" in
+        apt) net_get "$out" "${url#*:}" "200" 'B:BEGIN PGP SIGNED' ;;
+        repomd) net_get "$out" "${url#*:}" "200" 'B:<repomd' ;;
+        meta) net_get "$out" "${url#*:}" "200" 'B:(<metalink|^https?://)' ;;
+        *) net_get "$out" "${url#*:}" "200 301 302 400 401 403 404" "" -I ;;
+      esac
+      ;;
+    dockerrepo) net_get "$out" "$url" "200" 'B:BEGIN PGP PUBLIC KEY BLOCK' ;;
+    github) net_get "$out" "$url" "301 302" 'H:^location: .*/releases/tag/' -I ;;
+    ghassets)
+      if [ "$NET_TOOL" != "curl" ]; then
+        NET_R="NOT TESTED|needs curl"
+      else
+        net_get "$out" "$url" "200 206" "" -L -r 0-0
+        h="${NET_EFF#*://}"
+        h="${h%%[/:?]*}"
+        if [ -n "$h" ] && [ "$h" != "github.com" ]; then
+          host="$h"
+        fi
+      fi
+      ;;
+    brew) net_get "$out" "$url" "200" "" -I ;;
+    quay) net_get "$out" "$url" "401" 'H:realm="https://quay\.io/v2/auth"' ;;
+    desktop) net_get "$out" "$url" "200" 'B:<rss' ;;
+    hubapi) net_get "$out" "$url" "200" 'B:"results"' ;;
+    installer) net_get "$out" "$url" "200 206" 'B:^#!/usr/bin/env bash' -r 0-40 ;;
+    cloud) net_get "$out" "$url" "200" 'B:^true' ;;
+    license) net_get "$out" "$url" "200" 'H:^x-served-by: *licenses\.raynet\.de' ;;
+    acme) net_get "$out" "$url" "200" 'B:"newAccount"' ;;
+    awsip) net_get "$out" "$url" "200 206" 'B:"prefixes"' -r 0-1023 ;;
+    cfip) net_get "$out" "$url" "200" 'B:^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+/[0-9]+' ;;
+  esac
+  NET_R="${NET_R//$'\n'/ }"
+  printf '%s|%s\n' "$NET_R" "$host" > "$out.tmp" && mv -f -- "$out.tmp" "$out.res"
+}
+
+# net_line STATUS LEVEL HOST WHAT DETAIL -> one row of the check (80 columns; the detail below it)
+net_line() {
+  local st="$1" level="$2" host="$3" what="$4" detail="$5" color="$C_RED" l
+  case "$st" in
+    OK) color="$C_GRN" ;;
+    -|"NOT TESTED") color="$C_DIM" ;;
+    *)
+      if [ "$level" != "req" ]; then
+        color="$C_YLW"
+      fi
+      ;;
+  esac
+  printf '  %s %s %s\n' "$color$(ui_pad "$st" 13)$C_RST" "$(ui_pad "$host" 36)" "$what"
+  if [ -n "$detail" ]; then
+    while IFS= read -r l; do
+      printf '%17s%s\n' "" "$C_DIM$l$C_RST"
+    done <<< "$(printf '%s\n' "$detail" | fold -s -w 62 | sed 's/ *$//')"
+  fi
+}
+
+# net_kill_tree PID -> PID and every process it started (the curl of a stopped check would run on until its
+# time is up); the whole tree is collected first, as its processes go to init once their parent ends
+net_kill_tree() {
+  local -a all=("$1")
+  local i=0 c
+  while [ "$i" -lt "${#all[@]}" ] && [ "${#all[@]}" -lt 200 ]; do
+    while IFS= read -r c; do
+      if [ -n "$c" ]; then
+        all+=("$c")
+      fi
+    done <<< "$(pgrep -P "${all[i]}" 2>/dev/null || true)"
+    i=$((i + 1))
+  done
+  kill "${all[@]}" 2>/dev/null || true
+}
+
+# net_check [show|quiet|probe] [KEY...] -> checks the sites of net_rows at the same time (one request after
+# the other only inside a row), directly or through NET_VIA. show: the table and the verdict; quiet: nothing
+# on the screen; probe: only the required sites, nothing shown or cached (the candidates of a PAC file).
+# KEY...: only these rows. Fills NET_* and, after a full check of the settings in use, the cache of the
+# menu. 0 when every required site answers.
+net_check() {
+  local mode="${1:-show}" only="${2:-}" key host port level what url i n st det h stopped="" traps=""
+  local -a pids=()
+  NET_KEYS=()
+  NET_HOSTS=()
+  NET_PORTS=()
+  NET_LEVELS=()
+  NET_WHAT=()
+  NET_URLS=()
+  NET_STATUS=()
+  NET_DETAIL=()
+  NET_REQ_BAD=0
+  NET_OPT_BAD=0
+  NET_TOTAL=0
+  NET_NODNS=""
+  NET_LIMIT=""
+  NET_SECS=0
+  while IFS='|' read -r key host port level what url; do
+    if [ -z "$key" ] || { [ -n "$only" ] && [[ " $only " != *" $key "* ]]; } || { [ "$mode" = "probe" ] && [ "$level" != "req" ]; }; then
+      continue
+    fi
+    NET_KEYS+=("$key")
+    NET_HOSTS+=("$host")
+    NET_PORTS+=("$port")
+    NET_LEVELS+=("$level")
+    NET_WHAT+=("$what")
+    NET_URLS+=("$url")
+    NET_STATUS+=("-")
+    NET_DETAIL+=("")
+  done <<< "$(net_rows)"
+  n="${#NET_KEYS[@]}"
+  if command -v curl >/dev/null 2>&1; then
+    NET_TOOL="curl"
+  elif command -v wget >/dev/null 2>&1; then
+    NET_TOOL="wget"
+  else
+    if [ "$mode" = "show" ]; then
+      err "Neither curl nor wget is installed: the sites cannot be checked from here."
+      echo "  These are the sites the installation needs:"
+      net_hosts_text | sed 's/^/  /'
+    fi
+    return 1
+  fi
+  if ! NET_TMP="$(mktemp -d)"; then
+    return 1
+  fi
+  if [ "$mode" != "quiet" ]; then
+    traps="$(trap -p INT TERM)"
+    trap 'stopped="yes"' INT TERM
+  fi
+  NET_SECS="$SECONDS"
+  if [ "$mode" = "show" ]; then
+    printf '  %s\n' "${C_BLD}Internet access$C_RST - ${NET_VIA_TEXT:-direct, no proxy}"
+  fi
+  # one name first: a server that resolves no internet names reaches out only through a proxy
+  if [ -z "$NET_VIA" ] && [ "$n" -gt 0 ] && [ "${NET_KEYS[0]}" = "hub" ]; then
+    net_probe 0 || true
+    IFS='|' read -r st det h < "$NET_TMP/0.res" || st=""
+    if [ "$st" = "NO DNS" ]; then
+      NET_NODNS="yes"
+    fi
+  fi
+  for ((i = 0; i < n; i++)); do
+    if [ -f "$NET_TMP/$i.res" ]; then
+      continue
+    fi
+    if [ "${NET_LEVELS[i]}" = "-" ]; then
+      printf -- '-||%s\n' "${NET_HOSTS[i]}" > "$NET_TMP/$i.res"
+    elif [ -n "$NET_NODNS" ]; then
+      printf 'NO DNS||%s\n' "${NET_HOSTS[i]}" > "$NET_TMP/$i.res"
+    else
+      ( set +e; net_probe "$i" ) </dev/null >/dev/null 2>&1 &
+      pids[i]=$!
+    fi
+  done
+  for ((i = 0; i < n; i++)); do
+    while [ ! -f "$NET_TMP/$i.res" ] && [ -z "$stopped" ]; do
+      if [ -n "$NET_WATCH" ] && ! kill -0 "$NET_WATCH" 2>/dev/null; then
+        stopped="yes"
+        break
+      fi
+      if [ -n "${pids[i]:-}" ] && ! kill -0 "${pids[i]}" 2>/dev/null; then
+        if [ ! -f "$NET_TMP/$i.res" ]; then
+          printf 'BLOCKED|no result|%s\n' "${NET_HOSTS[i]}" > "$NET_TMP/$i.res"
+        fi
+        break
+      fi
+      sleep 0.1
+    done
+    if [ -n "$stopped" ]; then
+      break
+    fi
+    IFS='|' read -r st det h < "$NET_TMP/$i.res" || true
+    NET_STATUS[i]="${st:--}"
+    NET_DETAIL[i]="$det"
+    NET_HOSTS[i]="${h:-${NET_HOSTS[i]}}"
+    case "${NET_STATUS[i]}" in
+      -) ;;
+      OK|"NOT TESTED") NET_TOTAL=$((NET_TOTAL + 1)) ;;
+      *)
+        NET_TOTAL=$((NET_TOTAL + 1))
+        if [ "${NET_LEVELS[i]}" = "req" ]; then
+          NET_REQ_BAD=$((NET_REQ_BAD + 1))
+        else
+          NET_OPT_BAD=$((NET_OPT_BAD + 1))
+        fi
+        ;;
+    esac
+    if [ "$mode" = "show" ]; then
+      net_line "${NET_STATUS[i]}" "${NET_LEVELS[i]}" "${NET_HOSTS[i]}" "${NET_WHAT[i]}" "${NET_DETAIL[i]}"
+    fi
+  done
+  if [ -n "$stopped" ]; then
+    for i in ${pids[@]+"${!pids[@]}"}; do
+      net_kill_tree "${pids[i]}"
+    done
+  fi
+  NET_LIMIT="$(cat -- "$NET_TMP/hub.limit" 2>/dev/null)" || NET_LIMIT=""
+  rm -rf -- "$NET_TMP"
+  NET_TMP=""
+  NET_SECS=$((SECONDS - NET_SECS))
+  if [ "$mode" != "quiet" ]; then
+    trap - INT TERM
+    eval "$traps"
+  fi
+  if [ -n "$stopped" ]; then
+    echo
+    warn "The check was stopped."
+    return 130
+  fi
+  if [ "$mode" != "probe" ] && [ -z "$only" ] && [ "$NET_VIA" = "$(net_via_now)" ]; then
+    net_cache_write
+  fi
+  if [ "$mode" = "show" ]; then
+    echo
+    net_verdict
+  fi
+  [ "$NET_REQ_BAD" -eq 0 ] && [ -z "$NET_NODNS" ]
+}
+
+# The verdict after the table: what cannot be reached, what that means, the way out
+net_verdict() {
+  local i what="" hub="no" acme="no"
+  for ((i = 0; i < ${#NET_KEYS[@]}; i++)); do
+    case "${NET_STATUS[i]}" in
+      OK|-|"NOT TESTED") ;;
+      *)
+        case "${NET_KEYS[i]}" in
+          hub|hubauth|hubcdn) hub="yes" ;;
+        esac
+        if [ "${NET_LEVELS[i]}" != "req" ] && [[ "$what, " != *", ${NET_WHAT[i]% (optional)}, "* ]]; then
+          what="$what, ${NET_WHAT[i]% (optional)}"
+        fi
+        ;;
+    esac
+    if [ "${NET_KEYS[i]}" = "acme" ] && [ "${NET_LEVELS[i]}" = "req" ]; then
+      acme="yes"
+    fi
+  done
+  if [ -n "$NET_NODNS" ]; then
+    err "This server cannot resolve internet names: it probably reaches the"
+    echo "  internet only through a proxy."
+  elif [ "$NET_REQ_BAD" -gt 0 ]; then
+    err "$NET_REQ_BAD required site(s) cannot be reached$(if [ -z "$NET_VIA" ]; then printf '. A proxy is probably needed'; fi)."
+  fi
+  if [ "$hub" = "yes" ]; then
+    echo "  Without Docker Hub: a proxy, the offline bundle (option 8 on a computer with"
+    echo "  internet), or an internal registry mirror."
+  fi
+  if [ -n "$what" ] && [ -z "$NET_NODNS" ]; then
+    warn "Not reachable, so these do not work here: ${what#, }."
+  fi
+  if [ "$NET_REQ_BAD" -eq 0 ] && [ -z "$NET_NODNS" ]; then
+    ok "Internet access works: $((NET_TOTAL - NET_OPT_BAD)) of $NET_TOTAL sites answer ($NET_SECS s)."
+  fi
+  if [ -n "$NET_LIMIT" ]; then
+    echo "  Docker Hub: ${NET_LIMIT% *} of ${NET_LIMIT#* } pulls left (shared by everyone behind the same address)."
+  fi
+  if [ "$acme" = "yes" ]; then
+    echo "  Let's Encrypt also needs port 80 of this server open from the internet - that"
+    echo "  cannot be checked from here."
+  fi
+}
+
+# The proxy of the settings in use, with its login (empty: direct), as the check takes it
+net_via_now() {
+  if [ -n "$INTERNET_PROXY" ]; then
+    net_with_login "$INTERNET_PROXY"
+  else
+    printf '%s' "$NET_SHELL_PROXY"
+  fi
+}
+
+# NET_VIA and NET_VIA_TEXT for the proxy in use: INTERNET_PROXY with the saved login, else the proxy of the
+# shell, else none (direct)
+net_via_settings() {
+  local u
+  NET_VIA="$(net_via_now)"
+  NET_VIA_TEXT=""
+  NET_VIA_NO=""
+  if [ -n "$INTERNET_PROXY" ]; then
+    u="$(proxy_login_user)"
+    NET_VIA_TEXT="through $INTERNET_PROXY${u:+, login $u}"
+    NET_VIA_NO="$(net_no_list)"
+  elif [ -n "$NET_SHELL_PROXY" ]; then
+    NET_VIA_TEXT="through the proxy of your shell ($NET_SHELL_NAME)"
+    NET_VIA_NO="${NET_SHELL_NO// /}"
+  fi
+}
+
+# A checksum of what the sites and their answers depend on: a cached check counts only while it is the same
+net_signature() {
+  printf '%s|%s|%s|%s|%s|%s|%s|%s|%s' "$INTERNET_PROXY" "$INTERNET_NO_PROXY" "$(proxy_login | cksum)" "$CONTAINER_ENGINE" \
+    "$CATALOG_DOMAIN" "$INSTALL_NGINX_PROXY_MANAGER" "$CATALOG_VERSION" "$(printf '%s' "$NET_SHELL_PROXY" | cksum)" "$INTERNET_PROXY_CA_FILE" \
+    | cksum | cut -d' ' -f1
+}
+
+# The result of the last full check, for the menu header and option 16: the time, the signature, then one
+# line per site (no login in it)
+net_cache_write() {
+  local i f
+  if ! mkdir -p -- "$JOBS_DIR" 2>/dev/null; then
+    return 0
+  fi
+  chmod 700 "$JOBS_DIR" 2>/dev/null || true
+  f="$NET_CACHE.$BASHPID"
+  if {
+      printf '%s|%s|%s\n' "$(date +%s)" "$(net_signature)" "$NET_SECS"
+      for ((i = 0; i < ${#NET_KEYS[@]}; i++)); do
+        printf '%s|%s|%s|%s|%s|%s\n' "${NET_KEYS[i]}" "${NET_STATUS[i]}" "${NET_LEVELS[i]}" "${NET_HOSTS[i]}" "${NET_WHAT[i]}" "${NET_DETAIL[i]//|//}"
+      done
+    } > "$f" 2>/dev/null; then
+    mv -f -- "$f" "$NET_CACHE" 2>/dev/null || rm -f -- "$f"
+  else
+    rm -f -- "$f"
+  fi
+}
+
+# NET_C_REQ, NET_C_OPT (sites that cannot be reached) and NET_C_TOTAL from the cache; 1 when it is missing,
+# older than NET_CACHE_TTL seconds, or the settings changed since
+net_cache_read() {
+  local t sig rest key st level now
+  NET_C_REQ=0
+  NET_C_OPT=0
+  NET_C_TOTAL=0
+  if [ ! -r "$NET_CACHE" ] || ! IFS='|' read -r t sig rest < "$NET_CACHE"; then
+    return 1
+  fi
+  now="$(date +%s)"
+  if ! [[ "$t" =~ ^[0-9]+$ ]] || [ $((now - t)) -gt "$NET_CACHE_TTL" ] || [ $((now - t)) -lt -60 ] || [ "$sig" != "$(net_signature)" ]; then
+    return 1
+  fi
+  while IFS='|' read -r key st level rest; do
+    case "$st" in
+      -|"") ;;
+      OK|"NOT TESTED") NET_C_TOTAL=$((NET_C_TOTAL + 1)) ;;
+      *)
+        NET_C_TOTAL=$((NET_C_TOTAL + 1))
+        if [ "$level" = "req" ]; then
+          NET_C_REQ=$((NET_C_REQ + 1))
+        else
+          NET_C_OPT=$((NET_C_OPT + 1))
+        fi
+        ;;
+    esac
+  done <<< "$(tail -n +2 "$NET_CACHE")"
+}
+
+# The check of the menu start: in the background (the menu never waits for it), its result in the cache;
+# a fresh cache is used as it is. Called again while the menu stays open: a new check once the cache is
+# older than NET_CACHE_TTL. Not on a server marked offline (choice 5 of option 26). The check is no job of
+# the menu (a plain wait elsewhere does not wait for it) and stops when the menu has quit.
+net_background_start() {
+  if [ -n "$NET_BG_PID" ]; then
+    if kill -0 "$NET_BG_PID" 2>/dev/null; then
+      return 0
+    fi
+    NET_BG_PID=""
+  fi
+  if ! net_enabled || [ -f "$NET_OFFLINE_FILE" ]; then
+    return 0
+  fi
+  if [ -n "$NET_BG_AT" ] && [ $((SECONDS - NET_BG_AT)) -lt "$NET_CACHE_TTL" ]; then
+    return 0
+  fi
+  if net_cache_read; then
+    return 0
+  fi
+  NET_BG_AT="$SECONDS"
+  ( set +e; NET_WATCH="$$"; NET_CT=5; NET_MT=10; net_via_settings; net_check quiet ) </dev/null >/dev/null 2>&1 &
+  NET_BG_PID=$!
+  disown "$NET_BG_PID" 2>/dev/null || true
+}
+
+# True (once) when the background check of the menu start has ended: the header is drawn again
+net_background_done() {
+  if [ -n "$NET_BG_PID" ] && ! kill -0 "$NET_BG_PID" 2>/dev/null; then
+    NET_BG_PID=""
+    return 0
+  fi
+  return 1
+}
+
+# The internet line of the menu header: empty until a check is known
+net_header() {
+  if ! net_enabled || [ -f "$NET_OFFLINE_FILE" ] || ! net_cache_read; then
+    return 0
+  fi
+  if [ "$NET_C_REQ" -gt 0 ]; then
+    printf 'Internet: %s required site%s blocked - 26 shows them' "$NET_C_REQ" "$(if [ "$NET_C_REQ" -gt 1 ]; then printf s; fi)"
+  elif [ "$NET_C_OPT" -gt 0 ]; then
+    printf 'Internet %s %s optional site%s blocked' "$UI_OK" "$UI_SEP $NET_C_OPT" "$(if [ "$NET_C_OPT" -gt 1 ]; then printf s; fi)"
+  else
+    printf 'Internet %s' "$UI_OK"
+  fi
+}
+
+# The internet line of option 16: the check of the menu start when it is fresh, else a check now
+net_check_line() {
+  local k
+  while IFS= read -r k; do
+    if [ -z "$k" ]; then
+      continue
+    elif [ -z "$INTERNET_PROXY" ]; then
+      warn "$(kind_name "$k") does not read the proxy of your shell - option 26 saves it."
+    else
+      warn "$(kind_name "$k") does not use the internet settings yet - option 26 applies them."
+    fi
+  done <<< "$(net_engine_stale)"
+  if [ -f "$NET_OFFLINE_FILE" ]; then
+    info "Internet: not checked - an offline installation (option 26 checks it)."
+    return 0
+  fi
+  if ! net_cache_read; then
+    info "Checking the internet access (the sites the installation needs)..."
+    net_via_settings
+    net_check quiet || true
+    if ! net_cache_read; then
+      warn "The internet access could not be checked - $(hint 26 network-check) shows why."
+      return 0
+    fi
+  fi
+  if [ "$NET_C_REQ" -gt 0 ]; then
+    warn "Internet: $NET_C_REQ required site(s) cannot be reached - $(hint 26 network-check) shows them."
+  elif [ "$NET_C_OPT" -gt 0 ]; then
+    ok "Internet: every required site answers, $NET_C_OPT optional one(s) not."
+  else
+    ok "Internet: all $NET_C_TOTAL sites the installation needs answer."
+  fi
+}
+
+# net_engine_check -> before the engine is set up: the sites its setup needs (packages, Docker's repository,
+# Docker Compose on GitHub, Homebrew); shows only those that cannot be reached. 1 when a required one cannot.
+net_engine_check() {
+  local i shown="no"
+  if ! net_enabled || ! command -v curl >/dev/null 2>&1; then
+    return 0
+  fi
+  NET_ENGINE_KIND="$ENGINE_KIND"
+  info "Checking the sites the setup of $ENGINE_NAME downloads from..."
+  net_via_settings
+  net_check quiet "repo1 repo2 repo3 repo4 repo5 repo6 dockerrepo github ghassets brew quay desktop" || true
+  NET_ENGINE_KIND=""
+  for ((i = 0; i < ${#NET_KEYS[@]}; i++)); do
+    case "${NET_STATUS[i]}" in
+      OK|-|"NOT TESTED") ;;
+      *)
+        if [ "$shown" = "no" ]; then
+          echo "  The setup of $ENGINE_NAME downloads from these sites, which cannot be"
+          echo "  reached:"
+          shown="yes"
+        fi
+        net_line "${NET_STATUS[i]}" "${NET_LEVELS[i]}" "${NET_HOSTS[i]}" "${NET_WHAT[i]}" "${NET_DETAIL[i]}"
+        ;;
+    esac
+  done
+  if [ "$NET_REQ_BAD" -gt 0 ]; then
+    warn "The setup will probably fail - $(hint 26 network-check) checks the"
+    echo "  internet access and sets a proxy."
+    return 1
+  fi
+}
+
+# The sites of this installation for the network team's firewall request (network-hosts, option 26)
+net_hosts_text() {
+  local key host port level what url acme="no"
+  echo "# Sites the Raynet One Technology Catalog installation needs (outbound; HTTPS"
+  echo "# unless the port says otherwise). required: the installation stops without it."
+  while IFS='|' read -r key host port level what url; do
+    if [ -z "$key" ] || [ "$level" = "-" ]; then
+      continue
+    fi
+    if [ "$key" = "acme" ]; then
+      acme="yes"
+    fi
+    printf '%-40s %-8s %s\n' "$host:$port" "$(if [ "$level" = "req" ]; then printf required; else printf optional; fi)" "${what% (optional)}"
+  done <<< "$(net_rows)"
+  printf '%-40s %-8s %s\n' "packages.packagestore.com:443" "optional" "package store of the Catalog"
+  echo "# Docker Hub serves its layers from production.cloudfront.docker.com (the host"
+  echo "# its allow list names); when it moves them to another CDN host, the pulls"
+  echo "# follow a redirect there: network-check names the host it finds."
+  if [ "$acme" = "yes" ]; then
+    echo "# Let's Encrypt also needs inbound TCP port 80 to this server from the internet."
+  fi
+}
+
+# The proxies set on this server, one per line: WHERE|ADDRESS (the shell, /etc/environment, profile.d,
+# dnf, yum, rhsm, apt, SUSE, Docker, Podman, ~/.docker/config.json, macOS)
+net_found() {
+  local f v h p
+  if [ -n "$NET_SHELL_PROXY" ]; then
+    printf 'your shell (%s)|%s\n' "$NET_SHELL_NAME" "$NET_SHELL_PROXY"
+  fi
+  for f in "$NET_ETC/environment" "$NET_ETC"/profile.d/*.sh; do
+    if [ -r "$f" ]; then
+      v="$(awk 'match($0, /^[ \t]*(export[ \t]+)?(https_proxy|HTTPS_PROXY|http_proxy|HTTP_PROXY|all_proxy|ALL_PROXY)=/) { v = substr($0, RLENGTH + 1); gsub(/["\047]/, "", v); sub(/[ \t;].*/, "", v); if (v != "") { print v; exit } }' "$f")" || v=""
+      if [ -n "$v" ]; then
+        printf '%s|%s\n' "${f#"$NET_ETC"/}" "$v"
+      fi
+    fi
+  done
+  for f in "$NET_ETC/dnf/dnf.conf" "$NET_ETC/yum.conf" "$NET_ETC"/yum.repos.d/*.repo; do
+    if [ -r "$f" ]; then
+      v="$(awk -F= '$1 ~ /^[ \t]*proxy[ \t]*$/ { v = $2; gsub(/[ \t]/, "", v); if (v != "" && v != "_none_") { print v; exit } }' "$f")" || v=""
+      if [ -n "$v" ]; then
+        printf '%s|%s\n' "${f#"$NET_ETC"/}" "$v"
+      fi
+    fi
+  done
+  f="$NET_ETC/rhsm/rhsm.conf"
+  if [ -r "$f" ]; then
+    h="$(awk -F= '$1 ~ /^[ \t]*proxy_hostname[ \t]*$/ { v = $2; gsub(/[ \t]/, "", v); print v; exit }' "$f")" || h=""
+    p="$(awk -F= '$1 ~ /^[ \t]*proxy_port[ \t]*$/ { v = $2; gsub(/[ \t]/, "", v); print v; exit }' "$f")" || p=""
+    if [ -n "$h" ]; then
+      printf 'rhsm/rhsm.conf|http://%s%s\n' "$h" "${p:+:$p}"
+    fi
+  fi
+  v="$(net_apt_proxy)"
+  if [ -n "$v" ]; then
+    printf 'apt (Acquire::Proxy)|%s\n' "$v"
+  fi
+  f="$NET_ETC/sysconfig/proxy"
+  if [ -r "$f" ] && grep -q '^PROXY_ENABLED="yes"' "$f"; then
+    v="$(sed -n 's/^HTTPS_PROXY="\(.*\)"$/\1/p' "$f")"
+    v="${v:-$(sed -n 's/^HTTP_PROXY="\(.*\)"$/\1/p' "$f")}"
+    if [ -n "$v" ]; then
+      printf 'sysconfig/proxy|%s\n' "${v%%$'\n'*}"
+    fi
+  fi
+  if command -v systemctl >/dev/null 2>&1 && [ "$OS_KIND" != "Darwin" ]; then
+    for h in docker podman; do
+      v="$(systemctl show "$h.service" -p Environment 2>/dev/null)" || v=""
+      v="$(printf '%s\n' "$v" | tr ' ' '\n' | sed -n 's/^\(Environment=\)\{0,1\}[Hh][Tt][Tt][Pp][Ss]\{0,1\}_[Pp][Rr][Oo][Xx][Yy]=//p')" || v=""
+      if [ -n "$v" ]; then
+        printf '%s.service|%s\n' "$h" "${v%%$'\n'*}"
+      fi
+    done
+  fi
+  f="$NET_ETC/docker/daemon.json"
+  if [ -r "$f" ]; then
+    v="$(grep -o '"https\{0,1\}-proxy" *: *"[^"]*"' "$f")" || v=""
+    v="${v%%$'\n'*}"
+    if [ -n "$v" ]; then
+      v="${v%\"}"
+      printf 'docker/daemon.json|%s\n' "${v##*\"}"
+    fi
+  fi
+  for f in "$NET_ETC/containers/containers.conf" "$NET_ETC"/containers/containers.conf.d/*.conf; do
+    if [ -r "$f" ]; then
+      v="$(grep -o '[Hh][Tt][Tt][Pp][Ss]\{0,1\}_[Pp][Rr][Oo][Xx][Yy]=[^"]*' "$f")" || v=""
+      v="${v%%$'\n'*}"
+      if [ -n "$v" ]; then
+        printf '%s|%s\n' "${f#"$NET_ETC"/}" "${v#*=}"
+      fi
+    fi
+  done
+  f="$HOME/.docker/config.json"
+  if [ -r "$f" ]; then
+    v="$(grep -o '"https\{0,1\}Proxy" *: *"[^"]*"' "$f")" || v=""
+    v="${v%%$'\n'*}"
+    if [ -n "$v" ]; then
+      v="${v%\"}"
+      printf '~/.docker/config.json|%s\n' "${v##*\"}"
+    fi
+  fi
+  if [ "$OS_KIND" = "Darwin" ] && command -v scutil >/dev/null 2>&1; then
+    v="$(scutil --proxy 2>/dev/null)" || v=""
+    h="$(awk '$1 == "HTTPSProxy" { print $3 }' <<< "$v")"
+    p="$(awk '$1 == "HTTPSPort" { print $3 }' <<< "$v")"
+    if [ -n "$h" ] && [ "$(awk '$1 == "HTTPSEnable" { print $3 }' <<< "$v")" = "1" ]; then
+      printf 'macOS (Network settings)|http://%s%s\n' "$h" "${p:+:$p}"
+    fi
+    h="$(awk '$1 == "ProxyAutoConfigURLString" { print $3 }' <<< "$v")"
+    if [ -n "$h" ]; then
+      printf 'macOS (PAC file)|%s\n' "$h"
+    fi
+  fi
+}
+
+# net_found_show LINES -> the proxies of net_found on the screen (passwords masked), with the two places
+# whose proxy acts on more than the installer
+net_found_show() {
+  local where addr
+  echo "  Proxies set on this server:"
+  while IFS='|' read -r where addr; do
+    if [ -n "$where" ]; then
+      printf '    %s %s\n' "$(ui_pad "$where" 26)" "$(net_mask "$addr")"
+    fi
+  done <<< "$1"
+  if [[ "$1" == *"~/.docker/config.json|"* ]]; then
+    warn "~/.docker/config.json hands its proxy to every container Compose starts:"
+    echo "  with INTERNET_PROXY set, the services that need none get an empty one."
+  fi
+  if [[ "$1" == *"docker/daemon.json|"* ]]; then
+    warn "The proxies of docker/daemon.json win over every other setting of the"
+    echo "  Docker daemon."
+  fi
+}
+
+# The address of the first proxy net_found names that is a PAC file or a proxy address
+net_found_first() {
+  local where addr
+  while IFS='|' read -r where addr; do
+    if [ -n "$addr" ] && [[ "$where" != *"PAC file"* ]]; then
+      printf '%s|%s' "$where" "$addr"
+      return 0
+    fi
+  done <<< "$1"
+}
+
+# True when every required site that fails is behind a TLS inspection (the certificate question first)
+net_only_tls() {
+  local i tls="no"
+  for ((i = 0; i < ${#NET_KEYS[@]}; i++)); do
+    if [ "${NET_LEVELS[i]}" != "req" ]; then
+      continue
+    fi
+    case "${NET_STATUS[i]}" in
+      OK|-|"NOT TESTED") ;;
+      "TLS INSPECTED") tls="yes" ;;
+      *) return 1 ;;
+    esac
+  done
+  [ "$tls" = "yes" ]
+}
+
+# The issuer the TLS inspection of the last check named (empty: none)
+net_tls_issuer() {
+  local i d
+  for ((i = 0; i < ${#NET_KEYS[@]}; i++)); do
+    if [ "${NET_STATUS[i]}" = "TLS INSPECTED" ]; then
+      d="${NET_DETAIL[i]#*\"}"
+      printf '%s' "${d%\"*}"
+      return 0
+    fi
+  done
+}
+
+# net_ask [wizard] -> after a check: how this server reaches the internet - a proxy (address, PAC file or
+# WPAD), directly (the firewall opens the sites) or not at all (offline bundle). 0: a proxy or the
+# certificate was saved; 1: stopped later; 2: 0 at the first question; 3: offline; 4: directly
+net_ask() {
+  local mode="${1:-}" found first where="" addr="" choice rc
+  found="$(net_found)"
+  if [ -n "$found" ]; then
+    net_found_show "$found"
+    echo
+  fi
+  first="$(net_found_first "$found")"
+  if [ -n "$first" ]; then
+    where="${first%%|*}"
+    addr="${first#*|}"
+  fi
+  # a TLS inspection only: the company certificate first
+  if net_only_tls; then
+    if net_ask_ca "$(net_tls_issuer)"; then
+      return 0
+    fi
+    echo
+  fi
+  while true; do
+    echo "  How does this server reach the internet?"
+    printf '   %s  %s\n' "${C_BLD}1$C_RST" "Through a proxy server - I know its address"
+    printf '   %s  %s\n' "${C_BLD}2$C_RST" "Through a proxy configuration file (PAC)"
+    printf '   %s  %s\n' "${C_BLD}3$C_RST" "Find the proxy automatically (WPAD)"
+    printf '   %s  %s\n' "${C_BLD}4$C_RST" "Directly - the firewall will allow the sites"
+    printf '   %s  %s\n' "${C_BLD}5$C_RST" "Not at all - offline installation"
+    printf '   %s  %s\n' "${C_BLD}0$C_RST" "$C_DIM$(if [ "$mode" = "wizard" ]; then printf 'stop'; else printf 'back'; fi)$C_RST"
+    echo
+    if [ -n "$addr" ]; then
+      echo "  Enter takes 1 with $(net_mask "$addr")"
+      echo "  (found in $where)."
+    fi
+    if ! ui_ask choice "Select [1]:"; then
+      echo
+      return 2
+    fi
+    case "${choice:-1}" in
+      0) return 2 ;;
+      1)
+        rc=0
+        net_ask_proxy "$addr" || rc=$?
+        if [ "$rc" -eq 0 ]; then
+          return 0
+        fi
+        ;;
+      2)
+        if net_ask_pac ""; then
+          return 0
+        fi
+        ;;
+      3)
+        if net_ask_wpad; then
+          return 0
+        fi
+        ;;
+      4)
+        echo
+        echo "  For the network team - the sites to allow from this server:"
+        echo
+        net_hosts_text | sed 's/^/  /'
+        echo
+        info "Directly: the downloads work once the firewall allows these sites."
+        rm -f -- "$NET_OFFLINE_FILE"
+        # a saved proxy would still be used: it goes after a yes
+        if [ -n "$INTERNET_PROXY" ]; then
+          echo
+          net_remove || true
+        fi
+        return 4
+        ;;
+      5)
+        echo
+        info "Offline installation: on a computer with internet, option 8 (Download only)"
+        echo "  builds an offline bundle with all images; copy it here and run its"
+        echo "  import-images.sh, then the installer of the bundle."
+        echo "  The menu no longer checks the internet at its start (option 26 still does)."
+        if mkdir -p -- "$JOBS_DIR" 2>/dev/null; then
+          : > "$NET_OFFLINE_FILE" 2>/dev/null || true
+        fi
+        return 3
+        ;;
+      *) warn "Invalid choice: $choice" ;;
+    esac
+    echo
+  done
+}
+
+# net_proxy_notes SCHEME HOST -> what a SOCKS proxy or a relay on this server means
+net_proxy_notes() {
+  case "$1" in
+    socks5|socks5h)
+      warn "A SOCKS proxy: Let's Encrypt in Nginx Proxy Manager and wget cannot use it;"
+      echo "  an HTTP proxy is better."
+      if [ "$1" = "socks5" ]; then
+        echo "  socks5:// resolves the names on this server; socks5h:// lets the proxy do it."
+      fi
+      ;;
+  esac
+  case "$2" in
+    127.*|localhost|"[::1]")
+      info "A relay on this server: the containers reach it as host.docker.internal or"
+      echo "  host.containers.internal, so it must listen there too (cntlm Listen, px"
+      echo "  --gateway with --allow). Docker: the bridge address (172.17.0.1). Podman:"
+      echo "  host.containers.internal is the server's own LAN address - a relay there"
+      echo "  that logs in as a domain user is an open proxy for the whole network unless"
+      echo "  a firewall lets only the containers in (e.g. 10.88.0.0/16 for Podman)."
+      ;;
+  esac
+}
+
+# net_ntlm_text SCHEMES -> why a proxy that takes only Windows domain logins (or Digest) cannot be used by the
+# engine and the package managers, and the two ways out
+net_ntlm_text() {
+  echo
+  if [[ " $1 " == *" Digest "* ]] && [[ " $1 " != *" NTLM "* ]] && [[ " $1 " != *" Negotiate "* ]]; then
+    warn "This proxy accepts only Digest logins. Docker, Podman and apt log in"
+    echo "  only with Basic, so image pulls and packages cannot pass this proxy."
+    echo "  Two ways out:"
+  else
+    warn "This proxy accepts only Windows domain logins (NTLM or Kerberos). Docker,"
+    echo "  Podman and apt can log in only with Basic, so image pulls and packages"
+    echo "  cannot pass this proxy. Two ways out:"
+  fi
+  echo "    a) Ask the network team to let this server through without a login (by its"
+  echo "       address: $(host_ip)), or to open the sites ('network-hosts' prints them)."
+  echo "    b) Run a local relay that logs in for this server - cntlm (package \"cntlm\")"
+  echo "       or px (pip install px-proxy) - and enter the relay's address here as a"
+  echo "       normal proxy, e.g. 127.0.0.1:3128."
+  echo
+}
+
+# net_try URL LOGIN -> one request through the proxy URL: 0 it passes requests on; 1 it cannot be reached
+# (said why); 2 it asks for a login (NET_SCHEMES: the methods it offers)
+net_try() {
+  local tmp host="${1#*://}"
+  NET_VIA="$(net_with_login "$1" "$2")"
+  NET_VIA_NO=""
+  NET_SCHEMES=""
+  if ! command -v curl >/dev/null 2>&1; then
+    return 0
+  fi
+  NET_TOOL="curl"
+  tmp="$(mktemp -d)" || return 1
+  net_get "$tmp/p" "https://registry-1.docker.io/v2/" "401" ""
+  NET_SCHEMES="$(net_auth_schemes "$tmp/p.hdr")"
+  rm -rf -- "$tmp"
+  case "${NET_R%%|*}" in
+    "PROXY DNS") err "The name of the proxy does not resolve: ${host%:*}"; return 1 ;;
+    REFUSED) err "Nothing listens at $host (wrong port?)."; return 1 ;;
+    BLOCKED) err "The proxy does not answer ($host)."; return 1 ;;
+    "PROXY LOGIN") return 2 ;;
+  esac
+  return 0
+}
+
+# net_ask_login URL -> NET_LOGIN: user name and password (hidden) for a proxy that takes Basic, tried at
+# once; 3 tries. 1: stopped, or wrong three times
+net_ask_login() {
+  local url="$1" user pass try rc
+  echo "  The proxy asks for a login. It is kept in $(basename -- "$PROXY_LOGIN_FILE") next to the"
+  echo "  installer (mode 600), never in the script."
+  for try in 1 2 3; do
+    ui_ask user "User name for the proxy (DOMAIN\\user is fine):" || return 1
+    if [ "$user" = "0" ]; then
+      return 1
+    fi
+    if [ -z "$user" ]; then
+      warn "Give the user name (0 stops)."
+      continue
+    fi
+    if ! read -r -s -p "  $C_CYN$UI_ARROW$C_RST Password (hidden): " pass; then
+      echo
+      return 1
+    fi
+    echo
+    NET_LOGIN="$(net_encode "$user"):$(net_encode "$pass")"
+    pass=""
+    rc=0
+    net_try "$url" "$NET_LOGIN" || rc=$?
+    case "$rc" in
+      0)
+        ok "The proxy takes this login."
+        return 0
+        ;;
+      2) err "Wrong user name or password - the proxy asks again." ;;
+      *) return 1 ;;
+    esac
+  done
+  NET_LOGIN=""
+  err "Stopped after 3 failed logins."
+  return 1
+}
+
+# The domains of this server (its full name and the search line of resolv.conf), comma-separated: the
+# default of the internal names
+net_local_domains() {
+  local d out=""
+  for d in $(net_server_names | sed -n 's/^[^.]*\.//p') $(awk '$1 == "search" || $1 == "domain" { for (i = 2; i <= NF; i++) print $i }' "$NET_ETC/resolv.conf" 2>/dev/null); do
+    d="${d%.}"
+    d="${d,,}"
+    if [[ "$d" == *.* ]] && [[ ",$out," != *",$d,"* ]]; then
+      out="$out,$d"
+    fi
+  done
+  printf '%s' "${out#,}"
+}
+
+# net_ask_no_proxy [EXTRA] -> NET_NEW_NO: the internal names reached without the proxy (Enter takes
+# INTERNET_NO_PROXY, else the domains of this server, plus EXTRA). 1: 0 or the end of input
+net_ask_no_proxy() {
+  local extra="${1:-}" def input problem me item
+  def="$INTERNET_NO_PROXY"
+  if [ -z "$def" ]; then
+    def="$(net_local_domains)"
+  fi
+  for item in ${extra//,/ }; do
+    if [[ ",$def," != *",$item,"* ]]; then
+      def="${def:+$def,}$item"
+    fi
+  done
+  me="$(net_server_names | tr '\n' ' ')$(host_ip)"
+  echo
+  printf '%s\n' "These are always reached directly: localhost, the services of the Catalog, this server (${me// /, })." | fold -s -w 76 | sed 's/ *$//; s/^/  /'
+  echo "  More internal domains or hosts (comma-separated), e.g. corp.example.com;"
+  echo "  - for none."
+  while true; do
+    ui_ask input "Internal names [${def:-none}]:" || return 1
+    case "$input" in
+      0) return 1 ;;
+      "") input="$def" ;;
+      -) input="" ;;
+    esac
+    input="${input//[[:space:]]/}"
+    if [ -n "$input" ] && ! problem="$(settings_check INTERNET_NO_PROXY "$input" "")"; then
+      err "$problem"
+      continue
+    fi
+    NET_NEW_NO="$input"
+    return 0
+  done
+}
+
+# net_save URL LOGIN PAC NO-PROXY -> the proxy in the settings, its login in .proxy_login (or none), and in
+# use from now on
+net_save() {
+  local name value
+  for name in INTERNET_PROXY INTERNET_PROXY_PAC INTERNET_NO_PROXY; do
+    case "$name" in
+      INTERNET_PROXY) value="$1" ;;
+      INTERNET_PROXY_PAC) value="$3" ;;
+      *) value="$4" ;;
+    esac
+    if [ "${!name}" != "$value" ]; then
+      set_setting "$name" "$value" || return 1
+      printf -v "$name" '%s' "$value"
+    fi
+  done
+  if [ -n "$2" ]; then
+    proxy_login_save "$2" || return 1
+  else
+    rm -f -- "$PROXY_LOGIN_FILE"
+  fi
+  if [ -n "$1" ]; then
+    rm -f -- "$NET_OFFLINE_FILE"
+  fi
+  proxy_load
+}
+
+# net_ask_proxy [DEFAULT] [PAC-SOURCE] [NO-PROXY-EXTRA] -> the questions for a proxy: its address (taken from
+# a PAC file when PAC-SOURCE is given), its port, its login when it asks for one (a login typed into the
+# address goes to .proxy_login), the check of every site through it (and the company certificate when it
+# inspects HTTPS), the internal names; saved after a yes. 0: saved; 1: back
+net_ask_proxy_run() {
+  local def="${1:-}" pac="${2:-}" extra="${3:-}" input url login port rc ans user
+  while true; do
+    if [ -n "$pac" ] && [ -n "$def" ]; then
+      input="$def"
+    else
+      pac=""
+      ui_ask input "Address of the proxy, e.g. proxy.example.com:8080${def:+ [$(net_mask "$def")]}:" || return 1
+      input="${input:-$def}"
+      if [ "$input" = "0" ]; then
+        return 1
+      fi
+      if [ -z "$input" ]; then
+        continue
+      fi
+    fi
+    if ! net_parse "$input"; then
+      err "Give host:port, e.g. proxy.example.com:8080 or http://192.0.2.10:3128"
+      echo "  (http, https, socks5 or socks5h)."
+      def=""
+      pac=""
+      continue
+    fi
+    if [ -z "$NP_PORT" ]; then
+      while true; do
+        ui_ask port "Port of the proxy (often 8080, 3128 or 80):" || return 1
+        if [ "$port" = "0" ]; then
+          return 1
+        fi
+        if [[ "$port" =~ ^[1-9][0-9]{0,4}$ ]] && [ "$port" -le 65535 ]; then
+          break
+        fi
+        err "A port is a number from 1 to 65535."
+      done
+      NP_PORT="$port"
+    fi
+    url="$NP_SCHEME://$NP_HOST:$NP_PORT"
+    login=""
+    if [ -n "$NP_LOGIN" ]; then
+      login="$(net_encode "$(net_decode "${NP_LOGIN%%:*}")")"
+      if [[ "$NP_LOGIN" == *:* ]]; then
+        login="$login:$(net_encode "$(net_decode "${NP_LOGIN#*:}")")"
+      fi
+      info "The login goes into $(basename -- "$PROXY_LOGIN_FILE") (mode 600), not into the address."
+    elif [ "$url" = "$INTERNET_PROXY" ]; then
+      login="$(proxy_login)"
+    fi
+    net_proxy_notes "$NP_SCHEME" "$NP_HOST"
+    rc=0
+    net_try "$url" "$login" || rc=$?
+    if [ "$rc" -eq 1 ]; then
+      def=""
+      pac=""
+      continue
+    fi
+    if [ "$rc" -eq 2 ]; then
+      if [[ " $NET_SCHEMES " == *" Basic "* ]] || [ -z "$NET_SCHEMES" ]; then
+        if [ -n "$login" ]; then
+          err "The proxy does not take the login given - type it again."
+        fi
+        net_ask_login "$url" || return 1
+        login="$NET_LOGIN"
+      else
+        net_ntlm_text "$NET_SCHEMES"
+        def=""
+        pac=""
+        continue
+      fi
+    fi
+    # every site through it (the internal names of the settings and of the PAC file directly)
+    NET_VIA="$(net_with_login "$url" "$login")"
+    NET_VIA_NO="$(INTERNET_NO_PROXY="$INTERNET_NO_PROXY${extra:+,$extra}"; INTERNET_NO_PROXY="${INTERNET_NO_PROXY#,}"; net_no_list)"
+    user=""
+    if [ -n "$login" ]; then
+      user="$(net_decode "${login%%:*}")"
+    fi
+    NET_VIA_TEXT="through $url${user:+, login $user}"
+    echo
+    net_check show || true
+    if [ -n "$(net_tls_issuer)" ]; then
+      net_ask_ca "$(net_tls_issuer)" || true
+    fi
+    if [ "$NET_REQ_BAD" -gt 0 ] && ! net_only_tls; then
+      echo
+      ans=0
+      wiz_yes_no "Use this proxy anyway? (n: another address)" n || ans=$?
+      case "$ans" in
+        0) ;;
+        1) def=""; pac=""; echo; continue ;;
+        *) return 1 ;;
+      esac
+    fi
+    net_ask_no_proxy "$extra" || return 1
+    echo
+    echo "  Internet proxy $url"
+    if [ -n "$user" ]; then
+      echo "    login         $user (password saved, mode 600)"
+    fi
+    if [ -n "$pac" ]; then
+      echo "    taken from    $pac"
+    fi
+    echo "    this run      the downloads of the installer and the package installs (only"
+    echo "                  while the installer runs; nothing changes in apt or dnf)"
+    net_summary_apply
+    echo "    saved         INTERNET_PROXY and INTERNET_NO_PROXY in the settings$(if [ -n "$user" ]; then printf ','; fi)"
+    if [ -n "$user" ]; then
+      echo "                  the login in $(basename -- "$PROXY_LOGIN_FILE") (mode 600)"
+    fi
+    ans=0
+    wiz_yes_no "Save?" y || ans=$?
+    if [ "$ans" -ne 0 ]; then
+      info "Nothing was saved."
+      return 1
+    fi
+    net_save "$url" "$login" "$pac" "$NET_NEW_NO" || return 1
+    net_cache_write
+    ok "Saved: the installer uses this proxy from now on."
+    return 0
+  done
+}
+
+# net_ask_proxy [DEFAULT] [PAC-SOURCE] [NO-PROXY-EXTRA] -> the questions for a proxy (net_ask_proxy_run), then
+# the settings applied to the engine and the Catalog - once, a company certificate given on the way too.
+# 0: saved; 1: back
+net_ask_proxy() {
+  local rc=0
+  NET_DEFER="yes"
+  net_ask_proxy_run "$@" || rc=$?
+  NET_DEFER=""
+  if [ "$rc" -eq 0 ] || [ -n "$NET_APPLY_PENDING" ]; then
+    net_apply
+  fi
+  return "$rc"
+}
+
+# net_pac_fetch SOURCE -> the content of a PAC file: a URL is fetched directly (PAC servers are internal),
+# else through a proxy found on this server; a path is read. 1 when it is none (no FindProxyForURL).
+net_pac_fetch() {
+  local src="$1" c="" first
+  case "$src" in
+    http://*|https://*)
+      c="$(curl -fsS --noproxy '*' --connect-timeout 5 --max-time 10 "$src" 2>/dev/null)" || c=""
+      if [ -z "$c" ]; then
+        first="$(net_found_first "$(net_found)")"
+        if [ -n "$first" ]; then
+          c="$(printf 'proxy = "%s"\n' "${first#*|}" | curl -fsS -K - --connect-timeout 5 --max-time 10 "$src" 2>/dev/null)" || c=""
+        fi
+      fi
+      ;;
+    *)
+      if [ -f "$src" ] && [ -r "$src" ]; then
+        c="$(cat -- "$src")"
+      fi
+      ;;
+  esac
+  if [[ "$c" != *FindProxyForURL* ]]; then
+    return 1
+  fi
+  printf '%s\n' "$c"
+}
+
+# net_pac_candidates PAC-TEXT -> the proxies a PAC file names, in their order, as addresses (PROXY: http://,
+# HTTPS: https://, SOCKS: socks5h://), DIRECT as DIRECT
+net_pac_candidates() {
+  local kind hp
+  while read -r kind hp; do
+    case "$kind" in
+      PROXY) printf 'http://%s\n' "$hp" ;;
+      HTTPS) printf 'https://%s\n' "$hp" ;;
+      SOCKS|SOCKS5) printf 'socks5h://%s\n' "$hp" ;;
+      DIRECT) printf 'DIRECT\n' ;;
+    esac
+  done <<< "$(printf '%s\n' "$1" | grep -oE '(PROXY|HTTPS|SOCKS5?) ([A-Za-z0-9._-]+|\[[0-9A-Fa-f:.]+\]):[0-9]+|DIRECT')"
+}
+
+# net_pac_eval SOURCE PAC-TEXT -> the proxies of the PAC file for the required sites, in their order:
+# as pactester or libproxy's proxy tool evaluates it when one is installed (the installer installs neither),
+# else as the file names them
+net_pac_eval() {
+  local src="$1" text="$2" f host p o
+  {
+    if command -v pactester >/dev/null 2>&1; then
+      f="$(mktemp)"
+      printf '%s\n' "$text" > "$f"
+      for host in $(net_rows | awk -F'|' '$4 == "req" { print $2 }'); do
+        pactester -p "$f" -u "https://$host/" 2>/dev/null | awk -F';' 'NR == 1 { sub(/^ */, "", $1); print $1 }' || true
+      done | sed 's/^PROXY /http:\/\//; s/^HTTPS /https:\/\//; s/^SOCKS5* /socks5h:\/\//'
+      rm -f -- "$f"
+    else
+      p="$(command -v proxy 2>/dev/null)" || p=""
+      o=""
+      if [ -n "$p" ] && [[ "$src" == http* ]]; then
+        o="$(dpkg -S "$p" 2>/dev/null; rpm -qf "$p" 2>/dev/null)" || true
+      fi
+      if [[ "$o" == *libproxy* ]]; then
+        for host in $(net_rows | awk -F'|' '$4 == "req" { print $2 }'); do
+          o="$(printf 'https://%s/\n' "$host" | http_proxy="pac+$src" "$p" "https://$host/" 2>/dev/null)" || o=""
+          o="${o%% *}"
+          case "$o" in
+            direct://*|"") printf 'DIRECT\n' ;;
+            *) printf '%s\n' "${o%/}" ;;
+          esac
+        done
+      else
+        net_pac_candidates "$text"
+      fi
+    fi
+    printf 'DIRECT\n'
+  } | awk 'NF && !seen[$0]++'
+}
+
+# net_ask_pac [SOURCE] -> a proxy taken from a PAC file once (curl, Docker, Podman, dnf and wget cannot read
+# PAC files): the candidates it names and DIRECT are tried on the required sites; the first candidate that
+# reaches them all (with DIRECT: the sites only DIRECT reaches go to INTERNET_NO_PROXY) goes on into
+# net_ask_proxy. 1: back, or no single proxy reaches them all
+net_ask_pac() {
+  local src="${1:-}" text cands c chosen="" extra="" names="" direct=" " dn=0 i req=0 best="" bestn=-1 cnt own k
+  if [ -z "$src" ]; then
+    ui_ask src "Address or file of the PAC file, e.g. http://pac.example.com/proxy.pac${INTERNET_PROXY_PAC:+ [$INTERNET_PROXY_PAC]}:" || return 1
+    src="${src:-$INTERNET_PROXY_PAC}"
+    if [ -z "$src" ] || [ "$src" = "0" ]; then
+      return 1
+    fi
+  fi
+  if ! text="$(net_pac_fetch "$src")"; then
+    err "No PAC file at $src (it must contain FindProxyForURL)."
+    return 1
+  fi
+  cands="$(net_pac_eval "$src" "$text")"
+  while IFS= read -r c; do
+    if [ -n "$c" ]; then
+      names="$names, ${c#*://}"
+    fi
+  done <<< "$cands"
+  echo "  The PAC file names: ${names#, }."
+  info "Trying them on the required sites..."
+  NET_VIA=""
+  NET_VIA_NO=""
+  net_check probe || true
+  for ((i = 0; i < ${#NET_KEYS[@]}; i++)); do
+    req=$((req + 1))
+    if [ "${NET_STATUS[i]}" = "OK" ]; then
+      direct="$direct${NET_KEYS[i]} "
+      dn=$((dn + 1))
+    fi
+  done
+  if [ "$req" -gt 0 ] && [ "$dn" -eq "$req" ]; then
+    ok "All $req required sites answer directly - no proxy needed."
+    return 1
+  fi
+  while IFS= read -r c; do
+    if [ -z "$c" ] || [ "$c" = "DIRECT" ]; then
+      continue
+    fi
+    NET_VIA="$c"
+    net_check probe || true
+    extra=""
+    cnt=0
+    own=0
+    for ((i = 0; i < ${#NET_KEYS[@]}; i++)); do
+      k="${NET_KEYS[i]}"
+      case "${NET_STATUS[i]}" in
+        OK|"PROXY LOGIN") cnt=$((cnt + 1)); own=$((own + 1)) ;;
+        *)
+          if [[ "$direct" == *" $k "* ]]; then
+            extra="$extra,${NET_HOSTS[i]}"
+            cnt=$((cnt + 1))
+          fi
+          ;;
+      esac
+    done
+    # a proxy that reaches no site itself is none (a dead one, while DIRECT reaches the rest)
+    if [ "$own" -eq 0 ]; then
+      continue
+    fi
+    if [ "$cnt" -gt "$bestn" ]; then
+      best="$c"
+      bestn="$cnt"
+    fi
+    if [ "$cnt" -eq "$req" ]; then
+      chosen="$c"
+      break
+    fi
+  done <<< "$cands"
+  NET_VIA=""
+  if [ -z "$chosen" ]; then
+    err "No single proxy of the PAC file reaches all $req required sites."
+    if [ -n "$best" ]; then
+      echo "  The best one, ${best#*://}, reaches $bestn."
+    fi
+    echo "  Ask the network team for one proxy name for this server (a load-balanced one"
+    echo "  if there is one), then choice 1."
+    return 1
+  fi
+  ok "${chosen#*://} reaches all $req required sites - it will be used."
+  if [ -n "$extra" ]; then
+    echo "  Only reached directly, so they go to the internal names: ${extra#,}"
+  fi
+  echo "  The PAC file is read only now: its failover between proxies is lost."
+  net_ask_proxy "$chosen" "$src" "${extra#,}"
+}
+
+# The PAC addresses of WPAD for the domains of this server (search and domain of resolv.conf, the domain of
+# its name): http://wpad.DOMAIN/wpad.dat, walking up the domain but never below two labels, and never to a
+# public suffix such as co.uk or com.au (whoever registers wpad.co.uk would answer for every company there)
+net_wpad_urls() {
+  local d seen=" " re='^(co|com|net|org|ac|gov|edu|ne|or|go|gv|nic|ltd|plc|sch|mil)\.[a-z][a-z]$'
+  for d in $(awk '$1 == "search" || $1 == "domain" { for (i = 2; i <= NF; i++) print $i }' "$NET_ETC/resolv.conf" 2>/dev/null) $(hostname -d 2>/dev/null); do
+    d="${d%.}"
+    d="${d,,}"
+    while [[ "$d" == *.* ]] && ! [[ "$d" =~ $re ]]; do
+      if [[ "$seen" != *" $d "* ]]; then
+        seen="$seen$d "
+        printf 'http://wpad.%s/wpad.dat\n' "$d"
+      fi
+      d="${d#*.}"
+    done
+  done
+}
+
+# Choice 3: WPAD - only when chosen (a rogue answer could name any proxy): the PAC file it finds is shown and
+# used after a yes. 1: none found, or no
+net_ask_wpad() {
+  local url found="" ans tried="" c
+  info "Looking for the PAC file of your network (WPAD)..."
+  while IFS= read -r url; do
+    if [ -z "$url" ]; then
+      continue
+    fi
+    tried="$tried ${url#http://}"
+    c="$(curl -fsS --noproxy '*' --connect-timeout 3 --max-time 5 "$url" 2>/dev/null)" || c=""
+    if [[ "$c" == *FindProxyForURL* ]]; then
+      found="$url"
+      break
+    fi
+  done <<< "$(net_wpad_urls)"
+  if [ -z "$found" ]; then
+    warn "No PAC file found${tried:+ (tried:$tried)}."
+    return 1
+  fi
+  echo "  Found: $found"
+  echo "  Make sure it is your company's: on a network, anyone can answer for WPAD."
+  ans=0
+  wiz_yes_no "Use it?" n || ans=$?
+  if [ "$ans" -ne 0 ]; then
+    return 1
+  fi
+  net_ask_pac "$found"
+}
+
+# net_ca_pem FILE -> the certificates of FILE in PEM (DER is converted with openssl); fails, with the reason,
+# when FILE holds a private key or no certificate
+net_ca_pem() {
+  local f="$1"
+  if [ ! -f "$f" ] || [ ! -r "$f" ]; then
+    err "No readable file: $f"
+    return 1
+  fi
+  if grep -q 'PRIVATE KEY' "$f" 2>/dev/null; then
+    err "$f holds a private key - only the certificate is needed (never pass a key on)."
+    return 1
+  fi
+  if grep -q -- '-----BEGIN CERTIFICATE-----' "$f" 2>/dev/null; then
+    sed -n '/-----BEGIN CERTIFICATE-----/,/-----END CERTIFICATE-----/p' "$f"
+    return 0
+  fi
+  if command -v openssl >/dev/null 2>&1 && openssl x509 -inform der -in "$f" -outform pem 2>/dev/null; then
+    return 0
+  fi
+  err "$f is no certificate in PEM or DER$(if ! command -v openssl >/dev/null 2>&1; then printf ' (DER needs openssl)'; fi)."
+  return 1
+}
+
+# net_ca_show FILE -> each certificate of FILE: its name, validity and SHA-256 fingerprint, with a warning
+# for one that is no CA or has expired. 1 when FILE is none.
+net_ca_show() {
+  local pem dir c n=0 subj end fp
+  pem="$(net_ca_pem "$1")" || return 1
+  dir="$(mktemp -d)" || return 1
+  printf '%s\n' "$pem" | awk -v d="$dir" '/-----BEGIN CERTIFICATE-----/ { n++ } n { print > (d "/" n ".pem") }'
+  for c in "$dir"/*.pem; do
+    if [ ! -f "$c" ]; then
+      continue
+    fi
+    n=$((n + 1))
+    subj=""
+    end=""
+    if command -v openssl >/dev/null 2>&1; then
+      subj="$(openssl x509 -noout -subject -in "$c" 2>/dev/null | sed 's/^subject= *//')" || subj=""
+      end="$(openssl x509 -noout -enddate -in "$c" 2>/dev/null | sed 's/^notAfter=//')" || end=""
+      fp="$(openssl x509 -noout -fingerprint -sha256 -in "$c" 2>/dev/null | sed 's/^.*=//')" || fp=""
+    else
+      fp=""
+    fi
+    if [ -z "$fp" ]; then
+      fp="$(sed '/-----/d' "$c" | base64 -d 2>/dev/null | sha256sum 2>/dev/null | cut -d' ' -f1 | tr 'a-f' 'A-F' | sed 's/../&:/g; s/:$//')" || fp=""
+    fi
+    echo "  Certificate $n: ${subj:-(name unknown - openssl is missing)}"
+    if [ -n "$end" ]; then
+      echo "    valid until  $end"
+    fi
+    echo "    SHA-256      ${fp:0:47}"
+    if [ "${#fp}" -gt 48 ]; then
+      echo "                 ${fp:48}"
+    fi
+    if command -v openssl >/dev/null 2>&1; then
+      if ! openssl x509 -noout -checkend 0 -in "$c" >/dev/null 2>&1; then
+        warn "This certificate has expired."
+      fi
+      if [[ "$(openssl x509 -noout -text -in "$c" 2>/dev/null)" == *CA:FALSE* ]]; then
+        warn "This is no CA certificate (CA:FALSE) - the root certificate is needed."
+      fi
+    fi
+  done
+  rm -rf -- "$dir"
+  if [ "$n" -eq 0 ]; then
+    err "No certificate found in $1."
+    return 1
+  fi
+}
+
+# net_ask_ca [ISSUER] -> the company's root certificate for a network that inspects HTTPS: the file is asked
+# for, shown with its SHA-256 fingerprint and kept as proxy-ca.pem (INTERNET_PROXY_CA_FILE) after a yes.
+# 1: skipped
+net_ask_ca() {
+  local issuer="${1:-}" f ans pem
+  echo
+  if [ -n "$issuer" ]; then
+    echo "  Your network inspects HTTPS: the certificates come from"
+    echo "  \"$issuer\"."
+  else
+    echo "  A network that inspects HTTPS signs the sites with its own certificate."
+  fi
+  echo "  The server, the engine and the Catalog must trust your company's root"
+  echo "  certificate. Your IT department has it (a PEM or DER file)."
+  while true; do
+    ui_ask f "File of that certificate${INTERNET_PROXY_CA_FILE:+ [$INTERNET_PROXY_CA_FILE]}, or 0 to skip:" || return 1
+    f="${f:-$INTERNET_PROXY_CA_FILE}"
+    if [ -z "$f" ] || [ "$f" = "0" ]; then
+      return 1
+    fi
+    if ! net_ca_show "$f"; then
+      continue
+    fi
+    echo "  Compare the fingerprint with your IT department."
+    ans=0
+    wiz_yes_no "Is this your company's certificate?" n || ans=$?
+    case "$ans" in
+      0) break ;;
+      1) continue ;;
+      *) return 1 ;;
+    esac
+  done
+  pem="$(net_ca_pem "$f")" || return 1
+  if ! printf '%s\n' "$pem" > "$PROXY_CA_COPY.tmp" || ! mv -f -- "$PROXY_CA_COPY.tmp" "$PROXY_CA_COPY"; then
+    rm -f -- "$PROXY_CA_COPY.tmp"
+    err "Cannot write $PROXY_CA_COPY."
+    return 1
+  fi
+  chmod 644 "$PROXY_CA_COPY" 2>/dev/null || true
+  if [ "$INTERNET_PROXY_CA_FILE" != "$PROXY_CA_COPY" ]; then
+    set_setting INTERNET_PROXY_CA_FILE "$PROXY_CA_COPY" || return 1
+    INTERNET_PROXY_CA_FILE="$PROXY_CA_COPY"
+  fi
+  ok "Kept as $PROXY_CA_COPY (INTERNET_PROXY_CA_FILE)."
+  if [ "$OS_KIND" = "Darwin" ]; then
+    echo "  On this Mac, add it to the System keychain yourself (Docker Desktop reads it):"
+    echo "    sudo security add-trusted-cert -d -r trustRoot -k /Library/Keychains/System.keychain $PROXY_CA_COPY"
+  else
+    net_ca_trust ask || true
+  fi
+  if [ -n "$NET_DEFER" ]; then
+    NET_APPLY_PENDING="yes"
+  else
+    net_apply
+  fi
+}
+
+# Removes the proxy (after a yes): the settings, the login; the company certificate only after its own yes
+net_remove() {
+  local ans ca="no" trust="no"
+  ans=0
+  wiz_yes_no "Remove the proxy $INTERNET_PROXY and its login?" n || ans=$?
+  if [ "$ans" -ne 0 ]; then
+    info "Nothing was changed."
+    return 0
+  fi
+  if [ -n "$INTERNET_PROXY_CA_FILE" ]; then
+    ans=0
+    wiz_yes_no "Also forget the company certificate ($INTERNET_PROXY_CA_FILE)?" n || ans=$?
+    if [ "$ans" -eq 0 ]; then
+      ca="yes"
+    fi
+  fi
+  if [ "$ca" = "yes" ] && net_ca_trusted; then
+    ans=0
+    wiz_yes_no "Also take it out of the trust store of this server?" n || ans=$?
+    if [ "$ans" -eq 0 ]; then
+      trust="yes"
+    fi
+  fi
+  net_save "" "" "" "" || return 1
+  ok "The proxy is removed: the installer goes out directly."
+  if [ "$ca" = "yes" ] && set_setting INTERNET_PROXY_CA_FILE ""; then
+    INTERNET_PROXY_CA_FILE=""
+    rm -f -- "$PROXY_CA_COPY" "$PROXY_CA_BUNDLE"
+    ok "The company certificate is forgotten."
+    if [ "$trust" = "yes" ]; then
+      net_ca_trust remove || true
+    fi
+  fi
+  net_apply
+}
+
+# Option 26: the internet settings, the check of every site, then what to change
+net_menu() {
+  local choice u rc
+  echo "${C_BLD}Internet access${C_RST}"
+  u="$(proxy_login_user)"
+  printf '  %-12s %s\n' "Proxy" "${INTERNET_PROXY:-none - directly${NET_SHELL_PROXY:+ (or the proxy of your shell)}}${u:+, login $u (password saved)}"
+  if [ -n "$INTERNET_PROXY_PAC" ]; then
+    printf '  %-12s %s\n' "PAC file" "$INTERNET_PROXY_PAC"
+  fi
+  if [ -n "$INTERNET_NO_PROXY" ]; then
+    printf '  %-12s %s\n' "Internal" "$INTERNET_NO_PROXY"
+  fi
+  if [ -n "$INTERNET_PROXY_CA_FILE" ]; then
+    printf '  %-12s %s\n' "Certificate" "$INTERNET_PROXY_CA_FILE"
+  fi
+  echo
+  net_via_settings
+  rc=0
+  net_check show || rc=$?
+  case "$rc" in
+    0)
+      rm -f -- "$NET_OFFLINE_FILE"
+      net_shell_offer ask || true
+      ;;
+    130) return 0 ;;
+    *)
+      # nothing saved yet: straight to the questions; else the choices below (remove, certificate...)
+      if [ -z "$INTERNET_PROXY$INTERNET_PROXY_CA_FILE" ]; then
+        echo
+        net_ask || true
+        return 0
+      fi
+      ;;
+  esac
+  while true; do
+    echo
+    printf '   %s  %s\n' "${C_BLD}1$C_RST" "Set or change the proxy"
+    if [ -n "$INTERNET_PROXY" ]; then
+      printf '   %s  %s\n' "${C_BLD}2$C_RST" "Remove the proxy"
+    fi
+    printf '   %s  %s\n' "${C_BLD}3$C_RST" "Company certificate (for a network that inspects HTTPS)"
+    printf '   %s  %s\n' "${C_BLD}4$C_RST" "The sites for the network team (firewall)"
+    if [ -n "$INTERNET_PROXY_PAC" ]; then
+      printf '   %s  %s\n' "${C_BLD}5$C_RST" "Read the PAC file again"
+    fi
+    printf '   %s  %s\n' "${C_BLD}6$C_RST" "Apply the settings to the engine and the Catalog again"
+    printf '   %s  %s\n' "${C_BLD}0$C_RST" "${C_DIM}back$C_RST"
+    echo
+    ui_ask choice "Select [0]:" || return 0
+    case "${choice:-0}" in
+      0) return 0 ;;
+      1) echo; net_ask || true; return 0 ;;
+      2) if [ -n "$INTERNET_PROXY" ]; then net_remove; return 0; fi ;;
+      3) net_ask_ca "$(net_tls_issuer)" || true; return 0 ;;
+      4) echo; net_hosts_text; return 0 ;;
+      5) if [ -n "$INTERNET_PROXY_PAC" ]; then echo; net_ask_pac "$INTERNET_PROXY_PAC" || true; return 0; fi ;;
+      6) echo; net_apply; return 0 ;;
+    esac
+    warn "Invalid choice: $choice"
+  done
+}
+
+# The command network-check: the check of every site, no questions; 0 when every required site answers
+net_cli_check() {
+  local rc=0
+  net_via_settings
+  net_check show || rc=$?
+  if [ "$rc" -eq 0 ]; then
+    net_shell_offer note
+  fi
+  return "$rc"
+}
+
+# True when only the shell has a proxy (no INTERNET_PROXY): the installer's own downloads use it, the engine
+# and the containers of the Catalog do not read it
+net_shell_only() {
+  [ -z "$INTERNET_PROXY" ] && [ -n "$NET_SHELL_PROXY" ]
+}
+
+# net_shell_offer ask|note -> after a check through the shell's proxy: the engine and the Catalog do not read
+# it; ask: saving it is offered (Enter: yes). 2: 0 at the question
+net_shell_offer() {
+  local ans=0
+  if ! net_shell_only; then
+    return 0
+  fi
+  echo
+  warn "Only your shell has this proxy ($NET_SHELL_NAME): Docker, Podman and the"
+  echo "  containers of the Catalog do not read it - their pulls and downloads would"
+  echo "  go out directly. Saved in the settings (option 26), they get it too."
+  if [ "$1" != "ask" ]; then
+    return 0
+  fi
+  wiz_yes_no "Save the proxy of your shell for them?" y || ans=$?
+  case "$ans" in
+    0) echo; net_ask_proxy "$NET_SHELL_PROXY" || true ;;
+    1) ;;
+    *) return 2 ;;
+  esac
+}
+
+# The Internet step of the new installation: the check of the sites; when required ones cannot be reached,
+# the questions (net_ask). 0: on to the engine; 1: stopped; 2: stopped at its first question
+wiz_internet() {
+  local rc=0 ans
+  if ! net_enabled; then
+    echo "  ${C_DIM}The internet check is off (RN1_NET_CHECK=off).$C_RST"
+    return 0
+  fi
+  echo "  The installation downloads the container images, Docker Compose and the"
+  echo "  packages of the engine. First the sites it needs:"
+  echo
+  net_via_settings
+  net_check show || rc=$?
+  # Ctrl+C: stopped, no questions on a half-finished table
+  if [ "$rc" -eq 130 ]; then
+    return 2
+  fi
+  if [ "$rc" -eq 0 ]; then
+    # only optional sites fail: the company certificate when HTTPS is inspected, else a proxy after a yes;
+    # a proxy only the shell has is saved for the engine and the Catalog after a yes
+    if [ -n "$(net_tls_issuer)" ]; then
+      net_ask_ca "$(net_tls_issuer)" || true
+    elif net_shell_only; then
+      net_shell_offer ask || return 2
+    elif [ "$NET_OPT_BAD" -gt 0 ]; then
+      echo
+      ans=0
+      wiz_yes_no "Set an internet proxy now?" n || ans=$?
+      case "$ans" in
+        0) net_ask wizard || true ;;
+        1) ;;
+        *) return 2 ;;
+      esac
+    fi
+    ui_pause_tty
+    return 0
+  fi
+  echo
+  rc=0
+  net_ask wizard || rc=$?
+  case "$rc" in
+    0|4) ui_pause_tty; return 0 ;;
+    2) return 2 ;;
+    *) return 1 ;;
+  esac
+}
+
+# Hooks for the tests: __net encode|decode|parse|rows|found|env|run-plan|sudo|pac|pacask|wpad|header|ask|ca|engine|
+# engine-write|apply|agent|colima|cleanup|stale|offer|adopt
+net_test_hook() {
+  local cmd="${1:-}" p
+  shift || true
+  case "$cmd" in
+    encode) net_encode "$1"; echo ;;
+    decode) net_decode "$1"; echo ;;
+    parse) if net_parse "$1"; then echo "$NP_SCHEME|$NP_HOST|$NP_PORT|$NP_LOGIN"; else echo "invalid"; return 1; fi ;;
+    rows) net_rows ;;
+    found) net_found ;;
+    env)
+      # the proxy of this run without the password, and whether its login is the saved one
+      p="${https_proxy:-}"
+      printf '%s|%s|%s|%s|login=%s\n' "$(net_mask "$p")" "$(net_mask "${HTTP_PROXY:-}")" "${no_proxy:-}" "${RN1_PROXY_SET:-}" \
+        "$(if [ -n "$(proxy_login)" ] && [[ "$p" == *"://$(proxy_login)@"* ]]; then echo saved; else echo none; fi)"
+      ;;
+    run-plan) use_sudo || return 1; run_plan "$@" || return $? ;;
+    sudo) use_sudo || return 1; proxy_sudo "$@" || return $? ;;
+    pac) net_pac_candidates "$(cat -- "$1")" ;;
+    pacask) net_ask_pac "$1" || return $? ;;
+    wpad) net_wpad_urls ;;
+    header) net_header; echo ;;
+    ask)
+      net_via_settings
+      if net_check show; then
+        return 0
+      fi
+      echo
+      net_ask || return $?
+      ;;
+    ca) net_ask_ca "${1:-}" || return $? ;;
+    engine) engine_use "${1:-podman}"; net_engine_check || return $? ;;
+    engine-write) use_sudo || return 1; net_engine_write "$1" "$2" || return $?; net_engine_restart "$1" "$2" || return $? ;;
+    apply) net_apply ;;
+    agent) mac_agent "$1" ;;
+    colima) p=0; net_colima_env "$1" || p=$?; echo "rc=$p" ;;
+    cleanup) net_proxy_cleanup || return $? ;;
+    stale) net_engine_stale ;;
+    offer) net_offer_check "$1" ;;
+    adopt) net_adopt "$1" "$2" ;;
+    *) err "Unknown: __net $cmd"; return 2 ;;
+  esac
+}
+
+###############################################################################
+# Internet access (option 26): the proxy applied - the engine, the company certificate, the Catalog
+###############################################################################
+
+# The first line of every file the installer writes for the proxy outside its folder: only files that
+# start with it are changed or removed
+NET_MARK="# Written by the Raynet One Technology Catalog installer (option 26 changes or removes it)"
+# The proxy of the engine with its login, readable only by root. Host-wide (one engine serves every
+# installation folder), so it names the folder it came from.
+NET_ENGINE_ENV="$NET_ETC/rn1-technology-catalog/engine-proxy.env"
+NET_UNITS="$NET_ETC/systemd/system"
+# Podman hands its own proxy to every container it creates unless told not to: only catalog-web and Nginx
+# Proxy Manager get one, from the compose file
+NET_PODMAN_CONF="$NET_ETC/containers/containers.conf.d/50-rn1-proxy.conf"
+# The certificates of the containers while INTERNET_PROXY_CA_FILE is set: those of this system and the
+# company's, mounted read-only into catalog-web and Nginx Proxy Manager
+PROXY_CA_BUNDLE="$WORK_DIR/proxy-ca-bundle.pem"
+NET_CA_MOUNT="/etc/rn1/ca-bundle.pem"
+# The engines whose proxy files changed (" docker podman"): they read them at their next start
+NET_ENGINE_CHANGED=""
+# Set while the questions for a proxy run: a company certificate given on the way is applied with the proxy
+NET_DEFER=""
+NET_APPLY_PENDING=""
+# Set while R removes the installer's proxy files (all of them)
+NET_CLEANUP=""
+
+# net_dropin KIND -> the installer's drop-in for the systemd unit of KIND (docker, podman)
+net_dropin() {
+  printf '%s/%s.service.d/50-rn1-proxy.conf' "$NET_UNITS" "$1"
+}
+
+# net_ours FILE -> true when the installer wrote FILE (its first line is NET_MARK)
+net_ours() {
+  [ -f "$1" ] && [ -r "$1" ] && [ "$(head -n 1 -- "$1" 2>/dev/null)" = "$NET_MARK" ]
+}
+
+# net_root_read FILE -> FILE, which only root may read (sudo when needed); nothing when it is missing
+net_root_read() {
+  if [ -e "$1" ]; then
+    ${SUDO[@]+"${SUDO[@]}"} cat -- "$1" 2>/dev/null || true
+  fi
+}
+
+# net_root_file FILE [MODE TEXT] -> FILE with TEXT and MODE, as root (sudo when needed): the text goes
+# through stdin, so it shows in no process list; a new folder gets 755. Without MODE and TEXT: removed.
+net_root_file() {
+  if [ "$#" -lt 3 ]; then
+    ${SUDO[@]+"${SUDO[@]}"} rm -f -- "$1"
+    return
+  fi
+  ${SUDO[@]+"${SUDO[@]}"} sh -c 'umask 022 && mkdir -p "${1%/*}" && umask 077 && cat > "$1.rn1-new" && chmod "$2" "$1.rn1-new" && mv -f "$1.rn1-new" "$1"' sh "$1" "$2" <<< "$3"
+}
+
+# The address of this server for NO_PROXY (empty when it is not known)
+net_host_addr() {
+  local a
+  a="$(host_ip)"
+  case "$a" in
+    ""|"<server-ip>"|localhost) ;;
+    *) printf '%s' "$a" ;;
+  esac
+}
+
+# net_no_join LIST NAME... -> LIST (comma-separated) with each NAME that is not in it yet
+net_no_join() {
+  local out="$1" n
+  shift
+  for n in "$@"; do
+    if [ -n "$n" ] && [[ ",$out," != *",$n,"* ]]; then
+      out="${out:+$out,}$n"
+    fi
+  done
+  printf '%s' "$out"
+}
+
+# The NO_PROXY of the engine: localhost, this server, the domain of the Catalog, the internal names (as
+# name and .name) and the private address ranges (Go reads ranges)
+net_no_proxy_engine() {
+  local -a more=()
+  IFS=',' read -r -a more <<< "$(net_no_list)"
+  # shellcheck disable=SC2046
+  net_no_join "localhost,127.0.0.1,::1" $(net_server_names) "$(net_host_addr)" "$CATALOG_DOMAIN" \
+    ${more[@]+"${more[@]}"} 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16
+}
+
+# The host of the online catalog (CATALOG_CLOUD_URL, the parent of the synchronization) when it is internal:
+# an address, a name without a dot or with a local ending, or one in the domains of this server (.NET reads
+# no address ranges in NO_PROXY, so an internal parent must be named); empty for an internet one
+net_cloud_internal() {
+  local h d
+  h="${CATALOG_CLOUD_URL#*://}"
+  h="${h%%/*}"
+  h="${h##*@}"
+  if [[ "$h" == \[* ]]; then
+    h="${h%%]*}]"
+  else
+    h="${h%%:*}"
+  fi
+  h="${h,,}"
+  case "$h" in
+    "") return 0 ;;
+    \[*|*[!0-9.]*) ;;
+    *) printf '%s' "$h"; return 0 ;;
+  esac
+  if [[ "$h" == \[* ]] || [[ "$h" != *.* ]] || domain_private "$h"; then
+    printf '%s' "$h"
+    return 0
+  fi
+  for d in ${INTERNET_NO_PROXY//,/ } $(net_local_domains | tr ',' ' '); do
+    d="${d#.}"
+    if [ -n "$d" ] && { [ "$h" = "$d" ] || [[ "$h" == *".$d" ]]; }; then
+      printf '%s' "$h"
+      return 0
+    fi
+  done
+}
+
+# The NO_PROXY of catalog-web and Nginx Proxy Manager: localhost, the services of the stack, this server as
+# the engines name it inside the containers, its names and address, the host name of catalog-web, the
+# domain of the Catalog, an internal online catalog, the internal names (as name and .name) and the private
+# address ranges
+net_no_proxy_containers() {
+  local -a more=()
+  IFS=',' read -r -a more <<< "$(net_no_list)"
+  # shellcheck disable=SC2046
+  net_no_join "localhost,127.0.0.1,::1" mongo minio rabbitmq opensearch opensearch-dashboards catalog-web \
+    nginx-proxy-manager worker-recognition-1 worker-recognition-2 worker-other worker-search \
+    host.docker.internal host.containers.internal $(net_server_names) "$CATALOG_HOSTNAME" "$CATALOG_DOMAIN" \
+    "$(net_host_addr)" "$(net_cloud_internal)" ${more[@]+"${more[@]}"} 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16
+}
+
+# True when INTERNET_PROXY is a relay on this server (127.0.0.1, localhost, [::1]); NP_* of it
+net_proxy_local() {
+  net_parse "$INTERNET_PROXY" || return 1
+  case "$NP_HOST" in
+    127.*|localhost|"[::1]") return 0 ;;
+  esac
+  return 1
+}
+
+# INTERNET_PROXY as the containers reach it: a relay on this server by the name the engine gives this server
+# inside them (Podman: host.containers.internal, Docker: host.docker.internal)
+net_container_proxy() {
+  if ! net_proxy_local; then
+    printf '%s' "$INTERNET_PROXY"
+  elif [ "$ENGINE" = "podman" ]; then
+    printf '%s://host.containers.internal:%s' "$NP_SCHEME" "$NP_PORT"
+  else
+    printf '%s://host.docker.internal:%s' "$NP_SCHEME" "$NP_PORT"
+  fi
+}
+
+# The proxy part of .env (nothing without INTERNET_PROXY): the proxy of catalog-web and Nginx Proxy Manager
+# with its login, for HTTPS only - their internal calls are plain http:// or no HTTP at all, so none of them
+# can go to the proxy; for HTTP only when the online catalog is an http:// address
+net_env_block() {
+  local p http=""
+  if [ -z "$INTERNET_PROXY" ]; then
+    return 0
+  fi
+  p="$(net_with_login "$(net_container_proxy)")"
+  case "$CATALOG_CLOUD_URL" in
+    http://*) http="$p" ;;
+  esac
+  printf '\n# Internet proxy (option 26): only catalog-web and Nginx Proxy Manager go out through it\n'
+  printf "RN1_HTTPS_PROXY='%s'\nRN1_HTTP_PROXY='%s'\nRN1_NO_PROXY='%s'\n" "$p" "$http" "$(net_no_proxy_containers)"
+}
+
+# net_compose_edit FILE -> catalog-web and Nginx Proxy Manager of the compose FILE with the proxy of .env
+# (every name in both cases: .NET reads the lower-case one first, and an empty HTTP_PROXY and ALL_PROXY
+# also beat a proxy of ~/.docker/config.json) and the company certificate read-only; Nginx Proxy Manager
+# fetches no address ranges of CDNs at its start (not needed here, and it would wait for them); a relay on
+# this server is host.docker.internal for Docker. Every other service gets the same names empty: an engine
+# that hands its own proxy to each container (the Podman machine of a Mac, ~/.docker/config.json) would
+# send their calls to each other to the proxy. Without INTERNET_PROXY and INTERNET_PROXY_CA_FILE the file
+# stays as it is.
+net_compose_edit() {
+  local f="$1" env="" vol="" hosts="" npm="" none=""
+  if [ -z "$INTERNET_PROXY$INTERNET_PROXY_CA_FILE" ] || [ ! -f "$f" ]; then
+    return 0
+  fi
+  if [ -n "$INTERNET_PROXY" ]; then
+    # shellcheck disable=SC2016
+    env='      HTTPS_PROXY: "${RN1_HTTPS_PROXY}"
+      https_proxy: "${RN1_HTTPS_PROXY}"
+      HTTP_PROXY: "${RN1_HTTP_PROXY:-}"
+      http_proxy: "${RN1_HTTP_PROXY:-}"
+      ALL_PROXY: ""
+      all_proxy: ""
+      NO_PROXY: "${RN1_NO_PROXY}"
+      no_proxy: "${RN1_NO_PROXY}"'
+    npm='      IP_RANGES_FETCH_ENABLED: "false"'
+    none='      HTTPS_PROXY: ""
+      https_proxy: ""
+      HTTP_PROXY: ""
+      http_proxy: ""
+      ALL_PROXY: ""
+      all_proxy: ""
+      NO_PROXY: ""
+      no_proxy: ""'
+    if net_proxy_local && [ "$ENGINE" != "podman" ]; then
+      hosts='    extra_hosts:
+      - "host.docker.internal:host-gateway"'
+    fi
+  fi
+  if [ -n "$INTERNET_PROXY_CA_FILE" ]; then
+    env="$env${env:+$'\n'}      SSL_CERT_FILE: \"$NET_CA_MOUNT\"
+      REQUESTS_CA_BUNDLE: \"$NET_CA_MOUNT\"
+      NODE_EXTRA_CA_CERTS: \"$NET_CA_MOUNT\""
+    vol="      - ./$(basename -- "$PROXY_CA_BUNDLE"):$NET_CA_MOUNT:ro,z"
+  fi
+  NET_E="$env" NET_N="$npm" NET_V="$vol" NET_H="$hosts" NET_0="$none" awk '
+    /^[^ #]/ { top = $1; svc = "" }
+    top == "services:" && /^  [A-Za-z0-9_.-]+:[ \t]*$/ { svc = $1; sub(/:$/, "", svc) }
+    svc != "" && svc != "catalog-web" && svc != "nginx-proxy-manager" && $0 == "    environment:" && ENVIRON["NET_0"] != "" {
+      print
+      print ENVIRON["NET_0"]
+      next
+    }
+    svc != "catalog-web" && svc != "nginx-proxy-manager" { print; next }
+    $0 == "    environment:" {
+      if (ENVIRON["NET_H"] != "") print ENVIRON["NET_H"]
+      print
+      print ENVIRON["NET_E"]
+      if (svc == "nginx-proxy-manager" && ENVIRON["NET_N"] != "") print ENVIRON["NET_N"]
+      next
+    }
+    $0 == "    volumes:" && ENVIRON["NET_V"] != "" { print; print ENVIRON["NET_V"]; next }
+    { print }' "$f" > "$f.rn1-tmp" && cat -- "$f.rn1-tmp" > "$f"
+  rm -f -- "$f.rn1-tmp"
+}
+
+# The certificates of this system, as OpenSSL reads them (empty when none is found)
+net_sys_bundle() {
+  local f
+  for f in /etc/pki/tls/certs/ca-bundle.crt /etc/ssl/certs/ca-certificates.crt /etc/ssl/ca-bundle.pem /etc/ssl/cert.pem; do
+    if [ -r "$f" ] && [ -s "$f" ]; then
+      printf '%s' "$f"
+      return 0
+    fi
+  done
+}
+
+# proxy-ca-bundle.pem for the containers while INTERNET_PROXY_CA_FILE is set: the certificates of this
+# system and the company's (written in place: a container sees the new one after its restart). 0: changed
+net_ca_bundle_write() {
+  local sys new
+  if [ -z "$INTERNET_PROXY_CA_FILE" ]; then
+    return 1
+  fi
+  sys="$(net_sys_bundle)"
+  if ! new="$(net_ca_pem "$INTERNET_PROXY_CA_FILE")"; then
+    warn "The certificates for the containers were not written:"
+    echo "  $PROXY_CA_BUNDLE"
+    return 1
+  fi
+  if [ -n "$sys" ]; then
+    new="$(cat -- "$sys")"$'\n'"$new"
+  fi
+  if [ -f "$PROXY_CA_BUNDLE" ] && [ "$(cat -- "$PROXY_CA_BUNDLE")" = "$new" ]; then
+    return 1
+  fi
+  if ! printf '%s\n' "$new" > "$PROXY_CA_BUNDLE"; then
+    warn "Cannot write $PROXY_CA_BUNDLE."
+    return 1
+  fi
+  chmod 644 "$PROXY_CA_BUNDLE" 2>/dev/null || true
+}
+
+# The certificates for the containers before a start, when they are missing (the engine would create a
+# folder in their place)
+net_ca_bundle_ensure() {
+  if [ -n "$INTERNET_PROXY_CA_FILE" ] && [ ! -f "$PROXY_CA_BUNDLE" ]; then
+    net_ca_bundle_write || true
+  fi
+}
+
+# True when catalog-web or Nginx Proxy Manager of this folder runs
+net_stack_running() {
+  local s
+  if ! engine_cli || ! detect_compose >/dev/null 2>&1; then
+    return 1
+  fi
+  s="$(compose ps --services --filter status=running 2>/dev/null)" || return 1
+  grep -qx -e catalog-web -e nginx-proxy-manager <<< "$s"
+}
+
+# net_catalog_apply -> catalog-web and Nginx Proxy Manager with the internet settings: .env and the compose
+# file generated again when they differ from the settings (passwords and host name kept, as option 2 does),
+# the certificates for the containers; created again after a yes when the stack runs
+net_catalog_apply() {
+  local files="no" ca="no" var
+  local -a svc=(catalog-web)
+  if [ ! -f "$ENV_FILE" ] || [ ! -f "$COMPOSE_FILE" ]; then
+    return 0
+  fi
+  if net_ca_bundle_write; then
+    ca="yes"
+  fi
+  if settings_stale; then
+    # other settings not applied yet (versions, ports...) are no part of this: option 2 and the upgrade
+    # apply them, with their backup and checks
+    if ! net_only_net_stale; then
+      warn "Other settings differ from $ENV_FILE and $COMPOSE_FILE as well: they"
+      echo "  are applied together - option 2 (or U for a new version) writes the files,"
+      echo "  option 6 starts the Catalog with them."
+      return 0
+    fi
+    backup_file "$ENV_FILE"
+    backup_file "$COMPOSE_FILE"
+    if ! (
+      for var in MONGO_INITDB_ROOT_PASSWORD MINIO_ROOT_PASSWORD RABBITMQ_DEFAULT_PASS NPM_ADMIN_PASSWORD; do
+        printf -v "$var" '%s' "$(env_value "$var")"
+      done
+      CATALOG_HOSTNAME="$(catalog_hostname "$ENV_FILE")"
+      # the cache of MongoDB of .env (or, without one, for the memory of the engine, as option 2 writes it)
+      MONGO_WT_CACHE_GB="$(mongo_cache_written)"
+      if [ -z "$MONGO_WT_CACHE_GB" ]; then
+        MONGO_WT_CACHE_GB="$(mongo_cache_gb)"
+      fi
+      write_env_file
+      write_compose_file
+    ); then
+      err "$ENV_FILE and $COMPOSE_FILE could not be written - option 2 writes them."
+      return 1
+    fi
+    chmod 600 "$ENV_FILE"
+    files="yes"
+    ok "$ENV_FILE and $COMPOSE_FILE written again from the settings, passwords kept."
+  fi
+  if [ "$files$ca" = "nono" ]; then
+    return 0
+  fi
+  if ! net_stack_running; then
+    info "catalog-web and Nginx Proxy Manager use them from their next start"
+    echo "  (option 6)."
+    return 0
+  fi
+  if [ "$INSTALL_NGINX_PROXY_MANAGER" = "true" ]; then
+    svc+=(nginx-proxy-manager)
+  fi
+  if [ "$files" = "yes" ]; then
+    info "The containers whose proxy settings changed must be created again (about"
+    echo "  a minute without the web interface; the data stays)."
+  else
+    info "${svc[*]} must be created again to use them (about a minute"
+    echo "  without the web interface; the data stays)."
+  fi
+  if ! confirm "Do it now?" y; then
+    info "They use them from their next start (option 6)."
+    return 0
+  fi
+  if [ "$files" = "yes" ]; then
+    # only the proxy part differs (net_only_net_stale): compose creates again what changed, nothing else
+    compose up -d
+  else
+    compose up -d --no-deps --force-recreate "${svc[@]}"
+  fi
+}
+
+# net_strip FILE -> .env or the compose file without what the internet settings add (net_env_block,
+# net_compose_edit) and without empty lines
+net_strip() {
+  awk '
+    /^RN1_(HTTPS|HTTP|NO)_PROXY=/ || /^# Internet proxy \(option 26\)/ { next }
+    /^      (HTTPS_PROXY|https_proxy|HTTP_PROXY|http_proxy|ALL_PROXY|all_proxy|NO_PROXY|no_proxy|IP_RANGES_FETCH_ENABLED|SSL_CERT_FILE|REQUESTS_CA_BUNDLE|NODE_EXTRA_CA_CERTS): / { next }
+    /^      - \.\/proxy-ca-bundle\.pem:/ { next }
+    /^    extra_hosts:$/ { held = 1; next }
+    held && $0 == "      - \"host.docker.internal:host-gateway\"" { held = 0; next }
+    held { print "    extra_hosts:"; held = 0 }
+    /^[ \t]*$/ { next }
+    { print }' "$1" 2>/dev/null
+}
+
+# net_cache_line_match FILE -> FILE (written from the settings) without the cache of MongoDB when .env has
+# none yet: a start writes it (mongo_cache_refresh), as settings_stale counts it
+net_cache_line_match() {
+  if ! grep -q '^MONGO_WT_CACHE_GB=' "$ENV_FILE"; then
+    sed -i '/^MONGO_WT_CACHE_GB=/d' "$1"
+  fi
+}
+
+# True when .env and the compose file differ from the settings only in what the internet settings add
+net_only_net_stale() {
+  local tmp_env tmp_compose rc=1
+  tmp_env="$(mktemp)" || return 1
+  tmp_compose="$(mktemp)" || { rm -f -- "$tmp_env"; return 1; }
+  if (
+    for var in MONGO_INITDB_ROOT_PASSWORD MINIO_ROOT_PASSWORD RABBITMQ_DEFAULT_PASS NPM_ADMIN_PASSWORD; do
+      printf -v "$var" '%s' "$(env_value "$var")"
+    done
+    CATALOG_HOSTNAME="$(catalog_hostname "$ENV_FILE")"
+    MONGO_WT_CACHE_GB="$(mongo_cache_written)"
+    ENV_FILE="$tmp_env"
+    COMPOSE_FILE="$tmp_compose"
+    write_env_file
+    write_compose_file
+  ) >/dev/null 2>&1 && net_cache_line_match "$tmp_env" && [ "$(net_strip "$tmp_env")" = "$(net_strip "$ENV_FILE")" ] \
+    && [ "$(net_strip "$tmp_compose")" = "$(net_strip "$COMPOSE_FILE")" ]; then
+    rc=0
+  fi
+  rm -f -- "$tmp_env" "$tmp_compose"
+  return "$rc"
+}
+
+# net_engine_env_text [FOLDER...] -> the env file of the engine for INTERNET_PROXY (empty without it): the
+# proxy with its login and NO_PROXY in both cases, single-quoted (the login is percent-encoded), and the
+# folders whose installations use it (this one, then FOLDER...: one line each)
+net_engine_env_text() {
+  local p no f folders=""
+  if [ -z "$INTERNET_PROXY" ]; then
+    return 0
+  fi
+  p="$(net_with_login "$INTERNET_PROXY")"
+  no="$(net_no_proxy_engine)"
+  for f in "$WORK_DIR" "$@"; do
+    folders="$folders# Folder: $f"$'\n'
+  done
+  printf "%s\n%sHTTP_PROXY='%s'\nHTTPS_PROXY='%s'\nNO_PROXY='%s'\nhttp_proxy='%s'\nhttps_proxy='%s'\nno_proxy='%s'" \
+    "$NET_MARK" "$folders" "$p" "$p" "$no" "$p" "$p" "$no"
+}
+
+# net_env_folder TEXT -> the first folder an env file of the engine names (the one that wrote it)
+net_env_folder() {
+  local l
+  while IFS= read -r l; do
+    case "$l" in
+      "# Folder: "*)
+        printf '%s' "${l#\# Folder: }"
+        return 0
+        ;;
+    esac
+  done <<< "$1"
+}
+
+# net_env_users TEXT -> the other folders an env file of the engine names whose installer still has a proxy
+# set (one per line): the engine's proxy files stay while one of them uses them
+net_env_users() {
+  local l f
+  while IFS= read -r l; do
+    case "$l" in
+      "# Folder: "*)
+        f="${l#\# Folder: }"
+        if [ "$f" != "$WORK_DIR" ] && [ -d "$f" ] && grep -qs '^INTERNET_PROXY="[^"]' "$f"/*.sh; then
+          printf '%s\n' "$f"
+        fi
+        ;;
+    esac
+  done <<< "$1"
+}
+
+# net_env_body TEXT -> an env file of the engine without the line of its folder: what the engine reads
+net_env_body() {
+  local l
+  while IFS= read -r l; do
+    case "$l" in
+      "# Folder: "*) ;;
+      *) printf '%s\n' "$l" ;;
+    esac
+  done <<< "$1"
+}
+
+# net_env_proxy TEXT -> the proxy an env file of the engine holds, without its password
+net_env_proxy() {
+  local l
+  while IFS= read -r l; do
+    case "$l" in
+      HTTPS_PROXY=*)
+        l="${l#HTTPS_PROXY=}"
+        l="${l#\'}"
+        net_mask "${l%\'}"
+        return 0
+        ;;
+    esac
+  done <<< "$1"
+}
+
+# The drop-in of an engine's unit: the values stay in the env file (Environment= lines can be read by
+# every user); "-": the engine starts without the file too
+net_dropin_text() {
+  printf '%s\n[Service]\nEnvironmentFile=-%s' "$NET_MARK" "$NET_ENGINE_ENV"
+}
+
+net_podman_conf_text() {
+  printf '%s\n# Podman would hand its own proxy to every container it creates: only catalog-web and Nginx\n# Proxy Manager get one, from the compose file\n[containers]\nhttp_proxy = false' "$NET_MARK"
+}
+
+# net_engine_foreign KIND -> WHERE|PROXY when KIND has a proxy the installer did not set: Docker's
+# daemon.json (it wins over every other setting) or a drop-in of the unit of KIND
+net_engine_foreign() {
+  local f v
+  f="$NET_ETC/docker/daemon.json"
+  if [ "$1" = "docker" ] && [ -r "$f" ]; then
+    v="$(grep -o '"https\{0,1\}-proxy" *: *"[^"]*"' "$f")" || v=""
+    v="${v%%$'\n'*}"
+    if [ -n "$v" ]; then
+      v="${v%\"}"
+      printf 'docker/daemon.json|%s' "${v##*\"}"
+      return 0
+    fi
+  fi
+  for f in "$NET_UNITS/$1.service.d"/*.conf; do
+    if [ -r "$f" ] && ! net_ours "$f"; then
+      v="$(sed -n 's/^[^#]*[Hh][Tt][Tt][Pp][Ss]\{0,1\}_[Pp][Rr][Oo][Xx][Yy]=\([^" ]*\).*/\1/p' "$f")" || v=""
+      v="${v%%$'\n'*}"
+      if [ -n "$v" ]; then
+        printf '%s|%s' "${f#"$NET_ETC"/}" "$v"
+        return 0
+      fi
+    fi
+  done
+}
+
+# net_engine_write ask|yes KIND -> the proxy of INTERNET_PROXY for the engine KIND (Docker or Podman on a
+# Linux with systemd): its env file (mode 600, root) and the drop-in of its unit that points to it - for
+# Podman also no proxy handed on to the containers. Without INTERNET_PROXY the installer's files go (not
+# while the installer of another folder still uses them). A proxy in daemon.json is left alone (it wins
+# anyway); one of another drop-in or of another folder is replaced only after a yes. KIND joins
+# NET_ENGINE_CHANGED when something changed.
+net_engine_write() {
+  local mode="$1" kind="$2" name drop want have other foreign users f
+  local -a keep=()
+  case "$kind" in
+    docker) name="Docker" ;;
+    podman) name="Podman" ;;
+    *) return 0 ;;
+  esac
+  if [ "$OS_KIND" = "Darwin" ] || [ ! -d "${RN1_SYSTEMD_DIR:-/run/systemd/system}" ] || { [ "$kind" = "docker" ] && docker_is_snap; }; then
+    return 0
+  fi
+  drop="$(net_dropin "$kind")"
+  want="$(net_engine_env_text)"
+  if [ -z "$want" ]; then
+    # Podman with a proxy of its own (another drop-in) still hands none to the containers (not for R)
+    if [ "$kind" = "podman" ] && [ -z "$NET_CLEANUP" ] && ! net_ours "$drop" && [ -n "$(net_engine_foreign podman)" ]; then
+      return 0
+    fi
+    if ! net_ours "$drop" && ! { [ "$kind" = "podman" ] && net_ours "$NET_PODMAN_CONF"; }; then
+      return 0
+    fi
+    have="$(net_root_read "$NET_ENGINE_ENV")"
+    users="$(net_env_users "$have")"
+    if [ -n "$users" ]; then
+      info "$name keeps the proxy the installer in ${users%%$'\n'*} gave it."
+      # this folder no longer counts among its users
+      if net_env_folders_has "$have" "$WORK_DIR"; then
+        net_root_file "$NET_ENGINE_ENV" 600 "$(printf '%s\n' "$have" | awk -v me="# Folder: $WORK_DIR" '$0 != me')" || true
+      fi
+      return 0
+    fi
+    if ! net_root_file "$drop" || { [ "$kind" = "podman" ] && net_ours "$NET_PODMAN_CONF" && ! net_root_file "$NET_PODMAN_CONF"; }; then
+      err "Cannot remove the proxy of $name ($drop)."
+      return 1
+    fi
+    if [[ "$have" == "$NET_MARK"* ]] && ! net_ours "$(net_dropin docker)" && ! net_ours "$(net_dropin podman)"; then
+      net_root_file "$NET_ENGINE_ENV" || true
+    fi
+    NET_ENGINE_CHANGED="$NET_ENGINE_CHANGED $kind"
+    ok "$name has no proxy of the installer any more; removed:"
+    echo "  $drop"
+    return 0
+  fi
+  foreign="$(net_engine_foreign "$kind")"
+  if [[ "$foreign" == "docker/daemon.json|"* ]]; then
+    warn "Docker's proxy is set in $NET_ETC/docker/daemon.json, which wins over"
+    echo "  every other setting: the installer leaves it as it is."
+    echo "    $(net_mask "${foreign#*|}")"
+    return 0
+  fi
+  have="$(net_root_read "$NET_ENGINE_ENV")"
+  users="$(net_env_users "$have")"
+  # the same proxy as the installer of another folder: both are recorded (the files stay while one uses them)
+  if [ -n "$users" ] && [ "$(net_env_proxy "$have")" = "$(net_env_proxy "$want")" ]; then
+    while IFS= read -r f; do
+      keep+=("$f")
+    done <<< "$users"
+    want="$(net_engine_env_text "${keep[@]}")"
+  fi
+  if [ "$(net_env_body "$have")" = "$(net_env_body "$want")" ] && net_ours "$drop" && { [ "$kind" = "docker" ] || net_ours "$NET_PODMAN_CONF"; }; then
+    if ! net_env_folders_has "$have" "$WORK_DIR"; then
+      net_root_file "$NET_ENGINE_ENV" 600 "$want" || true
+    fi
+    return 0
+  fi
+  if [ -n "$foreign" ] && ! net_ours "$drop"; then
+    warn "$name has a proxy of its own: $(net_mask "${foreign#*|}")"
+    echo "  ($NET_ETC/${foreign%%|*})."
+    echo "  The installer's drop-in would win over it; that file stays as it is."
+    if [ "$mode" != "ask" ] || ! confirm "Give $name the proxy $INTERNET_PROXY instead?" n; then
+      info "$name keeps its own proxy."
+      net_podman_conf_keep "$kind"
+      return 0
+    fi
+  fi
+  other="$(net_env_folder "$have")"
+  if [ -n "$users" ] && [ "$(net_env_proxy "$have")" != "$(net_env_proxy "$want")" ]; then
+    other="${users%%$'\n'*}"
+    warn "The installer in $other gave the engine another proxy:"
+    echo "  $(net_env_proxy "$have") - one engine serves both folders."
+    if [ "$mode" != "ask" ] || ! confirm "Replace it with $INTERNET_PROXY?" n; then
+      info "$name keeps that proxy."
+      net_podman_conf_keep "$kind"
+      return 0
+    fi
+  fi
+  if ! net_root_file "$NET_ENGINE_ENV" 600 "$want" || ! net_root_file "$drop" 644 "$(net_dropin_text)" \
+    || { [ "$kind" = "podman" ] && ! net_root_file "$NET_PODMAN_CONF" 644 "$(net_podman_conf_text)"; }; then
+    err "Cannot write the proxy of $name ($drop, $NET_ENGINE_ENV)."
+    return 1
+  fi
+  NET_ENGINE_CHANGED="$NET_ENGINE_CHANGED $kind"
+  ok "$name gets the proxy: $drop"
+  echo "  It reads $NET_ENGINE_ENV (mode 600)."
+}
+
+# net_env_folders_has TEXT FOLDER -> true when an env file of the engine names FOLDER
+net_env_folders_has() {
+  [[ $'\n'"$1"$'\n' == *$'\n'"# Folder: $2"$'\n'* ]]
+}
+
+# net_podman_conf_keep KIND -> Podman keeps a proxy that is not the installer's: it still hands it to no
+# container (containers.conf.d), so the services of the Catalog call each other directly
+net_podman_conf_keep() {
+  if [ "$1" != "podman" ] || net_ours "$NET_PODMAN_CONF"; then
+    return 0
+  fi
+  if net_root_file "$NET_PODMAN_CONF" 644 "$(net_podman_conf_text)"; then
+    NET_ENGINE_CHANGED="$NET_ENGINE_CHANGED podman"
+    ok "Podman hands its proxy to no container: $NET_PODMAN_CONF"
+  fi
+}
+
+# net_engine_restart ask|yes KIND -> KIND reads its changed proxy files: systemd reloads its units; a running
+# Docker restarts after a yes (the Catalog is unreachable for about a minute; without the question it is
+# only said); a running Podman service stops (its socket starts it again; the containers keep running)
+net_engine_restart() {
+  local mode="$1" kind="$2"
+  local -a steps=("systemctl daemon-reload")
+  if [[ " $NET_ENGINE_CHANGED " != *" $kind "* ]]; then
+    return 0
+  fi
+  NET_ENGINE_CHANGED="${NET_ENGINE_CHANGED// $kind/}"
+  case "$kind" in
+    docker)
+      if systemctl is-active --quiet docker 2>/dev/null; then
+        info "Docker reads the change when it restarts: the Catalog is unreachable for"
+        echo "  about a minute, then its containers come back by themselves."
+        if [ "$mode" = "ask" ] && confirm "Restart Docker now?" n; then
+          steps+=("systemctl restart docker")
+        else
+          info "Docker reads the change at its next restart (systemctl restart docker)."
+        fi
+      fi
+      ;;
+    podman)
+      if systemctl is-active --quiet podman.service 2>/dev/null; then
+        steps+=("systemctl stop podman.service")
+      fi
+      ;;
+  esac
+  run_plan "${steps[@]}"
+}
+
+# net_engine_plan KIND -> before KIND is set up: true when it gets the installer's proxy files (or loses
+# them), with a note for the list of the steps
+net_engine_plan() {
+  if [ "$OS_KIND" = "Darwin" ]; then
+    return 1
+  fi
+  if [ -n "$INTERNET_PROXY" ]; then
+    echo "  $(kind_name "$1") gets the internet proxy before these steps:"
+    echo "    $(net_dropin "$1")"
+    echo "    reads $NET_ENGINE_ENV (mode 600)"
+    return 0
+  fi
+  net_ours "$(net_dropin "$1")"
+}
+
+# The engines whose proxy differs from INTERNET_PROXY as far as it shows without root (one per line: KIND):
+# no drop-in of the installer although a proxy is set or the shell has one (and none of their own), or one
+# without a proxy
+net_engine_stale() {
+  local kind
+  if [ "$OS_KIND" = "Darwin" ] || [ ! -d "${RN1_SYSTEMD_DIR:-/run/systemd/system}" ]; then
+    return 0
+  fi
+  for kind in docker podman; do
+    if ! net_installed "$kind" || { [ "$kind" = "docker" ] && docker_is_snap; }; then
+      continue
+    fi
+    # (a proxy only the shell has counts too: the engine does not read it)
+    if [ -n "$INTERNET_PROXY$NET_SHELL_PROXY" ] && ! net_ours "$(net_dropin "$kind")" && [ -z "$(net_engine_foreign "$kind")" ]; then
+      printf '%s\n' "$kind"
+    elif [ -z "$INTERNET_PROXY" ] && net_ours "$(net_dropin "$kind")"; then
+      printf '%s\n' "$kind"
+    fi
+  done
+}
+
+# Where the company certificate goes in the trust store of this Linux: FOLDER|EXTENSION|COMMAND; empty when
+# the installer knows none here. RN1_TRUST_DIR: another folder (the tests).
+net_trust_target() {
+  local os dir ext="pem" cmd
+  if [ "$OS_KIND" = "Darwin" ]; then
+    return 0
+  fi
+  os=" $(os_release ID) $(os_release ID_LIKE) "
+  case "$os" in
+    *suse*|*sles*) dir="/etc/pki/trust/anchors"; cmd="update-ca-certificates" ;;
+    *debian*|*ubuntu*) dir="/usr/local/share/ca-certificates"; ext="crt"; cmd="update-ca-certificates" ;;
+    *) dir="/etc/pki/ca-trust/source/anchors"; cmd="update-ca-trust extract" ;;
+  esac
+  if command -v "${cmd%% *}" >/dev/null 2>&1 || [ -x "/usr/sbin/${cmd%% *}" ] || [ -x "/sbin/${cmd%% *}" ]; then
+    printf '%s|%s|%s' "${RN1_TRUST_DIR:-$dir}" "$ext" "$cmd"
+  fi
+}
+
+# The name of this folder's company certificates in the trust store: rn1-proxy-ca-<checksum of the folder>
+# (one more installation on this server keeps its own; -N.EXT follows)
+net_trust_name() {
+  printf 'rn1-proxy-ca-%s' "$(printf '%s' "$WORK_DIR" | cksum | cut -d' ' -f1)"
+}
+
+# True when the company certificate of this folder is in the trust store of this server
+net_ca_trusted() {
+  local t dir ext cmd f
+  t="$(net_trust_target)"
+  if [ -z "$t" ]; then
+    return 1
+  fi
+  IFS='|' read -r dir ext cmd <<< "$t"
+  for f in "$dir/$(net_trust_name)"-*."$ext"; do
+    if [ -f "$f" ]; then
+      return 0
+    fi
+  done
+  return 1
+}
+
+# net_ca_trust ask|remove -> the company certificate (proxy-ca.pem) into the trust store of this Linux after
+# a yes, one file per certificate, then the check again (the certificates now trusted); or out of it. The
+# engines read it at their next start (NET_ENGINE_CHANGED). 1: not done
+net_ca_trust() {
+  local mode="$1" t dir ext cmd pem l cert="" n=0 kind
+  if [ "$OS_KIND" = "Darwin" ]; then
+    return 1
+  fi
+  t="$(net_trust_target)"
+  if [ -z "$t" ]; then
+    if [ "$mode" = "ask" ]; then
+      warn "No known trust store here (update-ca-trust, update-ca-certificates):"
+      echo "  add $PROXY_CA_COPY to the certificates of this system yourself."
+    fi
+    return 1
+  fi
+  IFS='|' read -r dir ext cmd <<< "$t"
+  if ! use_sudo; then
+    warn "The trust store of this server needs root: run as root, or install sudo."
+    return 1
+  fi
+  if [ "$mode" = "remove" ]; then
+    if ! net_ca_trusted; then
+      return 0
+    fi
+    ${SUDO[@]+"${SUDO[@]}"} sh -c 'rm -f -- "$1/$3"-*."$2"' sh "$dir" "$ext" "$(net_trust_name)" || return 1
+    run_plan "$cmd" || return 1
+    ok "The company certificate is out of the trust store of this server."
+  else
+    pem="$(net_ca_pem "$PROXY_CA_COPY")" || return 1
+    echo
+    echo "  This server, its engine and its downloads trust the certificate once it is in"
+    echo "  the trust store of the system ($cmd):"
+    echo "    $dir/$(net_trust_name)-N.$ext"
+    if ! confirm "Add it to the trust store of this server?" y; then
+      info "Not added: downloads through the inspection fail until it is there."
+      return 1
+    fi
+    ${SUDO[@]+"${SUDO[@]}"} sh -c 'rm -f -- "$1/$3"-*."$2"' sh "$dir" "$ext" "$(net_trust_name)" || return 1
+    while IFS= read -r l; do
+      l="${l%$'\r'}"
+      cert="$cert$l"$'\n'
+      if [ "$l" = "-----END CERTIFICATE-----" ]; then
+        n=$((n + 1))
+        if ! net_root_file "$dir/$(net_trust_name)-$n.$ext" 644 "${cert%$'\n'}"; then
+          err "Cannot write $dir/$(net_trust_name)-$n.$ext."
+          return 1
+        fi
+        cert=""
+      fi
+    done <<< "$pem"
+    run_plan "$cmd" || return 1
+    ok "The company certificate is in the trust store of this server."
+  fi
+  for kind in docker podman; do
+    if net_installed "$kind"; then
+      NET_ENGINE_CHANGED="$NET_ENGINE_CHANGED $kind"
+    fi
+  done
+  if [ "$mode" = "ask" ] && command -v curl >/dev/null 2>&1; then
+    echo
+    info "The check again, now with the trusted certificate:"
+    net_check show || true
+  fi
+}
+
+# net_private_write FILE -> stdin into FILE, readable only by its owner from the start: written next to it
+# with umask 077, then moved into its place (the LaunchAgent holds the proxy login)
+net_private_write() {
+  if ! (umask 077 && cat > "$1.rn1-new") || ! chmod 600 "$1.rn1-new" || ! mv -f -- "$1.rn1-new" "$1"; then
+    rm -f -- "$1.rn1-new"
+    warn "Cannot write $1."
+    return 1
+  fi
+}
+
+# The proxy for the LaunchAgent of the Podman machine (nothing without INTERNET_PROXY): Podman writes the
+# proxy into the machine at every start from the variables of the process that starts it, and removes it
+# when they are missing
+net_plist_env() {
+  local p no
+  if [ -z "$INTERNET_PROXY" ]; then
+    return 0
+  fi
+  p="$(net_with_login "$INTERNET_PROXY")"
+  no="$(net_no_proxy_engine)"
+  printf '\n  <key>EnvironmentVariables</key><dict>'
+  printf '<key>%s</key><string>%s</string>' HTTP_PROXY "$p" HTTPS_PROXY "$p" NO_PROXY "$no" http_proxy "$p" https_proxy "$p" no_proxy "$no"
+  printf '</dict>'
+}
+
+# net_colima_env FILE -> FILE (colima.yaml) with the proxy in its env: - the variables Colima gives the
+# Docker of its VM; started by brew services, Colima has no other place for them - or without them when
+# INTERNET_PROXY is empty. 0: changed; 1: as it was; 3: an env: the installer cannot change
+net_colima_env() {
+  local f="$1" add="" p no tmp rc=0
+  if [ ! -f "$f" ]; then
+    return 1
+  fi
+  if [ -n "$INTERNET_PROXY" ]; then
+    p="$(net_with_login "$INTERNET_PROXY")"
+    no="$(net_no_proxy_engine)"
+    add="  HTTP_PROXY: '$p'
+  HTTPS_PROXY: '$p'
+  NO_PROXY: '$no'
+  http_proxy: '$p'
+  https_proxy: '$p'
+  no_proxy: '$no'"
+  fi
+  tmp="$(mktemp "$f.XXXXXX")" || return 3
+  NET_E="$add" awk '
+    BEGIN { add = ENVIRON["NET_E"]; ours = "^[ \t]+(HTTP_PROXY|HTTPS_PROXY|NO_PROXY|http_proxy|https_proxy|no_proxy):" }
+    function flush(  out) {
+      out = kept
+      if (add != "") out = out (out != "" ? "\n" : "") add
+      if (out == "") print "env: {}"
+      else { print "env:"; print out }
+      printf "%s", blanks
+      blanks = ""
+      done = 1
+      inenv = 0
+    }
+    # empty lines in the block wait: they belong to it only when more of it follows
+    inenv && $0 ~ /^[ \t]*$/ { blanks = blanks $0 "\n"; next }
+    inenv && $0 ~ /^[ \t]/ {
+      if ($0 !~ ours) {
+        if (kept != "") kept = kept "\n"
+        kept = kept blanks $0
+      }
+      blanks = ""
+      next
+    }
+    inenv { flush() }
+    /^env:[ \t]*\{[ \t]*\}[ \t]*(#.*)?$/ { kept = ""; flush(); next }
+    /^env:[ \t]*(#.*)?$/ { inenv = 1; kept = ""; next }
+    /^env:/ { bad = 1 }
+    { print }
+    END {
+      if (inenv) flush()
+      else if (!done && add != "") { print "env:"; print add }
+      if (bad) exit 3
+    }' "$f" > "$tmp" || rc=$?
+  if [ "$rc" -ne 0 ]; then
+    rm -f -- "$tmp"
+    return 3
+  fi
+  if [ "$(cat -- "$tmp")" = "$(cat -- "$f")" ]; then
+    rm -f -- "$tmp"
+    return 1
+  fi
+  # the new file is mode 600 from its start (mktemp) and takes the place of the old one: the login is
+  # never in a file others can read
+  if ! chmod 600 "$tmp" || ! mv -f -- "$tmp" "$f"; then
+    rm -f -- "$tmp"
+    return 3
+  fi
+}
+
+# net_colima_apply ask|yes DEFAULT -> the proxy in colima.yaml, and Colima restarted to use it: after a yes
+# (DEFAULT: the answer of Enter), or without a question when DEFAULT is y and no question is asked
+net_colima_apply() {
+  local mode="$1" def="$2" yaml rc=0
+  yaml="$(mac_colima_yaml)"
+  if [ ! -f "$yaml" ]; then
+    return 0
+  fi
+  net_colima_env "$yaml" || rc=$?
+  case "$rc" in
+    0) ;;
+    1) return 0 ;;
+    *)
+      warn "The env: of $yaml is written in a form the installer"
+      echo "  does not change: give Colima the proxy there yourself."
+      return 0
+      ;;
+  esac
+  if [ -n "$INTERNET_PROXY" ]; then
+    ok "Colima gets the proxy: env: in"
+    echo "  $yaml (mode 600)"
+  else
+    ok "Colima has no proxy of the installer any more:"
+    echo "  $yaml"
+  fi
+  if { [ "$mode" = "yes" ] && [ "$def" = "y" ]; } || { [ "$mode" = "ask" ] && confirm "Restart Colima now to use it (the Catalog stops for about a minute)?" "$def"; }; then
+    colima restart || warn "colima restart failed - start it again: colima start"
+  else
+    info "Colima uses it after its next restart (colima restart)."
+  fi
+}
+
+# The internet settings for the engine of this Mac: the LaunchAgent of the Podman machine and the machine's
+# restart after a yes, colima.yaml, or what to set in Docker Desktop
+net_mac_apply() {
+  local name changed="no"
+  case "$(net_engine)" in
+    podman)
+      if ! command -v podman >/dev/null 2>&1; then
+        return 0
+      fi
+      name="$(mac_machine)"
+      if [ -z "$name" ]; then
+        return 0
+      fi
+      if [ ! -f "$MAC_AGENT" ]; then
+        changed="yes"
+      elif [ "$(mac_agent "$name")" != "$(cat -- "$MAC_AGENT" 2>/dev/null)" ]; then
+        launchctl unload "$MAC_AGENT" >/dev/null 2>&1 || true
+        mac_agent "$name" | net_private_write "$MAC_AGENT"
+        launchctl load -w "$MAC_AGENT" >/dev/null 2>&1 || true
+        ok "LaunchAgent updated: the Podman machine gets the proxy at every start."
+        changed="yes"
+      fi
+      if [ "$changed" = "yes" ]; then
+        info "The Podman machine $name uses the proxy from its next start."
+        if confirm "Restart it now (the Catalog stops for about a minute)?" n; then
+          podman machine stop "$name" >/dev/null 2>&1 || true
+          podman machine start "$name" || warn "podman machine start $name failed."
+        fi
+      fi
+      ;;
+    colima) net_colima_apply ask n ;;
+    docker)
+      if [ -n "$INTERNET_PROXY" ]; then
+        info "Docker Desktop takes its proxy from its own settings: Settings > Resources >"
+        echo "  Proxies - System (the proxy of macOS, also a PAC file), or Manual with"
+        echo "  $INTERNET_PROXY (and the login)."
+      fi
+      ;;
+  esac
+}
+
+# net_apply -> the internet settings applied after they changed: the engines of this server (Linux: their
+# drop-ins, a restart after a yes; macOS: the Podman machine, Colima, Docker Desktop described), then
+# catalog-web and Nginx Proxy Manager (.env, the compose file, created again after a yes). What cannot be
+# done is said.
+net_apply() {
+  local kind
+  NET_APPLY_PENDING=""
+  if [ "$OS_KIND" = "Darwin" ]; then
+    net_mac_apply || true
+  elif use_sudo; then
+    for kind in docker podman; do
+      if net_installed "$kind"; then
+        net_engine_write ask "$kind" || true
+        net_engine_restart ask "$kind" || true
+      fi
+    done
+  elif [ -n "$(net_engine_stale)" ]; then
+    warn "The engine gets the proxy only as root: run option 26 as root (sudo)."
+  fi
+  net_catalog_apply || true
+}
+
+# The lines of the summary before a proxy is saved: where the engine and the Catalog get it
+net_summary_apply() {
+  local kind shown="no"
+  if [ "$OS_KIND" = "Darwin" ]; then
+    case "$(net_engine)" in
+      podman) echo "    engine        the Podman machine, from its next start (LaunchAgent)" ;;
+      colima) echo "    engine        Colima: env: of colima.yaml (mode 600)" ;;
+      docker) echo "    engine        Docker Desktop: in its own settings (shown after saving)" ;;
+    esac
+    return 0
+  fi
+  for kind in docker podman; do
+    if net_installed "$kind"; then
+      printf '    %-13s %s\n' "$(if [ "$shown" = "no" ]; then printf 'engine'; fi)" "$(kind_name "$kind"): $(net_dropin "$kind")"
+      shown="yes"
+    fi
+  done
+  if [ "$shown" = "yes" ]; then
+    echo "                  -> $NET_ENGINE_ENV (mode 600)"
+  else
+    echo "    engine        a drop-in of its service when it is set up (mode 600)"
+  fi
+  echo "    Catalog       catalog-web and Nginx Proxy Manager, through $ENV_FILE (HTTPS"
+  echo "                  only); the other services get no proxy"
+}
+
+# net_offer_check WHAT -> after WHAT failed (a download): in a terminal the check of the internet access is
+# offered, otherwise named
+net_offer_check() {
+  local ans=0 rc
+  if ! net_enabled; then
+    return 0
+  fi
+  if [ ! -t 0 ] || [ ! -t 1 ]; then
+    info "$(hint 26 network-check) checks the internet access (a proxy may be missing)."
+    return 0
+  fi
+  echo
+  wiz_yes_no "$1 failed. Check the internet access now?" y || ans=$?
+  if [ "$ans" -ne 0 ]; then
+    return 0
+  fi
+  echo
+  net_via_settings
+  rc=0
+  net_check show || rc=$?
+  if [ "$rc" -eq 1 ]; then
+    echo
+    net_ask || true
+  fi
+}
+
+# net_adopt FOLDER ENV-FILE -> what a taken-over installation had for the internet: its login (.proxy_login,
+# mode 600) and company certificate (proxy-ca.pem), and the proxy of its .env as INTERNET_PROXY when none
+# is set here
+net_adopt() {
+  local dir="$1" envf="$2" v
+  if [ -f "$dir/.proxy_login" ] && [ ! -e "$PROXY_LOGIN_FILE" ] && (umask 077 && cp -- "$dir/.proxy_login" "$PROXY_LOGIN_FILE"); then
+    chmod 600 "$PROXY_LOGIN_FILE"
+    ok "Took over its proxy login ($(basename -- "$PROXY_LOGIN_FILE"), mode 600)."
+  fi
+  v="$(env_unquote "$(env_file_value RN1_HTTPS_PROXY "$envf")")"
+  if [ -n "$v" ] && [ -z "$INTERNET_PROXY" ] && net_parse "$v" && [ -n "$NP_PORT" ]; then
+    case "$NP_HOST" in
+      host.docker.internal|host.containers.internal) NP_HOST="127.0.0.1" ;;
+    esac
+    if set_setting INTERNET_PROXY "$NP_SCHEME://$NP_HOST:$NP_PORT"; then
+      INTERNET_PROXY="$NP_SCHEME://$NP_HOST:$NP_PORT"
+      if [ -n "$NP_LOGIN" ] && [ ! -e "$PROXY_LOGIN_FILE" ]; then
+        proxy_login_save "$NP_LOGIN" || true
+      fi
+      ok "Took over its internet proxy: $INTERNET_PROXY"
+    fi
+  fi
+  if [ -f "$dir/proxy-ca.pem" ] && [ -z "$INTERNET_PROXY_CA_FILE" ] && cp -- "$dir/proxy-ca.pem" "$PROXY_CA_COPY" \
+    && set_setting INTERNET_PROXY_CA_FILE "$PROXY_CA_COPY"; then
+    INTERNET_PROXY_CA_FILE="$PROXY_CA_COPY"
+    ok "Took over its company certificate ($(basename -- "$PROXY_CA_COPY"))."
+  fi
+}
+
+# True when this server has proxy files of the installer: an engine's drop-in, the company certificate in
+# the trust store
+net_proxy_files() {
+  net_ours "$(net_dropin docker)" || net_ours "$(net_dropin podman)" || net_ours "$NET_PODMAN_CONF" || net_ca_trusted
+}
+
+# R: the installer's proxy files of the engines and the company certificate in the trust store go (a
+# running engine keeps the proxy until its next restart). 1: not everything
+net_proxy_cleanup() {
+  local kind rc=0
+  use_sudo || return 1
+  for kind in docker podman; do
+    NET_CLEANUP="yes" INTERNET_PROXY="" net_engine_write yes "$kind" || rc=1
+    net_engine_restart yes "$kind" || rc=1
+  done
+  net_ca_trust remove || rc=1
+  return "$rc"
 }
 
 ###############################################################################
@@ -10773,6 +16868,7 @@ settings_group_title() {
     ASPNETCORE_) printf 'ASP.NET Core' ;;
     COMPOSE_) printf 'Docker Compose' ;;
     FILESTORAGE_) printf 'File storage' ;;
+    INTERNET_) printf 'Internet access' ;;
     *)
       w="${1//_/}"
       printf '%s%s' "${w:0:1}" "$(printf '%s' "${w:1}" | tr '[:upper:]' '[:lower:]')"
@@ -10802,16 +16898,22 @@ settings_hint() {
     CONTAINER_ENGINE) printf 'podman, docker%s; empty: the engine that holds this installation (now %s)' "$(if [ "$OS_KIND" = "Darwin" ]; then printf ' or colima'; fi)" "$ENGINE_KIND" ;;
     CATALOG_DOMAIN) printf 'Host name of the Catalog, e.g. catalog.example.com; empty: the address of the server (option 24)' ;;
     NPM_ADMIN_EMAIL) printf 'Login of Nginx Proxy Manager and the e-mail address for Let'"'"'s Encrypt; the password is generated into %s' "$ENV_FILE" ;;
+    INTERNET_PROXY) printf 'Proxy to the internet, e.g. http://proxy.example.com:8080; empty: directly (or the proxy of the shell). Option 26 checks it; its login is in .proxy_login%s' "$(value="$(proxy_login_user)"; if [ -n "$value" ]; then printf ' (%s, password saved)' "$value"; fi)" ;;
+    INTERNET_NO_PROXY) printf 'Internal names reached without the proxy, comma-separated, e.g. corp.example.com (this server and the Catalog always are)' ;;
+    INTERNET_PROXY_CA_FILE) printf 'Root certificate (PEM) of a network that inspects HTTPS; option 26 asks for it and keeps a copy' ;;
+    INTERNET_PROXY_PAC) printf 'The PAC file INTERNET_PROXY was taken from (read once; option 26 reads it again)' ;;
     CATALOG_VERSION) printf 'Version of catalog-web and all workers; option 8 picks one from Docker Hub' ;;
     CATALOG_IMAGE_REPO) printf 'Docker Hub repository of catalog-web' ;;
     CATALOG_WORKER_IMAGE_REPO) printf 'Docker Hub repository of the four workers' ;;
     CHECK_FOR_UPDATES) printf 'true: the menu looks for new Catalog versions on Docker Hub' ;;
     CATALOG_LICENSE_PATH) printf 'Folder of the license volume inside catalog-web' ;;
+    CATALOG_HOSTNAME) printf 'Host name of catalog-web, which the license is bound to; empty: as in %s, else the one of a licensed catalog-web, else this server (%s)' "$ENV_FILE" "$(server_hostname)" ;;
     CATALOG_CLOUD_URL) printf 'Online catalog for snapshots (option 17) and the daily self-sync (option 20)' ;;
     SYNC_MAX_UPLOAD) printf 'Largest snapshot upload of Catalog 26.x, e.g. 32GB (25.x: fixed 10 GB)' ;;
     HEALTH_TIMEOUT) printf 'Seconds the guided upgrade waits for a healthy stack' ;;
     INSTALLER_URL) printf 'Where option 22 downloads new versions of this installer' ;;
     OPENSEARCH_HEAP) printf 'Java heap of OpenSearch, e.g. -Xms1g -Xmx1g' ;;
+    MONGO_CACHE_GB) printf 'Cache of MongoDB in GB (at least 0.25); empty: automatic, (memory of the engine - 10 GB) / 2%s' "$(value="$(env_value MONGO_WT_CACHE_GB)"; if [ -n "$value" ]; then printf ' - %s has %s' "$ENV_FILE" "$value"; fi)" ;;
     OPENSEARCH_URL) printf 'Address of OpenSearch inside the stack' ;;
     X_FRAME_OPTIONS) printf 'X-Frame-Options header of Nginx Proxy Manager' ;;
     DISABLE_IPV6) printf 'true: Nginx Proxy Manager does not use IPv6' ;;
@@ -10835,7 +16937,7 @@ settings_hint() {
 
 # settings_empty_ok NAME SAVED -> true when NAME may be empty (it is empty now, or empty has a meaning)
 settings_empty_ok() {
-  [ -z "$2" ] || [ "$1" = "COMPOSE_PROJECT_NAME" ] || [ "$1" = "CONTAINER_ENGINE" ] || [ "$1" = "CATALOG_DOMAIN" ] || [ "$1" = "NPM_ADMIN_EMAIL" ]
+  [ -z "$2" ] || [ "$1" = "COMPOSE_PROJECT_NAME" ] || [ "$1" = "CONTAINER_ENGINE" ] || [ "$1" = "CATALOG_DOMAIN" ] || [ "$1" = "NPM_ADMIN_EMAIL" ] || [ "$1" = "CATALOG_HOSTNAME" ] || [ "$1" = "MONGO_CACHE_GB" ] || [[ "$1" == INTERNET_* ]]
 }
 
 # settings_check NAME VALUE SAVED -> fails and prints the reason when VALUE does not fit NAME
@@ -10936,6 +17038,12 @@ settings_check() {
         return 1
       fi
       ;;
+    MONGO_CACHE_GB)
+      if ! mongo_cache_valid "$value"; then
+        echo "Give the cache in GB, e.g. 4 or 2.5 (at least 0.25), or \"\" for automatic."
+        return 1
+      fi
+      ;;
     LOG_LEVEL_DEFAULT)
       case "$value" in
         Trace|Debug|Information|Warning|Error|Critical|None) ;;
@@ -10987,6 +17095,20 @@ settings_check() {
         return 1
       fi
       ;;
+    CATALOG_HOSTNAME)
+      if hostname_taken "$value"; then
+        echo "\"$value\" is a service of the stack: inside catalog-web it would name catalog-web itself."
+        return 1
+      fi
+      if [ "${value,,}" = "localhost" ]; then
+        echo "localhost is every machine's name for itself - give a name of its own, e.g. catalog01."
+        return 1
+      fi
+      if ! hostname_valid "$value"; then
+        echo "Give a host name without the domain: letters, digits and -, at most 63 characters, no dots (e.g. catalog01)."
+        return 1
+      fi
+      ;;
     NPM_ADMIN_EMAIL)
       if ! email_valid "$value"; then
         echo "Give an e-mail address, e.g. it@example.com."
@@ -10994,6 +17116,38 @@ settings_check() {
       fi
       if [ "$value" != "${value,,}" ]; then
         echo "Give the e-mail address in lower case (${value,,}): Nginx Proxy Manager takes logins only in lower case."
+        return 1
+      fi
+      ;;
+    INTERNET_PROXY)
+      if [[ "$value" != *://* ]] || ! net_parse "$value"; then
+        echo "Give scheme://host:port, e.g. http://proxy.example.com:8080 (http, https, socks5 or socks5h; no path)."
+        return 1
+      fi
+      if [ -n "$NP_LOGIN" ]; then
+        echo "No login in the address: option 26 keeps it in .proxy_login (mode 600), not in the script."
+        return 1
+      fi
+      if [ -z "$NP_PORT" ]; then
+        echo "Give the port too, e.g. http://proxy.example.com:8080."
+        return 1
+      fi
+      ;;
+    INTERNET_NO_PROXY)
+      if ! [[ "$value" =~ ^[A-Za-z0-9.:/_-]+(,[A-Za-z0-9.:/_-]+)*$ ]]; then
+        echo "Give names, addresses or ranges separated by commas, no spaces and no *, e.g. corp.example.com,192.0.2.0/24."
+        return 1
+      fi
+      ;;
+    INTERNET_PROXY_CA_FILE)
+      if [[ "$value" != /* ]] || [ ! -r "$value" ] || ! grep -q -- '-----BEGIN CERTIFICATE-----' "$value" 2>/dev/null; then
+        echo "Give the absolute path of a readable certificate file in PEM (option 26 asks for it and keeps a copy)."
+        return 1
+      fi
+      ;;
+    INTERNET_PROXY_PAC)
+      if ! [[ "$value" =~ ^https?://[^[:space:]]+$ ]] && [[ "$value" != /* ]]; then
+        echo "Give the http:// or https:// address of the PAC file, or its absolute path."
         return 1
       fi
       ;;
@@ -11412,9 +17566,45 @@ settings_tz_jobs() {
   fi
 }
 
+HOST_NOW=""
+HOST_LICENSE=""
+
+# For the edit screen of CATALOG_HOSTNAME: HOST_NOW, the host name of the catalog-web container (empty:
+# none), and HOST_LICENSE, the license of the Catalog (valid, invalid, or unreachable/error: it does not
+# answer). Asks Catalog Web, so only there, not when the menu or the settings are drawn.
+settings_host_state() {
+  HOST_NOW="$(web_container_hostname)"
+  HOST_LICENSE="invalid"
+  if [ -n "$HOST_NOW" ]; then
+    license_status --max-time 15
+    HOST_LICENSE="$LICENSE_STATE"
+  fi
+}
+
+# settings_host_effective VALUE -> the host name catalog-web gets with CATALOG_HOSTNAME=VALUE (as
+# do_generate decides it): VALUE, the one of the env file (or of its newest backup), the one a licensed
+# catalog-web keeps, else the name of this server. Needs settings_host_state.
+settings_host_effective() {
+  local from="$ENV_FILE"
+  if [ -n "$1" ]; then
+    printf '%s' "$1"
+    return 0
+  fi
+  if [ ! -f "$from" ]; then
+    from="$(newest_env_backup)"
+  fi
+  if [ -n "$from" ] && [ -f "$from" ] && [ -n "$(env_hostname "$from")" ]; then
+    CATALOG_HOSTNAME="" catalog_hostname "$from"
+  elif [ "$HOST_LICENSE" != "invalid" ] && hostname_valid "$HOST_NOW"; then
+    printf '%s' "$HOST_NOW"
+  else
+    server_hostname
+  fi
+}
+
 # settings_edit INDEX -> asks for a new value of one setting; it stays on the screen until saved
 settings_edit() {
-  local i="$1" name group saved cur value problem title pattern hint env bool="false" k jobs="" pre prompt
+  local i="$1" name group saved cur value problem title pattern hint env bool="false" k jobs="" pre prompt eff why
   local -a lines=()
   name="${SET_NAME[i]}"
   group="${SET_GROUP[i]}"
@@ -11430,13 +17620,30 @@ settings_edit() {
   if [ "${SET_MOD[i]}" = "1" ]; then
     lines+=("On screen  $C_YLW${cur:-(empty)}$C_RST  ${C_DIM}not saved yet$C_RST")
   fi
+  if [ "$name" = "CATALOG_HOSTNAME" ]; then
+    settings_host_state
+  fi
   if [ -f "$ENV_FILE" ] && grep -q "^$name=" "$ENV_FILE"; then
     env="$(env_value "$name")"
-    if [ "$env" = "$saved" ]; then
+    # an empty CATALOG_HOSTNAME keeps the one of the env file
+    if [ "$env" = "$saved" ] || { [ "$name" = "CATALOG_HOSTNAME" ] && [ "$(env_unquote "$env")" = "$(settings_host_effective "$saved")" ]; }; then
       lines+=("In $ENV_FILE    ${env:-$C_DIM(empty)$C_RST}")
     else
       lines+=("In $ENV_FILE    $C_YLW${env:-(empty)}$C_RST  ${C_DIM}option 2 regenerates it from the settings$C_RST")
     fi
+  fi
+  if [ "$name" = "CATALOG_HOSTNAME" ]; then
+    eff="$(settings_host_effective "$cur")"
+    if [ -z "$HOST_NOW" ]; then
+      why="no catalog-web container yet"
+    elif [ "$HOST_NOW" != "$eff" ]; then
+      why="catalog-web has $HOST_NOW until options 2 and 6"
+    elif [ "$HOST_LICENSE" = "valid" ]; then
+      why="catalog-web has it; the license is bound to it"
+    else
+      why="catalog-web has it"
+    fi
+    lines+=("Effective  $eff  $C_DIM($why)$C_RST")
   fi
   hint="$(settings_hint "$name" "$saved")"
   if [ -n "$hint" ]; then
@@ -11494,6 +17701,17 @@ settings_edit() {
   else
     SET_MOD[i]="1"
     settings_note "$C_YLW$SET_MARK$C_RST $name ${C_DIM}$UI_RARR$C_RST ${value:-(empty)}   ${C_DIM}not saved yet - S saves$C_RST"
+  fi
+  # a licensed Catalog (or one that does not answer: it may hold a license) loses it with another name
+  if [ "$name" = "CATALOG_HOSTNAME" ] && [ -n "$HOST_NOW" ] && [ "$HOST_LICENSE" != "invalid" ]; then
+    eff="$(settings_host_effective "$value")"
+    if [ "$eff" != "$HOST_NOW" ] && [ "$HOST_LICENSE" = "valid" ]; then
+      settings_note "$C_YLW$UI_NO$C_RST The Catalog's license is bound to the host name $HOST_NOW."
+      settings_note "  With $eff it must be activated again: option 25, after 2 and 6."
+    elif [ "$eff" != "$HOST_NOW" ]; then
+      settings_note "$C_YLW$UI_NO$C_RST If the Catalog holds a license, it is bound to the host name $HOST_NOW."
+      settings_note "  With $eff it must be activated again: option 25, after 2 and 6."
+    fi
   fi
   if [ "$name" = "TZ" ]; then
     if tz_known "${cur:-UTC}" && tz_known "${value:-UTC}"; then
@@ -11815,51 +18033,86 @@ stack_state() {
   printf '%s service(s) running' "$(count_lines "$running")"
 }
 
+# show_menu [LINES] -> the plain menu; LINES: what the caller prints below it (notices, prompt)
 show_menu() {
-  local found tz_note sib state inote dnote
+  local found tz_note sib state inote dnote below="${1:-0}" cols height item nh
+  local -a notes=() items=()
   reload_settings
   menu_scan
   state="$(stack_state)"
-  printf '%s\n' "${C_BLD}Raynet One Technology Catalog - Installation Portal${C_RST}   ($(version_label))"
-  printf 'Folder : %s\n' "$WORK_DIR"
-  printf 'Files  : %s %s   %s %s\n' "$ENV_FILE" "$(file_state "$ENV_FILE")" "$COMPOSE_FILE" "$(file_state "$COMPOSE_FILE")"
-  printf 'Stack  : %s\n' "$state"
   if [ ! -f "$ENV_FILE" ]; then
     found="$(first_installation_dir)"
     if [ -n "$found" ]; then
-      printf '%s\n' "${C_YLW}A Catalog installation already exists in $found - option 23 takes it over (settings, passwords, data).${C_RST}"
+      notes+=("${C_YLW}A Catalog installation already exists in $found - option 23 takes it over (settings, passwords, data).${C_RST}")
     fi
   fi
   inote="$(install_note)"
   if [ -n "$inote" ]; then
-    printf '%s\n' "${C_YLW}$inote - option 23 takes the installation's values over.${C_RST}"
+    notes+=("${C_YLW}$inote - option 23 takes the installation's values over.${C_RST}")
   fi
   sib="$(conflicting_sibling)"
   if [ -n "$sib" ]; then
-    printf '%s\n' "${C_YLW}$(basename -- "$sib") in this folder has other settings - option 23 takes them over (or rename it if it is no longer used).${C_RST}"
+    notes+=("${C_YLW}$(basename -- "$sib") in this folder has other settings - option 23 takes them over (or rename it if it is no longer used).${C_RST}")
   elif [ -n "$inote" ]; then
     :
   elif mongo_kernel_problem; then
-    printf '%s\n' "${C_YLW}MongoDB needs the kernel workaround (SERVER-121912), and the files lack it - option 2 (or I - repair) writes them again.${C_RST}"
+    notes+=("${C_YLW}MongoDB needs the kernel workaround (SERVER-121912), and the files lack it - option 2 (or I - repair) writes them again.${C_RST}")
   elif mongo_workaround_unneeded; then
-    printf '%s\n' "${C_YLW}This kernel no longer needs the MongoDB workaround in the files - option 2 writes them again (faster MongoDB).${C_RST}"
+    notes+=("${C_YLW}This kernel no longer needs the MongoDB workaround in the files - option 2 writes them again (faster MongoDB).${C_RST}")
   elif settings_stale; then
     dnote="$(install_diff_note)"
     if [ -n "$dnote" ]; then
-      printf '%s\n' "${C_YLW}$dnote - option 23 takes the installation's values over, option 2 writes the settings.${C_RST}"
+      notes+=("${C_YLW}$dnote - option 23 takes the installation's values over, option 2 writes the settings.${C_RST}")
     else
-      printf '%s\n' "${C_YLW}The generated files do not match the settings above (changed settings or manual edits) - option 2 regenerates them.${C_RST}"
+      notes+=("${C_YLW}The generated files do not match the settings above (changed settings or manual edits) - option 2 regenerates them.${C_RST}")
     fi
   fi
   if [ -z "$inote" ] && tz_note="$(tz_menu_note)" && [ -n "$tz_note" ]; then
-    printf '%s\n' "${C_YLW}$tz_note${C_RST}"
+    notes+=("${C_YLW}$tz_note${C_RST}")
+  fi
+  # the internet check of the menu start, once it is done (a header line)
+  nh="$(net_header)"
+  mapfile -t items < <(menu_items)
+  # the logo only in a terminal that has room for it above the whole menu: header (with the internet
+  # line), notes, the cards, every heading (two lines) and option, Exit and the legend, and what the
+  # caller prints below
+  cols="$(ui_cols)"
+  if [ -t 1 ] && [ "$cols" -ge 80 ]; then
+    height=$((4 + ${#notes[@]} + 2 + 3 + 5 + below))
+    if [ -n "$nh" ]; then
+      height=$((height + 1))
+    fi
+    for item in "${items[@]}"; do
+      IFS='|' read -r _ item _ <<< "$item"
+      if [ "$item" = "-" ]; then
+        height=$((height + 2))
+      elif [ -n "$item" ]; then
+        height=$((height + 1))
+      fi
+    done
+    if [ "$(ui_rows)" -ge $((height + ${#UI_LOGO[@]} + 1)) ]; then
+      ui_logo "$cols"
+      echo
+    fi
+  fi
+  printf '%s\n' "${C_BLD}Raynet One Technology Catalog - Installation Portal${C_RST}   ($(version_label))"
+  printf 'Folder : %s\n' "$WORK_DIR"
+  printf 'Files  : %s %s   %s %s\n' "$ENV_FILE" "$(file_state "$ENV_FILE")" "$COMPOSE_FILE" "$(file_state "$COMPOSE_FILE")"
+  printf 'Stack  : %s\n' "$state"
+  case "$nh" in
+    "") ;;
+    "Internet: "*) printf '%s\n' "$C_YLW$nh$C_RST" ;;
+    *) printf '%s\n' "$C_GRN$nh$C_RST" ;;
+  esac
+  if [ ${#notes[@]} -gt 0 ]; then
+    printf '%s\n' "${notes[@]}"
   fi
   local col key kind label desc what installed title color l1 l2 wide="no" text current=""
   installed="$(install_state)"
   if [ "$installed" != "no" ]; then
     current="$(installed_catalog)"
   fi
-  if [ "$(ui_cols)" -ge 70 ]; then
+  if [ "$cols" -ge 70 ]; then
     wide="yes"
   fi
   printf '\n %s\n' "${C_CYN}START HERE$C_RST"
@@ -11883,7 +18136,7 @@ show_menu() {
       fi
       printf '  %s) %s %s\n' "$(printf '%3s' "$key")" "$(menu_icon "$kind")" "$text"
     fi
-  done < <(menu_items)
+  done < <(printf '%s\n' "${items[@]}")
   printf '\n    0) Exit\n\n  %s\n\n' "$(menu_legend)"
   menu_scan_done
 }
@@ -11909,6 +18162,12 @@ menu_up() {
 
 menu_full_setup() {
   engine_guard || return 1
+  # a start that would lower the installation is refused before the memory question
+  downgrade_guard settings || return 1
+  if ! mem_ask confirm; then
+    info "Cancelled."
+    return 0
+  fi
   do_generate ask no-next
   if [ "$GENERATE_CANCELLED" = "true" ]; then
     return 0
@@ -12699,9 +18958,9 @@ install_snapshots() {
 
 # I: in a folder without an installation the new installation (install_new; first: the menu starts with
 # it on the first start here). In a folder that is installed already: repair (check, settings, files,
-# start), continue with the data, update or remove. install_wizard [first]
+# start), continue with the license and the data, update or remove. install_wizard [first]
 install_wizard() {
-  local -a steps=(Check Settings Files Start Data Done)
+  local -a steps=(Check Settings Files Start License Data Done)
   local jobs found choice rc ans step=1 installed="" npm note
   jobs="$(wiz_running_jobs)"
   if [ -n "$jobs" ]; then
@@ -12727,7 +18986,7 @@ install_wizard() {
       install_new "${1:-}"
       return 0
     fi
-    wiz_head "Install" 1 Engine Domain Proxy Versions Install Data Done
+    wiz_head "Install" 1 Internet Engine Domain Proxy Versions Install License Data Done
     warn "A Catalog installation already exists on this server: $found"
     echo "  The Catalog runs once per server (its containers have fixed names), so a second one cannot start."
     echo
@@ -12760,7 +19019,7 @@ install_wizard() {
   fi
   echo
   printf '   %s  %s\n' "${C_BLD}1$C_RST" "$repair"
-  printf '   %s  %s\n' "${C_BLD}2$C_RST" "Continue with the catalog data (step 5)"
+  printf '   %s  %s\n' "${C_BLD}2$C_RST" "Continue with the license and the catalog data (step 5)"
   printf '   %s  %s\n' "${C_BLD}3$C_RST" "Update it instead (U)"
   printf '   %s  %s\n' "${C_BLD}4$C_RST" "Remove it first (R), then install from scratch"
   printf '   %s  %s\n' "${C_BLD}0$C_RST" "${C_DIM}cancel$C_RST"
@@ -12777,6 +19036,14 @@ install_wizard() {
         warn "$note."
         install_takeover interactive || true
         ui_pause_tty
+      fi
+      # the repair keeps the Catalog version of the installation (step 2), not an older MongoDB of the settings:
+      # stopped before the check and the memory question
+      note="$(downgrade_problem "" "$MONGO_TAG" settings)"
+      if [ -n "$note" ]; then
+        err "$note"
+        echo "  The repair would write it - take the installation's values over first (option 23)."
+        return 0
       fi
       wiz_head "Install" 1 "${steps[@]}"
       ;;
@@ -12802,6 +19069,9 @@ install_wizard() {
     else
       echo
       wiz_yes_no "Some checks failed (see above). Continue anyway?" n || ans=$?
+    fi
+    if [ "$ans" -eq 0 ]; then
+      mem_ask wizard || ans=$?
     fi
     if [ "$ans" -ne 0 ]; then
       wiz_stop "I"
@@ -12876,32 +19146,35 @@ install_wizard() {
       0) ;;
       3)
         info "The start goes on in the background (J shows it). When it is done, I continues with the"
-        echo "  catalog data (choice 2), or use option 20 or options 17 and 19."
+        echo "  license and the catalog data (choice 2), or use options 25 and 20."
         return 0
         ;;
       *)
         err "The Catalog did not start cleanly - option 10 shows the logs, option 16 checks the server."
+        # the first start downloads the images
+        net_offer_check "The start of the Catalog"
         wiz_stop "I"
         return 0
         ;;
     esac
     echo
     ans=0
-    wiz_yes_no "Continue with the catalog data?" y || ans=$?
+    wiz_yes_no "Continue with the license and the catalog data?" y || ans=$?
     if [ "$ans" -ne 0 ]; then
       wiz_stop "I"
       return 0
     fi
   fi
-  install_finish 5 "${steps[@]}"
+  install_license 5 "${steps[@]}"
+  install_finish 6 "${steps[@]}"
 }
 
-# I in a folder without an installation: the engine, the domain name, Nginx Proxy Manager and the
-# versions, then the summary, the check, the files and the start (with Nginx Proxy Manager for the
-# domain), the catalog data. Every answer is saved at once, so the task starts again with them; 0 or
-# the end of input at a question stops it. install_new [first]
+# I in a folder without an installation: the internet access, the engine, the domain name, Nginx Proxy
+# Manager and the versions, then the summary, the check, the files and the start (with Nginx Proxy Manager
+# for the domain), the license and the catalog data. Every answer is saved at once, so the task starts
+# again with them; 0 or the end of input at a question stops it. install_new [first]
 install_new() {
-  local -a steps=(Engine Domain Proxy Versions Install Data Done)
+  local -a steps=(Internet Engine Domain Proxy Versions Install License Data Done)
   local rc ans out k holders="" before
   wiz_head "Install" 1 "${steps[@]}"
   # data volumes of this project without their passwords (.env, or a backup of it): new passwords
@@ -12927,7 +19200,20 @@ install_new() {
     echo
   fi
 
-  # 1. Engine (stopped at its first question: the next start opens the menu, I starts the installation)
+  # 1. Internet: the sites the installation needs, the proxy questions only when required ones fail
+  # (stopped at its first question: as at the engine's)
+  rc=0
+  wiz_internet || rc=$?
+  if [ "$rc" -ne 0 ]; then
+    wiz_stop "I"
+    if [ "$rc" -eq 2 ] && [ ! -f "$SETUP_LATER_FILE" ] && touch -- "$SETUP_LATER_FILE" 2>/dev/null; then
+      echo "  The next start opens the menu directly."
+    fi
+    return 0
+  fi
+
+  # 2. Engine (stopped at its first question: the next start opens the menu, I starts the installation)
+  wiz_head "Install" 2 "${steps[@]}"
   rc=0
   wiz_engine || rc=$?
   if [ "$rc" -ne 0 ]; then
@@ -12944,23 +19230,23 @@ install_new() {
     return 0
   fi
 
-  # 2. Domain
+  # 3. Domain
   before="$CATALOG_DOMAIN"
-  wiz_head "Install" 2 "${steps[@]}"
+  wiz_head "Install" 3 "${steps[@]}"
   if ! wiz_domain; then
     wiz_stop "I"
     return 0
   fi
 
-  # 3. Proxy
-  wiz_head "Install" 3 "${steps[@]}"
+  # 4. Proxy
+  wiz_head "Install" 4 "${steps[@]}"
   if ! wiz_proxy "$before"; then
     wiz_stop "I"
     return 0
   fi
 
-  # 4. Versions (Enter takes the recommended ones); first the addresses the answers so far give
-  wiz_head "Install" 4 "${steps[@]}"
+  # 5. Versions (Enter takes the recommended ones); first the addresses the answers so far give
+  wiz_head "Install" 5 "${steps[@]}"
   ok "The Catalog: $(wiz_addresses)"
   echo
   if ! choose_versions; then
@@ -12968,8 +19254,8 @@ install_new() {
     return 0
   fi
 
-  # 5. Install: the summary, the time zone, the check, then the files and the start as one answer
-  wiz_head "Install" 5 "${steps[@]}"
+  # 6. Install: the summary, the time zone, the check, then the files and the start as one answer
+  wiz_head "Install" 6 "${steps[@]}"
   reload_settings
   wiz_summary
   if mongo_rseq_workaround "$MONGO_TAG"; then
@@ -12995,6 +19281,9 @@ install_new() {
     printf '%s\n' "$out"
     echo
     wiz_yes_no "Some checks failed (see above). Continue anyway?" n || ans=$?
+  fi
+  if [ "$ans" -eq 0 ]; then
+    mem_ask wizard || ans=$?
   fi
   if [ "$ans" -ne 0 ]; then
     wiz_stop "I"
@@ -13023,7 +19312,7 @@ install_new() {
     0) ;;
     3)
       info "The start goes on in the background (J shows it). When it is done, I"
-      echo "  continues with the catalog data (choice 2) - or option 20, or 17 and 19."
+      echo "  continues with the license and the data (choice 2) - or options 25 and 20."
       if [ -n "$CATALOG_DOMAIN" ] && [ "$INSTALL_NGINX_PROXY_MANAGER" = "true" ]; then
         echo "  Option 24 then sets up Nginx Proxy Manager for $CATALOG_DOMAIN."
       fi
@@ -13047,50 +19336,65 @@ install_new() {
     fi
   fi
   ui_pause_tty
-  install_finish 6 "${steps[@]}"
+  install_license 7 "${steps[@]}"
+  install_finish 8 "${steps[@]}"
 }
 
-# The last steps of the install task: the catalog data (step DATA-STEP), then the summary.
+# The last steps of the install task: the catalog data (step DATA-STEP), then the summary. The data
+# needs a valid license: without one the summary says so instead.
 # install_finish DATA-STEP STEP-NAME...
 install_finish() {
   local n="$1" choice since data="no"
   shift
-  wiz_head "Install" "$n" "$@"
-  echo "  The Catalog is empty until it gets its data from $CATALOG_CLOUD_URL."
-  echo
-  printf '   %s %s  %s\n' "${C_BLD}1$C_RST" "$(menu_icon run)" "Daily self-sync: the Catalog fetches the data itself $C_DIM(server with internet, option 20)$C_RST"
-  printf '   %s %s  %s\n' "${C_BLD}2$C_RST" "$(menu_icon run)" "Download the snapshots here and import them $C_DIM(options 17 and 19)$C_RST"
-  printf '   %s    %s\n' "${C_BLD}0$C_RST" "${C_DIM}later$C_RST"
-  echo
-  ui_ask choice "Select [0]:" || choice="0"
-  # what really happened is read afterwards: a mark of the self-sync, and the jobs started meanwhile
-  since="$(wiz_last_job)"
-  WIZ_MARK="$(mktemp)"
-  case "$choice" in
-    1) wiz_run local_self_sync || true ;;
-    2) wiz_run install_snapshots || true ;;
+  license_status
+  case "$LICENSE_STATE" in
+    valid) ;;
+    invalid) data="unlicensed" ;;
+    *) data="noweb" ;;
   esac
-  if grep -qx sync "$WIZ_MARK" 2>/dev/null; then
-    data="sync"
+  if [ "$data" = "no" ]; then
+    wiz_head "Install" "$n" "$@"
+    ok "The Catalog is activated (valid license)."
+    echo "  The Catalog is empty until it gets its data from $CATALOG_CLOUD_URL."
+    echo
+    printf '   %s %s  %s\n' "${C_BLD}1$C_RST" "$(menu_icon run)" "Daily self-sync: the Catalog fetches the data itself $C_DIM(server with internet, option 20)$C_RST"
+    printf '   %s %s  %s\n' "${C_BLD}2$C_RST" "$(menu_icon run)" "Download the snapshots here and import them $C_DIM(options 17 and 19)$C_RST"
+    printf '   %s    %s\n' "${C_BLD}0$C_RST" "${C_DIM}later$C_RST"
+    echo
+    ui_ask choice "Select [0]:" || choice="0"
+    # what really happened is read afterwards: a mark of the self-sync, and the jobs started meanwhile
+    since="$(wiz_last_job)"
+    WIZ_MARK="$(mktemp)"
+    case "$choice" in
+      1) wiz_run local_self_sync || true ;;
+      2) wiz_run install_snapshots || true ;;
+    esac
+    if grep -qx sync "$WIZ_MARK" 2>/dev/null; then
+      data="sync"
+    fi
+    rm -f -- "$WIZ_MARK"
+    WIZ_MARK=""
+    case "$(wiz_job_since "$since" "Snapshot import")" in
+      done) data="snapshot" ;;
+      # unfollowed: the import goes on in the Catalog
+      running|unfollowed) data="importing" ;;
+      "")
+        case "$(wiz_job_since "$since" "Snapshot download")" in
+          done) data="downloaded" ;;
+          running) data="downloading" ;;
+        esac
+        ;;
+    esac
+    ui_pause_tty
   fi
-  rm -f -- "$WIZ_MARK"
-  WIZ_MARK=""
-  case "$(wiz_job_since "$since" "Snapshot import")" in
-    done) data="snapshot" ;;
-    running) data="importing" ;;
-    "")
-      case "$(wiz_job_since "$since" "Snapshot download")" in
-        done) data="downloaded" ;;
-        running) data="downloading" ;;
-      esac
-      ;;
-  esac
-  ui_pause_tty
 
   wiz_head "Install" $((n + 1)) "$@"
   ok "The Catalog is installed: $(stack_state)."
   echo
   show_access_info
+  echo
+  echo "  Catalog Web login: root (default password root unless it was changed) -"
+  echo "  change it in the web interface."
   echo
   case "$data" in
     sync)
@@ -13101,6 +19405,15 @@ install_finish() {
     importing) echo "  Catalog data: the import runs in the background (J shows it)." ;;
     downloaded) warn "Catalog data: downloaded, not imported yet - option 19 imports it." ;;
     downloading) echo "  Catalog data: downloading in the background (J); option 19 imports it then." ;;
+    unlicensed)
+      warn "The Catalog has no data yet: it is not activated (no valid license)."
+      echo "  Option 25 activates the Catalog, then options 20 / 17 and 19 load the data."
+      ;;
+    noweb)
+      warn "The Catalog has no data yet: Catalog Web did not answer the license check."
+      echo "  Option 9 shows the stack; then option 25 activates the Catalog, and options"
+      echo "  20 / 17 and 19 load the data."
+      ;;
     *) warn "The Catalog has no data yet: option 20 (daily self-sync), or 17 and 19." ;;
   esac
   echo "  Options: 14 passwords $UI_SEP 15 addresses $UI_SEP 24 domain and HTTPS $UI_SEP 9 status"
@@ -13479,7 +19792,7 @@ remove_files() {
   local -a list=()
   case "$1" in
     files) list=("$WORK_DIR/$ENV_FILE" "$WORK_DIR/$COMPOSE_FILE" "$WORK_DIR/$ENV_FILE".bak-* "$WORK_DIR/$COMPOSE_FILE".bak-*) ;;
-    jobs) list=("$JOBS_DIR" "$API_KEY_FILE" "$LOCAL_KEY_FILE" "$TZ_KEEP_FILE" "$UPGRADE_FAILED_FILE" "$NPM_CERT_FILE" "$NPM_LOGIN_FILE" "$SETUP_LATER_FILE") ;;
+    jobs) list=("$JOBS_DIR" "$API_KEY_FILE" "$LOCAL_KEY_FILE" "$TZ_KEEP_FILE" "$UPGRADE_FAILED_FILE" "$NPM_CERT_FILE" "$NPM_LOGIN_FILE" "$SETUP_LATER_FILE" "$PROXY_LOGIN_FILE" "$PROXY_CA_COPY" "$PROXY_CA_BUNDLE") ;;
     snapshots) list=("$WORK_DIR"/snapshots/*.tar.gz "$WORK_DIR"/snapshots/*.tar.gz.part "$WORK_DIR"/snapshots/chain-*.tsv "$WORK_DIR"/snapshots/plan-*.tsv) ;;
     backups) list=("$WORK_DIR"/backups/mongo-*.archive.gz) ;;
     bundles) list=("$WORK_DIR"/RN1-Technology-Catalog-*) ;;
@@ -13696,6 +20009,10 @@ remove_wizard() {
   if [ -n "$(remove_files installer)" ]; then
     keys+=(installer); labels+=("This installer ($SCRIPT_NAME)"); picked+=(0)
   fi
+  # only when no other installation on this server needs them
+  if net_proxy_files && [ -z "$(find_installations 2>/dev/null)" ]; then
+    keys+=(proxy); labels+=("The internet proxy of the engine, the company certificate in the trust store"); picked+=(1)
+  fi
   while true; do
     wiz_head "Remove" 2 "${steps[@]}"
     if [ "$ncont" -gt 0 ]; then
@@ -13790,6 +20107,14 @@ remove_wizard() {
     case "${keys[i]}" in
       volumes|images) continue ;;
       installer) self_gone="yes" ;;
+      proxy)
+        if net_proxy_cleanup; then
+          removed="$removed engine-proxy"
+        else
+          failed+=("the internet proxy of the engine")
+        fi
+        continue
+        ;;
     esac
     while IFS= read -r f; do
       if [ -z "$f" ]; then
@@ -14027,14 +20352,15 @@ ${c}THE ICONS$r
   $(menu_icon del)  delete    removes data - you are asked to type DELETE first
 
 ${c}START HERE - GUIDED TASKS$r
-$(help_item I run "Install" "New installation, step by step: engine, domain name, Nginx Proxy Manager," "versions, then start and catalog data. Runs by itself on the first start.")
+$(help_item I run "Install" "New installation, step by step: internet, engine, domain name, Nginx Proxy Manager," "versions, then start and catalog data. Runs by itself on the first start.")
 $(help_item U run "Update" "This installer first, then the Catalog: backup, new version, health" "check, patch updates of MongoDB, OpenSearch, RabbitMQ and the others.")
 $(help_item R del "Remove" "Removes the Catalog from this server: you choose data, images, files," "snapshots, backups, the installer; then type DELETE.")
 
 ${c}SETUP $UI_SEP install on this host$r
 $(help_item 7 run "Install in one go" "Generates .env and docker-compose.yml, validates them and starts the stack" "in one go; asks only about existing passwords and the time zone (I guides).")
-$(help_item 16 view "Check this server" "$ENGINE_NAME, $ENGINE compose, kernel, ports, vm.max_map_count, time zone.")
+$(help_item 16 view "Check this server" "$ENGINE_NAME, $ENGINE compose, kernel, ports, vm.max_map_count, time zone, internet.")
 $(help_item 23 run "Take over installation" "Takes the settings of an existing installation (another folder, an older" "installer here, or the versions that run here and their .env); data stays.")
+$(help_item 26 run "Internet access" "Checks the sites the installation needs (Docker Hub, GitHub, Raynet ...)," "sets the proxy and the company certificate for the engine and the Catalog.")
 
 ${c}CONFIGURE $UI_SEP edit settings, 2 writes the files, 6 applies them$r
 $(help_item 1 edit "Edit settings" "All settings on one screen, grouped by name (CATALOG_*, MINIO_*," "*_TAG ...); checked before they are saved. E opens them in $(editor_short).")
@@ -14047,6 +20373,7 @@ ${c}ACCESS $UI_SEP addresses and logins$r
 $(help_item 14 view "User names + passwords" "User names and passwords of MongoDB, MinIO, RabbitMQ and Nginx Proxy" "Manager from .env.")
 $(help_item 15 view "URLs and proxy setup" "Where Catalog Web and the other services answer, the login of Nginx" "Proxy Manager, and in short how to set up its proxy host by hand.")
 $(help_item 24 run "Domain and HTTPS" "The domain name of the Catalog. With Nginx Proxy Manager it also sets up" "the proxy host and a Let's Encrypt certificate, through its API.")
+$(help_item 25 run "License / activation" "Shows the license and activates the Catalog (without one it takes no data):" "by order number (needs internet), license file or e-mail; root logs in.")
 
 ${c}START & STOP $UI_SEP the containers$r
 $(help_item 6 run "Start / apply changes" "$ENGINE compose up -d: starts the stack or applies changed files.")
@@ -14125,6 +20452,8 @@ menu_dispatch() {
     22) update_installer || true ;;
     23) adopt_installation || true ;;
     24) run_action domain_menu ;;
+    25) run_action license_activate ;;
+    26) run_action net_menu ;;
     99) run_action menu_reset ;;
     j|J) run_action jobs_menu ;;
     i|I) install_wizard ;;
@@ -14146,6 +20475,7 @@ menu_items() {
 1|7|run|Install in one go|writes files, checks, starts|Generates both files, validates, starts
 1|16|view|Check this server|$ENGINE_NAME, ports, kernel, TZ|Checks $ENGINE_NAME, Compose, kernel, ports, TZ
 1|23|run|Take over installation|keeps its passwords and data|Takes over an installation (copies its files)
+1|26|run|Internet access|sites, proxy, certificate|Checks the sites; sets proxy and certificate
 1|||
 1|-||CONFIGURE|settings and files|edit settings - 2 writes the files, 6 applies
 1|1|edit|Edit settings|version, ports, proxy, TZ|All settings on one screen; 2 writes the files
@@ -14154,10 +20484,11 @@ menu_items() {
 1|4|edit|Edit docker-compose.yml|by hand; 2 overwrites it|Opens docker-compose.yml in the editor
 1|5|view|Check the files|$ENGINE compose config|Lets $ENGINE compose check both files
 1|||
-1|-||ACCESS|addresses and logins|where to sign in, logins, domain and HTTPS
+1|-||ACCESS|addresses and logins|where to sign in, logins, domain, license
 1|14|view|User names + passwords|MongoDB, MinIO, RabbitMQ, NPM|Logins of MongoDB, MinIO, RabbitMQ and NPM
 1|15|view|URLs and proxy setup|addresses, NPM login|Addresses of all services, the NPM login
 1|24|run|Domain and HTTPS|domain, proxy, Let's Encrypt|Sets the domain, proxy host and certificate
+1|25|run|License / activation|order number, file, e-mail|Shows the license, activates the Catalog
 2|-||START & STOP|the containers|all containers of this stack
 2|6|run|Start / apply changes|starts, or applies new files|$ENGINE compose up -d: starts or applies
 2|12|run|Restart the stack|all containers, data kept|Restarts all containers; data is kept
@@ -14249,7 +20580,7 @@ tui_cell() {
 tui_draw() {
   reload_settings
   menu_scan
-  local tz_note sib cols="$1" rows="${2:-40}" line col key kind label desc what i n col_w found head2 head3 version state need cards keys cur inote dnote
+  local tz_note sib cols="$1" rows="${2:-40}" line col key kind label desc what i n col_w found head2 head3 version state need cards keys cur inote dnote logo
   local -a c1=() c2=() c3=()
   version="$(version_label)"
   cur="$(installed_catalog)"
@@ -14274,13 +20605,20 @@ tui_draw() {
     *" exist"*) head3="$head3 $UI_SEP $state" ;;
     *) head3="$head3 $UI_SEP stack $state" ;;
   esac
-  local notes=()
+  local notes=() nh
   if [ ! -f "$ENV_FILE" ]; then
     found="$(first_installation_dir)"
     if [ -n "$found" ]; then
       notes+=("$C_YLW$UI_ARROW An installation exists in $found - option 23 takes it over$C_RST")
     fi
   fi
+  # the internet check of the menu start, once it is done (tui_menu draws again then)
+  nh="$(net_header)"
+  case "$nh" in
+    "") ;;
+    "Internet: "*) notes+=("$C_YLW$UI_ARROW $nh$C_RST") ;;
+    *) head2="$head2   $C_GRN$nh$C_RST" ;;
+  esac
   if [ -f "$UPGRADE_FAILED_FILE" ]; then
     notes+=("$C_YLW$UI_ARROW The last upgrade did not become healthy - option 21 can go back$C_RST")
   fi
@@ -14333,12 +20671,21 @@ tui_draw() {
   need=$((4 + ${#notes[@]} + 1 + 4 + 1 + n + 3 + (${#TUI_NOTICE} > 0 ? 1 : 0)))
   cards=4
   TUI_COMPACT="no"
+  # the logo and a blank line above it all only when the full menu still fits below them
+  logo="no"
+  if [ "$cols" -ge 80 ] && [ $((need + ${#UI_LOGO[@]} + 1)) -le $((rows - 10)) ]; then
+    logo="yes"
+  fi
   if [ "$need" -gt $((rows - 10)) ]; then
     TUI_COMPACT="yes"
     need=$((need - 3))
   fi
   if [ "$need" -gt $((rows - 10)) ]; then
     cards=1
+  fi
+  if [ "$logo" = "yes" ]; then
+    ui_logo "$cols"
+    echo
   fi
   ui_box "$cols" "RAYNET ONE TECHNOLOGY CATALOG $UI_SEP Installation Portal" "$head2" "$head3" ${notes[@]+"${notes[@]}"}
   echo
@@ -14475,6 +20822,12 @@ tui_menu() {
       tui_draw_box "$cols" "$rows"
       last_box="$now"
       held=0
+      if net_background_done; then
+        redraw=1
+        continue
+      fi
+      # a menu left open: the check again once its result is older than NET_CACHE_TTL
+      net_background_start
     fi
     if [ "$buf" != "$hint_for" ]; then
       tui_draw_hint "$cols" "$rows" "$buf"
@@ -14562,7 +20915,7 @@ tui_run() {
 }
 
 menu() {
-  local choice note notice="${RVC_NOTICE:-}" resume="${1:-}"
+  local choice note below notice="${RVC_NOTICE:-}" resume="${1:-}"
   INTERACTIVE="true"
   TUI_NOTICE="$notice"
   unset RVC_NOTICE
@@ -14588,6 +20941,8 @@ menu() {
     echo
     pause
   fi
+  # the internet check runs in the background; the header shows it when it is done
+  net_background_start
 
   if [ -n "${RVC_HUB_STATUS:-}" ]; then
     HUB_STATUS="$RVC_HUB_STATUS"
@@ -14618,8 +20973,17 @@ menu() {
   fi
 
   while true; do
+    net_background_start
     clear_screen
-    show_menu
+    # below the menu: the notices, the running processes, the keys and the prompt
+    below=$((2 + (${#notice} > 0 ? 2 : 0) + (${#TUI_NOTICE} > 0 ? 2 : 0)))
+    if [ -n "$SCRIPT_PATH" ]; then
+      choice="$(job_running_ids)"
+      if [ -n "$choice" ]; then
+        below=$((below + 2 + $(count_lines "$choice")))
+      fi
+    fi
+    show_menu "$below"
     if [ -n "$notice" ]; then
       ok "$notice"
       echo
@@ -14683,7 +21047,14 @@ Commands:
   info                        Show URLs and the Nginx Proxy Manager login
   domain [NAME|-]             Domain name and HTTPS: saves it (- removes it), applies it, sets up the
                               proxy host and a Let's Encrypt certificate in Nginx Proxy Manager
+  license [status|file PATH|order|text]
+                              The license of the Catalog: status (no login), or activation by the
+                              license file, the order number (needs internet) or the license text of
+                              Raynet's e-mail (a site administrator logs in); without one: as option 25
   check                       Check prerequisites ($ENGINE_NAME, $ENGINE compose, ports, vm.max_map_count, Docker Hub)
+  network-check               Check the sites the installation needs, directly or through INTERNET_PROXY;
+                              exit code 0 when every required one answers (no questions; option 26 asks)
+  network-hosts               The sites (host:port) the installation needs, for a firewall request
   timezone                    Use the time zone of this server for TZ (the job times are converted)
   updates                     Show available updates for all components
   upgrade                     Guided upgrade (asks first, then runs as a background job)
@@ -14709,8 +21080,12 @@ main() {
   fi
   cd -- "$WORK_DIR"
   case "$cmd" in
-    check-settings|__cron_convert|__settings_groups) ;;
-    *) resolve_engine ;;
+    check-settings|__cron_convert|__settings_groups|__server_hostname) ;;
+    *)
+      # the proxy of the settings for every download of this run (and the programs it starts)
+      proxy_load
+      resolve_engine
+      ;;
   esac
 
   case "$cmd" in
@@ -14736,7 +21111,15 @@ main() {
       ;;
     validate|config) do_validate ;;
     up|start) do_up ;;
-    setup|install) engine_guard; do_generate keep no-next; echo; do_up ;;
+    setup|install)
+      engine_guard
+      downgrade_guard settings
+      if ! mem_ask confirm; then
+        info "Cancelled."
+        return 0
+      fi
+      do_generate keep no-next; echo; do_up
+      ;;
     status|ps) do_status ;;
     logs) do_logs "${1:-}" ;;
     pull) do_pull ;;
@@ -14745,7 +21128,11 @@ main() {
     credentials|creds) show_credentials ;;
     info|urls) show_access_info ;;
     domain) domain_menu "${1:-}" ;;
+    license) license_cli "$@" ;;
     check) do_check ;;
+    network-check) net_cli_check ;;
+    network-hosts) net_hosts_text ;;
+    __net) net_test_hook "$@" ;;
     timezone|tz) timezone_cli ;;
     install-podman) engine_cli_setup podman ;;
     install-docker) engine_cli_setup docker ;;
@@ -14761,6 +21148,7 @@ main() {
     __wiz_engine_pick) wiz_engine_pick "$(engine_choices)" "${1:-}"; echo ;;
     __choose_versions) choose_versions ;;
     __domain_normalize) domain_normalize "${1:-}"; echo ;;
+    __server_hostname) server_hostname; echo ;;
     __domain_checks) domain_checks "${1:-}"; echo "DOMAIN_DNS=$DOMAIN_DNS" ;;
     updates) show_updates_cli ;;
     upgrade) INTERACTIVE="true"; do_upgrade ;;
@@ -14795,7 +21183,7 @@ main() {
       esac
       ;;
     import-chain) import_chain "${1:-$(ls -1t -- "$WORK_DIR"/snapshots/chain-*.tsv 2>/dev/null | head -n 1)}" cli ;;
-    import) import_snapshot "${1:-}" cli ;;
+    import) import_snapshot "${1:-}" cli || exit $? ;;
     versions) list_versions ;;
     set-version) set_version_cli "${1:-}" ;;
     check-settings) check_settings ;;  # used by menu option 1 after editing

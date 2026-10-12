@@ -13,3 +13,6 @@ backups/
 .domain-certificate
 .npm-login
 .setup-later
+.proxy_login
+proxy-ca.pem
+proxy-ca-bundle.pem

@@ -8,6 +8,8 @@ rm -rf "$T"; mkdir -p "$T/bin" "$T/oldroot" "$T/rn1-technology-catalog"
 sed 's/^CONTAINER_ENGINE=""$/CONTAINER_ENGINE="podman"/' "$1" > "${T%/*}/podman-installer.sh"; NEW="${T%/*}/podman-installer.sh"
 PASS=0; FAIL=0
 check() { if eval "$2"; then PASS=$((PASS+1)); echo "PASS: $1"; else FAIL=$((FAIL+1)); echo "FAIL: $1"; fi; }
+# the internet check (menu start, new installation, option 16, engine setup) has its own suite (run_network_tests)
+export RN1_NET_CHECK=off
 export LOG="$T/podman.log" UNHANDLED="$T/unhandled.log" OLD="$T/oldroot"
 : > "$LOG"; : > "$UNHANDLED"
 
@@ -44,6 +46,7 @@ render() {
   sub '{{.State.Status}}' running
   sub '{{with .State.Health}}{{or .Status "none"}}{{else}}none{{end}}' none
   sub '{{.RestartCount}}' 0
+  sub '{{.State.OOMKilled}}' false
   sub '{{.Name}}' catalog-web
   case "$t" in *'{{'*) unhandled ;; esac
   printf '%s\n' "$t"
@@ -55,6 +58,7 @@ case "${1:-}" in
     [ "$2" = --format ] && [ $# -eq 3 ] || unhandled
     case "$3" in
       '{{.Host.Security.Rootless}}') echo false ;;
+      '{{.Host.MemTotal}}') echo 34359738368 ;;
       *) unhandled ;;
     esac ;;
   ps)

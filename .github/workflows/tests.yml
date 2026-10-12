@@ -44,6 +44,12 @@ jobs:
         run: bash tests/run_versions_tests.sh "$PWD/rn1-technology-catalog-installer.sh"
       - name: Domain, Nginx Proxy Manager and Let's Encrypt
         run: bash tests/run_domain_tests.sh "$PWD/rn1-technology-catalog-installer.sh"
+      - name: License, activation and the host name of catalog-web
+        run: bash tests/run_license_tests.sh "$PWD/rn1-technology-catalog-installer.sh"
+      - name: Memory of the engine, the cache of MongoDB and out-of-memory stops
+        run: bash tests/run_memory_tests.sh "$PWD/rn1-technology-catalog-installer.sh"
+      - name: Internet access, the proxy questions and the proxy of the package managers
+        run: bash tests/run_network_tests.sh "$PWD/rn1-technology-catalog-installer.sh"
 
   distributions:
     name: ${{ matrix.name }}
@@ -194,6 +200,104 @@ jobs:
           free -m; df -h /
           sudo docker compose --env-file .env -f docker-compose.yml logs --tail=80 || true
           journalctl -u docker --no-pager | tail -n 50 || true
+
+  e2e-proxy:
+    name: Catalog through a proxy with a login (Podman, ubuntu-24.04)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - name: Room and settings for the stack (disk, vm.max_map_count, no Docker)
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/share/boost
+          sudo sysctl -w vm.max_map_count=262144
+          sudo systemctl disable --now docker.service docker.socket || true
+      - name: squid with a Basic login - the only way out for root and apt (HTTP and HTTPS)
+        run: |
+          sudo apt-get update -qq
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq squid >/dev/null
+          pw="$(openssl rand -hex 16)"
+          echo "::add-mask::$pw"
+          echo "PROXY_PW=$pw" >> "$GITHUB_ENV"
+          printf 'ci:%s\n' "$(openssl passwd -apr1 "$pw")" | sudo tee /etc/squid/passwd >/dev/null
+          sudo chown root:proxy /etc/squid/passwd
+          sudo chmod 640 /etc/squid/passwd
+          sudo tee /etc/squid/squid.conf >/dev/null <<'EOF'
+          auth_param basic program /usr/lib/squid/basic_ncsa_auth /etc/squid/passwd
+          auth_param basic realm rn1-ci
+          acl authed proxy_auth REQUIRED
+          acl SSL_ports port 443
+          acl Safe_ports port 80 443
+          acl CONNECT method CONNECT
+          http_access deny !Safe_ports
+          http_access deny CONNECT !SSL_ports
+          http_access allow authed
+          http_access deny all
+          http_port 3128
+          visible_hostname rn1-ci
+          cache deny all
+          access_log daemon:/var/log/squid/access.log squid
+          EOF
+          sudo systemctl restart squid
+          # the runner itself (its own user) keeps talking to GitHub; root and apt's _apt may only use squid
+          for t in iptables ip6tables; do
+            for u in root _apt; do
+              sudo "$t" -A OUTPUT -p tcp -m multiport --dports 80,443 -m owner --uid-owner "$u" -j REJECT
+            done
+          done
+          if sudo curl -sS --noproxy '*' --max-time 10 -o /dev/null https://registry-1.docker.io/v2/; then
+            echo "root still goes out directly"; exit 1
+          fi
+      - name: Installer in its own folder - INTERNET_PROXY and its login (.proxy_login, mode 600)
+        run: |
+          mkdir -p "$RUNNER_TEMP/rn1"
+          cp rn1-technology-catalog-installer.sh "$RUNNER_TEMP/rn1/"
+          ip="$(hostname -I | awk '{print $1}')"
+          sed -i "s/^CHECK_FOR_UPDATES=.*/CHECK_FOR_UPDATES=\"false\"/; s/^CONTAINER_ENGINE=.*/CONTAINER_ENGINE=\"podman\"/; s|^INTERNET_PROXY=.*|INTERNET_PROXY=\"http://$ip:3128\"|" "$RUNNER_TEMP/rn1/rn1-technology-catalog-installer.sh"
+          (umask 077 && printf 'ci:%s\n' "$PROXY_PW" > "$RUNNER_TEMP/rn1/.proxy_login")
+      - name: network-check through the proxy (no questions, exit 0)
+        run: sudo bash "$RUNNER_TEMP/rn1/rn1-technology-catalog-installer.sh" network-check
+      - name: install-podman through the proxy (packages, Docker Compose, the drop-in of podman.service)
+        run: |
+          sudo bash "$RUNNER_TEMP/rn1/rn1-technology-catalog-installer.sh" install-podman
+          [ "$(sudo stat -c %a /etc/rn1-technology-catalog/engine-proxy.env)" = 600 ]
+          systemctl show podman.service -p EnvironmentFiles | grep -q /etc/rn1-technology-catalog/engine-proxy.env
+          grep -q '^http_proxy = false$' /etc/containers/containers.conf.d/50-rn1-proxy.conf
+          if sudo grep -rqF "$PROXY_PW" /etc/apt /etc/environment /var/log/apt /etc/systemd/system/podman.service.d; then
+            echo "the proxy password is in a configuration or log file"; exit 1
+          fi
+      - name: setup through the proxy (generate, pull, start)
+        run: cd "$RUNNER_TEMP/rn1" && sudo bash rn1-technology-catalog-installer.sh setup </dev/null
+      - name: The pulls went through squid with the login; only catalog-web and Nginx Proxy Manager have the proxy (the others have it empty)
+        run: |
+          sudo awk '{ print $6, $7, $8 }' /var/log/squid/access.log | sort | uniq -c | sort -rn | head -n 30
+          sudo grep -q 'CONNECT registry-1.docker.io:443 ci ' /var/log/squid/access.log
+          sudo grep -q 'CONNECT ghcr.io:443 ci ' /var/log/squid/access.log
+          n=0
+          for c in $(sudo podman ps -aq --filter label=com.docker.compose.project=rn1); do
+            svc="$(sudo podman container inspect --format '{{index .Config.Labels "com.docker.compose.service"}}' "$c")"
+            env="$(sudo podman container inspect --format '{{range .Config.Env}}{{println .}}{{end}}' "$c")"
+            case "$svc" in
+              catalog-web|nginx-proxy-manager)
+                grep -q '^HTTPS_PROXY=http://ci:' <<< "$env" || { echo "$svc has no proxy"; exit 1; }
+                grep -qx 'HTTP_PROXY=' <<< "$env" || { echo "$svc has an HTTP proxy"; exit 1; }
+                n=$((n + 1))
+                ;;
+              *)
+                if grep -qiE '_proxy=.+' <<< "$env"; then echo "$svc has a proxy"; exit 1; fi
+                ;;
+            esac
+          done
+          [ "$n" -eq 2 ]
+      - name: Diagnostics
+        if: failure() || cancelled()
+        run: |
+          sudo tail -n 60 /var/log/squid/access.log || true
+          sudo podman ps -a || true
+          journalctl -u podman.service --no-pager | tail -n 50 || true
+          sudo iptables -S OUTPUT || true
 
   macos:
     name: macOS (Apple Silicon)

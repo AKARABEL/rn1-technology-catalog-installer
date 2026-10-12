@@ -11,6 +11,8 @@ rm -rf "$T"; mkdir -p "$T/bin" "$T/srv/daily" "$T/srv/full"
 sed 's/^CONTAINER_ENGINE=""$/CONTAINER_ENGINE="podman"/' "$1" > "${T%/*}/podman-installer.sh"; NEW="${T%/*}/podman-installer.sh"
 PASS=0; FAIL=0
 check() { if eval "$2"; then PASS=$((PASS+1)); echo "PASS: $1"; else FAIL=$((FAIL+1)); echo "FAIL: $1"; fi; }
+# the internet check (menu start, new installation, option 16, engine setup) has its own suite (run_network_tests)
+export RN1_NET_CHECK=off
 wait_for() { local i; for i in $(seq 1 "${2:-150}"); do eval "$1" && return 0; sleep 0.2; done; return 1; }
 export LOG="$T/curl.log" SRV="$T/srv"
 : > "$LOG"
@@ -140,6 +142,26 @@ if command -v script >/dev/null 2>&1; then
 else
   bash "$D/rn1-technology-catalog-installer.sh" jobs cancel 3 >/dev/null 2>&1; wait "$mp"
   echo "SKIP: script (util-linux) missing - no full screen test"
+fi
+
+# 6. A job that stopped following a task that goes on elsewhere (an import in the Catalog) ends without a
+# result - only with the mark of job_unfollowed: any other exit code 4 is a failure
+for id in 60 61; do
+  mkdir -p "$D/.jobs/$id"; echo "Snapshot import (x-$id.tar.gz)" > "$D/.jobs/$id/title"; echo running > "$D/.jobs/$id/state"
+  date '+%Y-%m-%d %H:%M:%S' > "$D/.jobs/$id/started"
+done
+: > "$D/.jobs/61/unfollowed"
+bash "$D/rn1-technology-catalog-installer.sh" __job 60 bash -c 'exit 4' > "$D/.jobs/60/log" 2>&1
+bash "$D/rn1-technology-catalog-installer.sh" __job 61 bash -c 'exit 4' > "$D/.jobs/61/log" 2>&1
+check "exit code 4 alone is a failure; with the mark of job_unfollowed the job ends without a result" '[ "$(state 60)" = failed ] && [ "$(state 61)" = unfollowed ]'
+out="$(bash "$D/rn1-technology-catalog-installer.sh" jobs list 2>&1)"
+check "jobs list shows the job without a result" 'grep -Eq "^ +61 +unfollowed " <<< "$out" && grep -Eq "^ +60 +failed " <<< "$out"'
+rm -f "$D/.jobs/61/seen"
+if command -v script >/dev/null 2>&1; then
+  # no job runs now: without the mark of a put off first start the menu would begin with the new installation
+  : > "$D/.setup-later"
+  out="$( { sleep 3; printf q; } | TERM=xterm LANG=C.UTF-8 timeout 60 script -qfec "stty cols 120 rows 40; bash $D/rn1-technology-catalog-installer.sh menu" /dev/null 2>&1 | sed 's/\x1b[[(][0-9;?]*[A-Za-z]//g; s/\x1b[78]//g')"
+  check "menu box: the job without a result as such, not as failed" 'grep -q "#61 Snapshot import (x-61.tar.gz)" <<< "$out" && grep -q "result unknown" <<< "$out" && ! grep -q "unfollowed" <<< "$out"'
 fi
 
 echo "== $PASS passed, $FAIL failed"

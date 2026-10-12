@@ -7,6 +7,8 @@ rm -rf "$T"; mkdir -p "$T/bin" "$T/d" "$T/home"
 unset XDG_CONFIG_HOME COLIMA_HOME
 PASS=0; FAIL=0
 check() { if eval "$2"; then PASS=$((PASS+1)); echo "PASS: $1"; else FAIL=$((FAIL+1)); echo "FAIL: $1"; fi; }
+# the internet check (menu start, new installation, option 16, engine setup) has its own suite (run_network_tests)
+export RN1_NET_CHECK=off
 
 # what this machine is: the package manager and the distribution family
 PM=""
@@ -55,6 +57,7 @@ case "$1" in
     case "$*" in
       *Rootless*) echo "${SHIM_ROOTLESS:-false}" ;;
       *Kernel*) echo "${SHIM_VM_KERNEL:-6.12.5-200.fc41.aarch64}" ;;
+      *MemTotal*) echo "${SHIM_MEMTOTAL:-34359738368}" ;;
     esac ;;
   compose)
     shift
@@ -133,6 +136,7 @@ case "$*" in
   info) echo "Server: Docker Engine - Community" ;;
   "info --format {{range .SecurityOptions}}{{.}} {{end}}") echo "name=seccomp,profile=builtin name=cgroupns " ;;
   "info --format {{.KernelVersion}}") echo "${SHIM_VM_KERNEL:-6.12.5-linuxkit}" ;;
+  "info --format {{.MemTotal}}") echo "${SHIM_MEMTOTAL:-34359738368}" ;;
   "ps -aq --filter label=com.docker.compose.project="*|"volume ls -q --filter label=com.docker.compose.project="*)
     v="SHIM_DATA_${ctx//-/_}"
     a="$*"; if [ -n "${!v:-}" ] && [ "${a##*=}" = "${!v}" ]; then echo 0123456789ab; fi ;;
@@ -196,7 +200,7 @@ cat > "$T/bin/sysctl" <<'EOF'
 #!/usr/bin/env bash
 case "$*" in
   *hw.optional.arm64*) echo "${SHIM_ARM:-1}" ;;
-  *hw.memsize*) echo 34359738368 ;;
+  *hw.memsize*) echo "${SHIM_MEMSIZE:-34359738368}" ;;
   *hw.ncpu*) echo 10 ;;
   *) exec /sbin/sysctl "$@" ;;
 esac
@@ -395,6 +399,16 @@ else
   fi
   out="$(drun check)"
   check "check after install-docker: Docker, its daemon and Compose OK" 'grep -q "OK Docker 29.9.0" <<< "$out" && grep -q "The Docker daemon answers and runs rootful" <<< "$out" && grep -q "Compose: docker compose with Docker Compose version" <<< "$out"'
+  # with an internet proxy (Docker's repository): the drop-in of docker.service and its env file before the
+  # packages - Debian's package starts dockerd at once
+  if [ "$PM" = apt-get ] || [ "$PM" = dnf ]; then
+    reset_docker
+    sed -i 's|^INTERNET_PROXY=.*|INTERNET_PROXY="http://proxy.example.com:8080"|' "$DI"
+    out="$(SHIM_UID=1000 RN1_ETC_DIR="$T/etcp" RN1_RUN_DIR="$T/runp" drun install-docker)"; rc=$?
+    sed -i 's|^INTERNET_PROXY=.*|INTERNET_PROXY=""|' "$DI"
+    check "install-docker with a proxy: the env file and the drop-in of docker.service are written before the packages ($ID $VER)" '[ "$rc" -eq 0 ] && e="$(grep -n "sh $T/etcp/rn1-technology-catalog/engine-proxy.env 600$" "$SUDO_LOG" | head -n 1 | cut -d: -f1)" && w="$(grep -n "sh $T/etcp/systemd/system/docker.service.d/50-rn1-proxy.conf 644$" "$SUDO_LOG" | head -n 1 | cut -d: -f1)" && p="$(grep -nF -- "$DPLAN2" "$SUDO_LOG" | head -n 1 | cut -d: -f1)" && [ -n "$e" ] && [ -n "$w" ] && [ -n "$p" ] && [ "$e" -lt "$p" ] && [ "$w" -lt "$p" ] && grep -q "Docker gets the internet proxy before these steps" <<< "$out"'
+    check "install-docker with a proxy: each step reads the proxy of the run, the units are reloaded before the daemon starts" '[ "$(grep -cF -- "$DPLAN2" "$SUDO_LOG")" -ge 1 ] && grep -F -- "$DPLAN2" "$SUDO_LOG" | grep -q "^sudo sh -c \. $T/runp/rn1-proxy\.[0-9]*\.env; " && [ "$(grep -n "systemctl daemon-reload$" "$SUDO_LOG" | head -n 1 | cut -d: -f1)" -lt "$(grep -n "systemctl enable --now docker$" "$SUDO_LOG" | head -n 1 | cut -d: -f1)" ]'
+  fi
 fi
 reset_docker
 out="$(SHIM_ARCH=aarch64 drun check)"
@@ -420,7 +434,7 @@ check "macOS without Homebrew: says where to get it" '[ "$rc" -ne 0 ] && grep -q
 cp "$T/inst/brew" "$T/bin/brew"
 out="$(SHIM_OS=Darwin PROVIDER= run install-podman)"; rc=$?
 check "macOS: Homebrew installs podman and the GNU tools" '[ "$rc" -eq 0 ] && grep -q "^brew install podman coreutils gnu-sed grep findutils$" "$LOG"'
-check "macOS: a rootful machine with Rosetta and enough memory" 'grep -q "^podman machine init --rootful --cpus 6 --memory 12288 --disk-size 100 --now$" "$LOG" && grep -q "rosetta = true" "$T/home/.config/containers/containers.conf.d/50-rn1-machine.conf" && grep -q "provider = \"applehv\"" "$T/home/.config/containers/containers.conf.d/50-rn1-machine.conf"'
+check "macOS: a rootful machine with Rosetta and 24 GB (the Mac has 32)" 'grep -q "^podman machine init --rootful --cpus 6 --memory 24576 --disk-size 100 --now$" "$LOG" && grep -q "rosetta = true" "$T/home/.config/containers/containers.conf.d/50-rn1-machine.conf" && grep -q "provider = \"applehv\"" "$T/home/.config/containers/containers.conf.d/50-rn1-machine.conf"'
 check "macOS: restart service in the machine, LaunchAgent starts the machine at login" 'grep -q "podman machine ssh podman-machine-default sudo systemctl enable podman-restart.service" "$LOG" && grep -q "<string>machine</string><string>start</string><string>podman-machine-default</string>" "$T/home/Library/LaunchAgents/de.raynet.rn1-podman-machine.plist" && grep -q "<key>AbandonProcessGroup</key><true/>" "$T/home/Library/LaunchAgents/de.raynet.rn1-podman-machine.plist" && grep -q "^launchctl load -w" "$LOG"'
 check "macOS: Rosetta checked in the machine, no restart when it runs" 'grep -q "podman machine ssh podman-machine-default cat /proc/sys/fs/binfmt_misc/rosetta" "$LOG" && ! grep -q "^podman machine stop" "$LOG"'
 check "macOS: the newest Compose for darwin-aarch64 in ~/.docker/cli-plugins, without sudo" '[ -x "$T/home/.docker/cli-plugins/docker-compose" ] && grep -q "download/v5.6.0/docker-compose-darwin-aarch64$" "$LOG" && ! grep -q . "$SUDO_LOG"'
@@ -435,6 +449,18 @@ out="$(SHIM_OS=Darwin SHIM_VMTYPE=libkrun PROVIDER= run install-podman)"; rc=$?
 check "macOS: a libkrun machine is refused (it has no Rosetta)" '[ "$rc" -ne 0 ] && grep -q "runs with libkrun, which cannot use Rosetta" <<< "$out"'
 out="$(SHIM_OS=Darwin SHIM_MACOS=15.6 PROVIDER= run install-podman)"; rc=$?
 check "macOS 15: refused, Rosetta in the machine needs macOS 26" '[ "$rc" -ne 0 ] && grep -q "macOS 15.6 is too old for the Catalog" <<< "$out"'
+# a new machine gets 24 GB when the Mac keeps 8 GB for itself, else all but 8 GB (at least 8 GB), with a warning
+for spec in "48 24576" "32 24576" "24 16384" "16 8192" "8 8192"; do
+  read -r gb want <<< "$spec"
+  reset_podman; cp "$T/inst/brew" "$T/bin/brew"
+  out="$(SHIM_OS=Darwin SHIM_MEMSIZE=$((gb * 1073741824)) PROVIDER= run install-podman)"; rc=$?
+  check "macOS with $gb GB: a Podman machine with $((want / 1024)) GB" '[ "$rc" -eq 0 ] && grep -q "^podman machine init --rootful --cpus 6 --memory $want --disk-size 100 --now$" "$LOG"'
+  if [ "$gb" -ge 32 ]; then
+    check "macOS with $gb GB: no warning about the memory" '! grep -q "is recommended" <<< "$out" && ! grep -q "less than 16 GB" <<< "$out"'
+  else
+    check "macOS with $gb GB: 24 GB recommended$(if [ "$gb" -lt 16 ]; then echo ", less than 16 GB named"; fi)" 'grep -q "^WARN The Linux VM gets $((want / 1024)) GB of memory; at least 24 GB is recommended$" <<< "$out" && grep -q "^  (a Mac with 32 GB or more).$" <<< "$out" && { [ "$gb" -lt 16 ] && grep -q "This Mac has less than 16 GB of memory" <<< "$out" || { [ "$gb" -ge 16 ] && ! grep -q "less than 16 GB" <<< "$out"; }; }'
+  fi
+done
 echo running > "$MSTATE"
 (cd "$T/d" && HOME="$T/home" PATH="$T/bin:$SYSPATH" SHIM_OS=Darwin SHIM_VM_KERNEL=7.0.0-12-generic bash "$I" generate </dev/null >/dev/null 2>&1)
 check "macOS on Apple Silicon: the amd64 Catalog images run with platform linux/amd64" '[ "$(grep -c "^    platform: linux/amd64$" "$T/d/docker-compose.yml")" -eq 5 ] && [ "$(sed -n "/^  catalog-web:/,/^  worker/p" "$T/d/docker-compose.yml" | grep -c "platform: linux/amd64")" -eq 1 ]'
@@ -494,7 +520,7 @@ crun() { (cd "$T/cc" && HOME="$T/home" SHIM_OS=Darwin PATH="$T/bin:$SYSPATH" bas
 reset_docker; cp "$T/inst/brew" "$T/bin/brew"
 out="$(crun install-engine)"; rc=$?
 check "Colima: Homebrew installs colima, docker and the GNU tools" '[ "$rc" -eq 0 ] && grep -q "^brew install colima docker coreutils gnu-sed grep findutils$" "$LOG"'
-check "Colima: a VM with Apple's virtualization, Rosetta, 6 CPUs, 12 GB, 100 GB" 'grep -q "^colima start --vm-type=vz --vz-rosetta --cpu 6 --memory 12 --disk 100$" "$LOG"'
+check "Colima: a VM with Apple's virtualization, Rosetta, 6 CPUs, 24 GB, 100 GB" 'grep -q "^colima start --vm-type=vz --vz-rosetta --cpu 6 --memory 24 --disk 100$" "$LOG"'
 check "Colima: the newest Docker Compose for darwin-aarch64 in ~/.docker/cli-plugins" '[ -x "$T/home/.docker/cli-plugins/docker-compose" ] && grep -q "download/v5.6.0/docker-compose-darwin-aarch64$" "$LOG" && grep -q "runs it" <<< "$out"'
 check "Colima: vm.max_map_count set in the VM and kept by a provision script" 'grep -q "^colima ssh -- sudo sysctl -w vm.max_map_count=262144$" "$LOG" && grep -q "^provision:$" "$T/home/.colima/default/colima.yaml" && grep -q "^  - mode: system$" "$T/home/.colima/default/colima.yaml" && grep -q "^    script: sysctl -w vm.max_map_count=262144$" "$T/home/.colima/default/colima.yaml" && ! grep -q "provision: \[\]" "$T/home/.colima/default/colima.yaml"'
 check "Colima: Rosetta checked in the VM, started at login with brew services" 'grep -q "^colima ssh -- cat /proc/sys/fs/binfmt_misc/rosetta$" "$LOG" && grep -q "^brew services start colima$" "$LOG"'

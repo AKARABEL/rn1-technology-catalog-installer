@@ -22,7 +22,7 @@ echo "$(sed -n 's/^PRETTY_NAME=//p' /etc/os-release | tr -d '"'), bash $BASH_VER
 rc=0
 for s in run_tests run_bundle_tests run_snapshot_tests run_upgrade_tests run_selfupdate_tests run_adopt_tests \
   run_jobs_tests run_timezone_tests run_wizard_tests run_distro_tests run_docker_tests \
-  run_versions_tests run_domain_tests; do
+  run_versions_tests run_domain_tests run_license_tests run_memory_tests run_network_tests; do
   echo "::group::$s"
   if su -s /bin/bash t -c "cd /home/t/r && bash tests/$s.sh /home/t/r/rn1-technology-catalog-installer.sh" > "/tmp/$s.log" 2>&1; then
     cat "/tmp/$s.log"

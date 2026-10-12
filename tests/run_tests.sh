@@ -8,6 +8,8 @@ rm -rf "$T"; mkdir -p "$T/bin"
 sed 's/^CONTAINER_ENGINE=""$/CONTAINER_ENGINE="podman"/' "$1" > "${T%/*}/podman-installer.sh"; NEW="${T%/*}/podman-installer.sh"
 PASS=0; FAIL=0
 check() { if eval "$2"; then PASS=$((PASS+1)); echo "PASS: $1"; else FAIL=$((FAIL+1)); echo "FAIL: $1"; fi; }
+# the internet check (menu start, new installation, option 16, engine setup) has its own suite (run_network_tests)
+export RN1_NET_CHECK=off
 
 # Fake rootful Podman with no containers. SHIM_VOLUMES: names of volumes that carry the label
 # com.docker.compose.project=<the part before the first _>, as Compose names them.
@@ -21,6 +23,7 @@ case "$*" in
   "info") exit 0 ;;
   "info --format {{.Host.Security.Rootless}}") echo false; exit 0 ;;
   "info --format {{.Host.Kernel}}") echo "${SHIM_KERNEL:-6.8.0-generic}"; exit 0 ;;
+  "info --format {{.Host.MemTotal}}") echo "${SHIM_MEMTOTAL:-34359738368}"; exit 0 ;;
   "ps -aq --filter label=com.docker.compose.project="*|"ps -aq --filter label=com.docker.compose.service="*) exit 0 ;;
   "volume ls -q --filter label=com.docker.compose.project="*)
     a="$*"; p="${a##*=}"
@@ -109,10 +112,11 @@ cat > "$T/bin/timedatectl" <<'TZEOF'
 printf '%s\n' "${SHIM_TZ:-Europe/Berlin}"
 TZEOF
 chmod +x "$T/bin/timedatectl"
-# the kernel of the test machine must not change the generated files (MongoDB workaround on 6.19 to 7.0.x)
+# the kernel of the test machine must not change the generated files (MongoDB workaround on 6.19 to 7.0.x),
+# nor its name (the host name of catalog-web)
 REAL_UNAME="$(command -v uname)"
 printf '#!/usr/bin/env bash
-if [ "${1:-}" = "-r" ]; then echo "${SHIM_KERNEL:-6.8.0-generic}"; else exec "%s" "$@"; fi
+if [ "${1:-}" = "-r" ]; then echo "${SHIM_KERNEL:-6.8.0-generic}"; elif [ "${1:-}" = "-n" ]; then echo Test-Server01.example.com; else exec "%s" "$@"; fi
 ' "$REAL_UNAME" > "$T/bin/uname"
 chmod +x "$T/bin/uname"
 export PATH="$T/bin:$PATH" SHIM_LOG="$T/podman.log" HUB_DIR="$SP/hub" RN1_COMPOSE_PROVIDER="$T/bin/docker-compose"
@@ -120,18 +124,24 @@ export PATH="$T/bin:$PATH" SHIM_LOG="$T/podman.log" HUB_DIR="$SP/hub" RN1_COMPOS
 export SHIM_UNHANDLED="$T/unhandled.log"; : > "$SHIM_UNHANDLED"
 : > "$SHIM_LOG"
 mask() { sed -E 's/^((MONGO_INITDB_ROOT|MINIO_ROOT|NPM_ADMIN)_PASSWORD|RABBITMQ_DEFAULT_PASS)=.*/\1=X/' "$1"; }
-# New since the original: the domain and the admin of Nginx Proxy Manager in .env; in the compose file
-# that admin and, with Nginx Proxy Manager, the networks catalog-web takes X-Forwarded-Proto from
-ADDED_ENV='CATALOG_DOMAIN=|NPM_ADMIN_EMAIL=|NPM_ADMIN_PASSWORD=X'
+# New since the original: the domain and the admin of Nginx Proxy Manager in .env, the host name of
+# catalog-web (the short name of this server: the Catalog binds its license to it) and the cache of MongoDB
+# (automatic: 11 GB of the 32 GB the fake Podman has); in the compose file that admin and, with Nginx Proxy
+# Manager, the networks catalog-web takes X-Forwarded-Proto from
+ADDED_ENV='CATALOG_DOMAIN=|NPM_ADMIN_EMAIL=|NPM_ADMIN_PASSWORD=X|CATALOG_HOSTNAME=test-server01|MONGO_WT_CACHE_GB=11'
 ADDED_COMPOSE='^      (INITIAL_ADMIN_(EMAIL|PASSWORD)|ForwardedHeaders__KnownNetworks__[0-2]): '
 newdir() { rm -rf "$T/$1"; mkdir -p "$T/$1"; cp "$NEW" "$T/$1/gen.sh"; echo "$T/$1"; }
 # With Podman every service has "restart: always" (podman-restart.service starts only those again after
-# a reboot): mongo and the two workers had unless-stopped, opensearch and opensearch-dashboards had none
+# a reboot): mongo and the two workers had unless-stopped, opensearch and opensearch-dashboards had none.
+# catalog-web has a fixed host name (the license is bound to it; without it, the ID of each new container).
+# MongoDB starts with the size of its cache (from .env).
 restart_always() {
   awk '$0 == "    restart: unless-stopped" { print "    restart: always"; next }
        { print }
+       $0 == "    image: mongo:${MONGO_TAG}" { print "    command: [\"--wiredTigerCacheSizeGB\", \"${MONGO_WT_CACHE_GB:-1}\"]" }
        $0 == "    container_name: opensearch" || $0 == "    container_name: opensearch-dashboards" { print "    restart: always" }
-       $0 == "      MINIO_ROOT_PASSWORD: \"${MINIO_ROOT_PASSWORD}\"" { print "      HOME: /root" }' "$1"
+       $0 == "      MINIO_ROOT_PASSWORD: \"${MINIO_ROOT_PASSWORD}\"" { print "      HOME: /root" }
+       $0 == "    image: ${CATALOG_IMAGE}" { print "    hostname: ${CATALOG_HOSTNAME}" }' "$1"
 }
 # The default tags name the series Raynet runs with the Catalog instead of a floating major or latest:
 # MongoDB 8 -> 8.0, RabbitMQ 3-management-alpine -> 3.13-management-alpine, Nginx Proxy Manager latest -> 2
@@ -147,9 +157,9 @@ for npm in true false; do
   (cd "$O" && bash gen.sh >/dev/null)
   restart_always "$O/docker-compose.yml" > "$O/podman-compose.yml"
   bash "$D/gen.sh" generate </dev/null >/dev/null 2>&1
-  check "env identical NPM=$npm (plus domain and NPM admin)" 'diff <(mask "$O/.env") <(mask "$D/.env" | grep -vxE "$ADDED_ENV") >/dev/null && [ "$(mask "$D/.env" | grep -cxE "$ADDED_ENV")" -eq 3 ]'
+  check "env identical NPM=$npm (plus domain, NPM admin, host name and the cache of MongoDB)" 'diff <(mask "$O/.env") <(mask "$D/.env" | grep -vxE "$ADDED_ENV") >/dev/null && [ "$(mask "$D/.env" | grep -cxE "$ADDED_ENV")" -eq 5 ]'
   added=0; [ "$npm" = true ] && added=5
-  check "compose identical NPM=$npm (3 restart lines changed, 2 added, HOME for MinIO; $added lines NPM admin and proxy networks)" '[ "$(diff "$O/docker-compose.yml" "$O/podman-compose.yml" | grep -c "^[<>]")" -eq 9 ] && cmp -s "$O/podman-compose.yml" <(grep -vE "$ADDED_COMPOSE" "$D/docker-compose.yml") && [ "$(grep -cE "$ADDED_COMPOSE" "$D/docker-compose.yml")" -eq "$added" ]'
+  check "compose identical NPM=$npm (3 restart lines changed, 2 added, HOME for MinIO, the host name of catalog-web, the cache of MongoDB; $added lines NPM admin and proxy networks)" '[ "$(diff "$O/docker-compose.yml" "$O/podman-compose.yml" | grep -c "^[<>]")" -eq 11 ] && cmp -s "$O/podman-compose.yml" <(grep -vE "$ADDED_COMPOSE" "$D/docker-compose.yml") && [ "$(grep -cE "$ADDED_COMPOSE" "$D/docker-compose.yml")" -eq "$added" ]'
 done
 
 # 2. keep / new / unknown flag
@@ -282,7 +292,7 @@ out="$(printf '1\n/port\n0\n0\n' | COLUMNS=120 bash "$D/gen.sh" menu 2>&1)"
 out="$(sed -n '/Filter "port": /,$p' <<< "$out")"
 check "filter shows only matching settings" 'grep -q "WEB_PORT" <<< "$out" && ! grep -q "ENV_FILE" <<< "$out"'
 out="$(printf '1\n/MINIO_*\n/mongodb\n0\n0\n' | COLUMNS=120 bash "$D/gen.sh" menu 2>&1)"
-check "filter takes the patterns and group names shown" 'grep -q "Filter \"MINIO_\*\": 5 of" <<< "$out" && grep -q "Filter \"mongodb\": 4 of" <<< "$out"'
+check "filter takes the patterns and group names shown" 'grep -q "Filter \"MINIO_\*\": 5 of" <<< "$out" && grep -q "Filter \"mongodb\": 5 of" <<< "$out"'
 out="$(printf '1\n999\n\033[A\n0\n0\n' | bash "$D/gen.sh" menu 2>&1)"
 check "unknown number and arrow keys reported" 'grep -q "There is no setting 999" <<< "$out" && grep -q "Type a number, a name or /text" <<< "$out" && ! grep -q "Filter \"" <<< "$out"'
 cs1="$(cksum < "$D/gen.sh")"
@@ -438,6 +448,9 @@ sed -i 's/^CHECK_FOR_UPDATES=.*/CHECK_FOR_UPDATES="false"/' "$D/gen.sh"
 out="$(printf '0\n' | bash "$D/gen.sh" menu 2>&1)"
 check "CHECK_FOR_UPDATES=false skips lookup" '! grep -q "^curl" "$SHIM_LOG" && ! grep -q "Checking Docker Hub" <<< "$out"'
 check "header plain when disabled" 'grep -q "Installation Portal   (Catalog 26.3.4789.148)$" <<< "$out"'
+logo_row='|  \ /    |  |_ \_ | | |  | \_/ |_ \_/ \_|  |'
+out="$(printf '0\n' | COLUMNS=200 LINES=200 bash "$D/gen.sh" menu 2>&1)"
+check "plain menu without a terminal: no logo, even with room for it" '! grep -qF "$logo_row" <<< "$out" && grep -q "Installation Portal" <<< "$out"'
 
 # Upload limit setting: only Catalog 26 and newer read it (25.x output stays identical to the original)
 D="$(newdir upload26)"; sed -i 's/^CATALOG_VERSION=.*/CATALOG_VERSION="26.3.4789.148"/' "$D/gen.sh"
@@ -454,7 +467,7 @@ want="$(sed -n '/^menu_dispatch() {/,/^}/p' "$NEW" | grep -oE '^ +[0-9]+\)' | tr
 have="$(awk -F'|' '$2 ~ /^[0-9]+$/ { print $2 }' <<< "$tab" | sort -n | tr '\n' ' ')"
 check "menu: every numbered option of the dispatcher once" '[ -n "$want" ] && [ "$want" = "$have" ] && [ "$(awk -F"|" "\$2 == \"J\" || \$2 == \"H\"" <<< "$tab" | wc -l)" -eq 2 ]'
 group() { awk -F'|' -v g="$1" '$2 == "-" { cur = $4; next } $2 != "" && cur == g { printf "%s ", $2 }' <<< "$tab"; }
-check "menu: SETUP holds only setup (7 16 23)" '[ "$(group SETUP)" = "7 16 23 " ]'
+check "menu: SETUP holds only setup (7 16 23 26)" '[ "$(group SETUP)" = "7 16 23 26 " ]'
 check "menu: settings and file editing in CONFIGURE (1-5), start and stop apart" '[ "$(group CONFIGURE)" = "1 2 3 4 5 " ] && [ "$(group "START & STOP")" = "6 12 13 " ]'
 check "menu: numbers rise inside every group" '[ -z "$(awk -F"|" "\$2 == \"-\" { last = 0; next } \$2 ~ /^[0-9]+\$/ { if (\$2 + 0 < last) print \$2; last = \$2 + 0 }" <<< "$tab")" ]'
 long="$(awk -F'|' '
