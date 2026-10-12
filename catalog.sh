@@ -2405,6 +2405,12 @@ settings_stale() {
   return "$rc"
 }
 
+# True when an installer older than the fixed host name of catalog-web wrote .env (no CATALOG_HOSTNAME): the
+# files differ from what this one writes (settings_stale), whatever the settings are
+files_older() {
+  [ -f "$ENV_FILE" ] && ! grep -q '^CATALOG_HOSTNAME=' "$ENV_FILE"
+}
+
 ###############################################################################
 # Memory
 ###############################################################################
@@ -3046,11 +3052,58 @@ version_with_tag() {
   fi
 }
 
-# "Catalog X - up to date": the installed Catalog (the setting while nothing is installed)
+# Where nothing is installed: the Catalog version a start would install - the one .env names (option 6 starts
+# the files as they are), the setting while there is no .env
+next_catalog() {
+  local v=""
+  if [ -f "$ENV_FILE" ]; then
+    v="$(env_value CATALOG_IMAGE)"
+    v="${v##*:}"
+  fi
+  printf '%s' "${v:-$CATALOG_VERSION}"
+}
+
+# Where nothing is installed: the version a start would install - "X would be installed (the newest)", or the
+# newer one Docker Hub has; when the files name another version than the settings, both
+install_next_text() {
+  local next text
+  next="$(next_catalog)"
+  text="$next would be installed"
+  if [ "$next" != "$CATALOG_VERSION" ]; then
+    printf '%s (the files; option 2 writes %s)' "$text" "$CATALOG_VERSION"
+    return 0
+  fi
+  case "$HUB_STATUS" in
+    ok)
+      if [ "$LATEST_VERSION" = "$CATALOG_VERSION" ]; then
+        text="$text (the newest)"
+      elif ! is_version "$CATALOG_VERSION"; then
+        text="$text, newest on Docker Hub: $(version_with_tag "$LATEST_VERSION")"
+      elif version_gt "$LATEST_VERSION" "$CATALOG_VERSION"; then
+        text="$text, ${C_YLW}newer: $(version_with_tag "$LATEST_VERSION"), option 8${C_RST}"
+      fi
+      ;;
+    failed)
+      text="$text, newest version unknown (Docker Hub not reachable)"
+      ;;
+  esac
+  printf '%s' "$text"
+}
+
+# version_label KIND -> "Catalog X - up to date": the installed Catalog. Without one (KIND, see install_kind:
+# files or none) the version a start would install: "Catalog not installed - X would be installed (the newest)".
+# When the engine cannot tell the version (or the files are incomplete): "Catalog X (the settings)", no status.
 version_label() {
-  local cur label
+  local cur label kind="${1:-}"
+  if nothing_installed "$kind"; then
+    printf 'Catalog %snot installed%s - %s' "$C_YLW" "$C_RST" "$(install_next_text)"
+    return 0
+  fi
   cur="$(installed_catalog)"
-  cur="${cur:-$CATALOG_VERSION}"
+  if [ -z "$cur" ]; then
+    printf 'Catalog %s (the settings)' "$CATALOG_VERSION"
+    return 0
+  fi
   label="Catalog $cur"
   case "$HUB_STATUS" in
     ok)
@@ -3799,6 +3852,13 @@ show_updates() {
     row_status catalog "" ""
     newest="-"
   fi
+  # nothing installed in this folder (option 99, R, a new folder): the setting is the newest, nothing is up to date
+  if nothing_installed "$(install_kind)"; then
+    case "$ST_TEXT" in
+      "up to date") ST_TEXT="the newest - not installed" ;;
+      "update available") ST_TEXT="newer available - not installed" ;;
+    esac
+  fi
   rows+=("$(ui_pad "$C_BLD$i$C_RST" 4)$(ui_pad "Catalog + 4 workers" 26)$(ui_pad "$(ui_current "$CATALOG_VERSION" "${cat_resolved:-$CATALOG_VERSION}")" "$w_cur")$(ui_pad "$newest" "$w_new")$(ui_badge "$ST_TEXT" "$ST_COLOR")")
 
   for key in "${UPD_KEYS[@]}"; do
@@ -4241,7 +4301,8 @@ choose_versions() {
     err "The installer must be a writable file (it keeps the versions)."
     return 1
   fi
-  if wiz_installed; then
+  # the files that option 99 or R left hold no installation: the versions of a new one
+  if ! nothing_installed "$(install_kind)"; then
     installed="yes"
   fi
   if ! collect_updates; then
@@ -8558,6 +8619,14 @@ do_upgrade() {
   require_files || return 1
   require_engine || return 1
   engine_guard || return 1
+  # option 99, or R that kept the files: no Catalog to upgrade
+  if [ "$(install_kind)" = "files" ]; then
+    info "Nothing is installed in this folder yet: only $ENV_FILE and $COMPOSE_FILE, no containers and no data."
+    echo "  There is nothing to upgrade - option 8 picks the versions, I or option 6 installs the Catalog."
+    # (the mark of a failed upgrade from before the data went: nothing to go back to)
+    rm -f -- "$UPGRADE_FAILED_FILE"
+    return 0
+  fi
   sibling_guard || return 1
   upgrade_offer_rollback || return 0
   if ! command -v curl >/dev/null 2>&1; then
@@ -9417,8 +9486,8 @@ ui_ask() {
 ui_badge() {
   local text="$1" color="$2" sym="$UI_NO"
   case "$text" in
-    "up to date"*) sym="$UI_OK" ;;
-    "update available"*) sym="$UI_UP" ;;
+    "up to date"*|"the newest"*) sym="$UI_OK" ;;
+    "update available"*|"newer available"*) sym="$UI_UP" ;;
     "major update"*) sym="$UI_MAJOR"; color="$C_MAG" ;;
   esac
   printf '%s%s %s%s' "$color" "$sym" "$text" "$C_RST"
@@ -9509,6 +9578,17 @@ ui_len() {
     s="${s/"${BASH_REMATCH[0]}"/}"
   done
   printf '%s' "${#s}"
+}
+
+# ui_lines TEXT COLUMNS -> the rows TEXT takes in a terminal of COLUMNS (a longer line wraps)
+ui_lines() {
+  local n
+  n="$(ui_len "$1")"
+  if [ "$n" -le "$2" ]; then
+    printf '1'
+  else
+    printf '%s' $(((n + $2 - 1) / $2))
+  fi
 }
 
 # ui_pad TEXT WIDTH -> TEXT cut or padded to exactly WIDTH visible characters
@@ -12608,14 +12688,31 @@ do_full_setup() {
 }
 
 do_status() {
-  local inst note
+  local inst note here more=""
   require_files || return 1
   require_engine || return 1
   compose ps
+  here="$(install_kind)"
   inst="$(installed_catalog)"
-  if [ -n "$inst" ]; then
+  if [ "$here" = "files" ]; then
     echo
-    echo "Catalog $inst installed$(if [ "$inst" != "$CATALOG_VERSION" ]; then printf ' (the settings say %s)' "$CATALOG_VERSION"; fi)"
+    echo "Catalog not installed: no containers and no data volumes, only $ENV_FILE and $COMPOSE_FILE."
+    echo "A start makes a new, empty Catalog - $(install_next_text)."
+    if [ "$INTERACTIVE" = "true" ]; then
+      more=", or step by step with I"
+    fi
+    echo "Start it with $(hint 6 up)$more."
+  elif [ -n "$inst" ]; then
+    if [ "$inst" != "$CATALOG_VERSION" ]; then
+      more=" (the settings say $CATALOG_VERSION)"
+    fi
+    if [ "$here" = "stopped" ]; then
+      more="$more, stopped - $(hint 6 up) starts it"
+    elif [ "$here" = "data" ]; then
+      more="$more: its data is kept, no containers - $(hint 6 up) starts it again"
+    fi
+    echo
+    echo "Catalog $inst installed$more"
   fi
   note="$(install_note)"
   if [ -n "$note" ]; then
@@ -12710,14 +12807,15 @@ do_reset() {
     fi
   fi
   compose down -v --remove-orphans
-  # the proxy hosts, certificates and the admin of Nginx Proxy Manager are gone with its volumes
-  rm -f -- "$NPM_CERT_FILE" "$NPM_LOGIN_FILE"
+  # the proxy hosts, certificates and the admin of Nginx Proxy Manager are gone with its volumes; a failed
+  # upgrade has no data left to go back to
+  rm -f -- "$NPM_CERT_FILE" "$NPM_LOGIN_FILE" "$UPGRADE_FAILED_FILE"
   ok "Containers and data volumes removed."
   echo "Optionally generate new passwords (option 2), then start again (option 6)."
 }
 
 do_check() {
-  local problems=0 name port mmc host_tz v where="" mb
+  local problems=0 name port mmc host_tz v where="" mb inst
   info "Checking prerequisites..."
   echo "  Container engine: $ENGINE_NAME$(if [ -z "$CONTAINER_ENGINE" ]; then printf ' (CONTAINER_ENGINE is empty: the one found on this server)'; fi)"
 
@@ -12964,19 +13062,35 @@ do_check() {
   else
     warn "Time zone: the Catalog uses ${TZ:-UTC}, this server $host_tz - './$SCRIPT_NAME timezone' or option 2 can align it."
   fi
+  # the newest Catalog first: the line of what is installed names it, as the menu does
+  if [ "$CHECK_FOR_UPDATES" = "true" ]; then
+    if fetch_hub_versions; then
+      ok "Docker Hub is reachable - newest Catalog version: $(version_with_tag "${HUB_VERSIONS%%$'\n'*}")"
+      LATEST_VERSION="${HUB_VERSIONS%%$'\n'*}"
+      HUB_STATUS="ok"
+    else
+      warn "Docker Hub is not reachable - the version list (option 8) will not work."
+      HUB_STATUS="failed"
+    fi
+  fi
+  # what is installed in this folder, as the menu says it
+  if [ -f "$ENV_FILE" ] && [ -f "$COMPOSE_FILE" ]; then
+    v="$(stack_state)"
+    inst="$(installed_catalog)"
+    inst="${inst:-$(env_value CATALOG_IMAGE)}"
+    inst="${inst##*:}"
+    case "$(install_kind "$v")" in
+      running) ok "Catalog $inst is installed here: $v." ;;
+      stopped) info "Catalog $inst is installed here, stopped - $(hint 6 up) starts it." ;;
+      data) info "Catalog $inst is installed here: its data is kept, no containers - $(hint 6 up) starts it again." ;;
+      files) info "Catalog not installed here: no containers and no data volumes, only $ENV_FILE and $COMPOSE_FILE - a start makes a new, empty Catalog: $(install_next_text)." ;;
+    esac
+  fi
   v="$(install_note)"
   if [ -n "$v" ]; then
     warn "$v - $(hint 23 "adopt .") takes the installation's values over (older settings are not written into the files)."
   elif v="$(install_diff_note)" && [ -n "$v" ]; then
     warn "$v - $(hint 23 "adopt .") takes the installation's values over, $(hint 2 generate) writes the settings."
-  fi
-
-  if [ "$CHECK_FOR_UPDATES" = "true" ]; then
-    if fetch_hub_versions; then
-      ok "Docker Hub is reachable - newest Catalog version: $(version_with_tag "${HUB_VERSIONS%%$'\n'*}")"
-    else
-      warn "Docker Hub is not reachable - the version list (option 8) will not work."
-    fi
   fi
   if net_enabled; then
     net_check_line
@@ -15652,8 +15766,8 @@ wiz_internet() {
   esac
 }
 
-# Hooks for the tests: __net encode|decode|parse|rows|found|env|run-plan|sudo|pac|pacask|wpad|header|ask|ca|engine|
-# engine-write|apply|agent|colima|cleanup|stale|offer|adopt
+# Hooks for the tests: __net encode|decode|parse|rows|found|env|run-plan|sudo|pac|pacask|wpad|header|signature|ask|ca|
+# engine|engine-write|apply|agent|colima|cleanup|stale|offer|adopt
 net_test_hook() {
   local cmd="${1:-}" p
   shift || true
@@ -15675,6 +15789,7 @@ net_test_hook() {
     pacask) net_ask_pac "$1" || return $? ;;
     wpad) net_wpad_urls ;;
     header) net_header; echo ;;
+    signature) net_signature; echo ;;
     ask)
       net_via_settings
       if net_check show; then
@@ -18035,11 +18150,12 @@ stack_state() {
 
 # show_menu [LINES] -> the plain menu; LINES: what the caller prints below it (notices, prompt)
 show_menu() {
-  local found tz_note sib state inote dnote below="${1:-0}" cols height item nh
-  local -a notes=() items=()
+  local found tz_note sib state here inote dnote below="${1:-0}" cols height item nh head version line
+  local -a notes=() items=() heads=()
   reload_settings
   menu_scan
-  state="$(stack_state)"
+  state="$MENU_STACK"
+  here="$(install_kind "$state")"
   if [ ! -f "$ENV_FILE" ]; then
     found="$(first_installation_dir)"
     if [ -n "$found" ]; then
@@ -18063,6 +18179,8 @@ show_menu() {
     dnote="$(install_diff_note)"
     if [ -n "$dnote" ]; then
       notes+=("${C_YLW}$dnote - option 23 takes the installation's values over, option 2 writes the settings.${C_RST}")
+    elif files_older; then
+      notes+=("${C_YLW}The generated files do not match the settings above (written by an older installer) - option 2 regenerates them.${C_RST}")
     else
       notes+=("${C_YLW}The generated files do not match the settings above (changed settings or manual edits) - option 2 regenerates them.${C_RST}")
     fi
@@ -18073,15 +18191,30 @@ show_menu() {
   # the internet check of the menu start, once it is done (a header line)
   nh="$(net_header)"
   mapfile -t items < <(menu_items)
-  # the logo only in a terminal that has room for it above the whole menu: header (with the internet
-  # line), notes, the cards, every heading (two lines) and option, Exit and the legend, and what the
-  # caller prints below
   cols="$(ui_cols)"
+  # the title with the state of the Catalog beside it; wider than the terminal, that state gets a line of its
+  # own, like Folder and Stack
+  version="$(version_label "$here")"
+  head="${C_BLD}Raynet One Technology Catalog - Installation Portal${C_RST}   ($version)"
+  if [ -t 1 ] && [ "$(ui_len "$head")" -gt "$cols" ]; then
+    heads=("${head%%   (*}" "Catalog: ${version#Catalog }")
+  else
+    heads=("$head")
+  fi
+  heads+=("Folder : $WORK_DIR" "Files  : $ENV_FILE $(file_state "$ENV_FILE")   $COMPOSE_FILE $(file_state "$COMPOSE_FILE")" "Stack  : $state")
+  case "$nh" in
+    "") ;;
+    "Internet: "*) heads+=("$C_YLW$nh$C_RST") ;;
+    *) heads+=("$C_GRN$nh$C_RST") ;;
+  esac
+  # the logo only in a terminal that has room for it above the whole menu: header (with the internet
+  # line) and notes as the terminal wraps them, the cards, every heading (two lines) and option, Exit and
+  # the legend, and what the caller prints below
   if [ -t 1 ] && [ "$cols" -ge 80 ]; then
-    height=$((4 + ${#notes[@]} + 2 + 3 + 5 + below))
-    if [ -n "$nh" ]; then
-      height=$((height + 1))
-    fi
+    height=$((2 + 3 + 5 + below))
+    for line in "${heads[@]}" ${notes[@]+"${notes[@]}"}; do
+      height=$((height + $(ui_lines "$line" "$cols")))
+    done
     for item in "${items[@]}"; do
       IFS='|' read -r _ item _ <<< "$item"
       if [ "$item" = "-" ]; then
@@ -18095,21 +18228,12 @@ show_menu() {
       echo
     fi
   fi
-  printf '%s\n' "${C_BLD}Raynet One Technology Catalog - Installation Portal${C_RST}   ($(version_label))"
-  printf 'Folder : %s\n' "$WORK_DIR"
-  printf 'Files  : %s %s   %s %s\n' "$ENV_FILE" "$(file_state "$ENV_FILE")" "$COMPOSE_FILE" "$(file_state "$COMPOSE_FILE")"
-  printf 'Stack  : %s\n' "$state"
-  case "$nh" in
-    "") ;;
-    "Internet: "*) printf '%s\n' "$C_YLW$nh$C_RST" ;;
-    *) printf '%s\n' "$C_GRN$nh$C_RST" ;;
-  esac
+  printf '%s\n' "${heads[@]}"
   if [ ${#notes[@]} -gt 0 ]; then
     printf '%s\n' "${notes[@]}"
   fi
-  local col key kind label desc what installed title color l1 l2 wide="no" text current=""
-  installed="$(install_state)"
-  if [ "$installed" != "no" ]; then
+  local col key kind label desc what title color l1 l2 wide="no" text current=""
+  if ! nothing_installed "$here"; then
     current="$(installed_catalog)"
   fi
   if [ "$cols" -ge 70 ]; then
@@ -18117,8 +18241,8 @@ show_menu() {
   fi
   printf '\n %s\n' "${C_CYN}START HERE$C_RST"
   for key in I U R; do
-    IFS='|' read -r title color l1 l2 <<< "$(wiz_card "$key" "$installed" "$state" 40 "$current")"
-    if [ "$installed" = "incomplete" ] && [ "$key" != "R" ]; then
+    IFS='|' read -r title color l1 l2 <<< "$(wiz_card "$key" "$here" "$state" 40 "$current")"
+    if [ "$here" = "incomplete" ] && [ "$key" != "R" ]; then
       l1="$l1 $UI_SEP $l2"
     fi
     printf '  %s) %s  %s\n' "$(printf '%3s' "$key")" "$color$(ui_pad "$title" 8)$C_RST" "$l1"
@@ -18322,10 +18446,13 @@ wiz_job_since() {
 # The containers of this installation, listed once per menu draw (menu_scan): the cards and the stack
 # line need them, and every listing asks the engine several times. here_containers uses that list during
 # the draw and asks the engine again at any other time.
+# The stack line (stack_state) is part of the scan too: the draw that follows asks the engine nothing else.
 MENU_HERE=""
 MENU_HERE_AT=-10
 MENU_CATALOG=""
 MENU_DATA=""
+MENU_STACK=""
+MENU_CONTAINERS=""
 menu_scan() {
   MENU_HERE=""
   MENU_HERE_AT=-10
@@ -18338,6 +18465,14 @@ menu_scan() {
   if [ -z "$MENU_CATALOG" ] && ! install_data; then
     MENU_DATA="no"
   fi
+  MENU_HERE_AT="$SECONDS"
+  MENU_STACK="$(stack_state)"
+  # the other containers of the stack: asked only where nothing runs and catalog-web has none (install_kind)
+  MENU_CONTAINERS="yes"
+  if [ -z "$MENU_CATALOG" ] && [ "$MENU_STACK" = "0 service(s) running" ] && ! stack_containers_any; then
+    MENU_CONTAINERS="no"
+  fi
+  # the draw comes now: the cache counts from the end of the scan
   MENU_HERE_AT="$SECONDS"
 }
 menu_scan_done() {
@@ -18368,6 +18503,65 @@ wiz_installed() {
     return 0
   fi
   engine_cli && [ -n "$(here_containers)" ]
+}
+
+# True when a container of the stack exists, running or stopped (the project's label: what compose lists)
+stack_containers_any() {
+  local ids
+  engine_cli && ids="$("$ENGINE" ps -aq --filter "label=com.docker.compose.project=$(stack_project)" 2>/dev/null)" && [ -n "$ids" ]
+}
+
+# True when containers of the stack are there - catalog-web's or others, running or stopped; the menu asks
+# once per draw (menu_scan)
+stack_has_containers() {
+  if [ -n "$(running_catalog)" ]; then
+    return 0
+  fi
+  if [ $((SECONDS - MENU_HERE_AT)) -le 2 ]; then
+    [ "$MENU_CONTAINERS" = "yes" ]
+    return
+  fi
+  stack_containers_any
+}
+
+# install_kind [STACK-STATE] -> what is installed in this folder: running (services of the stack run), stopped
+# (containers of the stack are there, none runs), data (no container, the data volumes are kept - option 13),
+# files (only .env and docker-compose.yml, no container and no data volume - option 99, or R that kept the
+# files), none, incomplete (see install_state) or unknown (the engine does not answer). The menu decides it
+# once per draw from what menu_scan knows (with its stack line, STACK-STATE).
+install_kind() {
+  local state="${1:-}"
+  case "$(install_state)" in
+    no)
+      printf 'none'
+      return 0
+      ;;
+    incomplete)
+      printf 'incomplete'
+      return 0
+      ;;
+  esac
+  if [ -z "$state" ]; then
+    state="$(stack_state)"
+  fi
+  case "$state" in
+    "0 service(s) running")
+      if stack_has_containers; then
+        printf 'stopped'
+      elif install_data; then
+        printf 'data'
+      else
+        printf 'files'
+      fi
+      ;;
+    [0-9]*" service(s) running") printf 'running' ;;
+    *) printf 'unknown' ;;
+  esac
+}
+
+# nothing_installed KIND -> true when no Catalog is installed in this folder: KIND (see install_kind) files or none
+nothing_installed() {
+  [ "$1" = "files" ] || [ "$1" = "none" ]
 }
 
 # Names of the running jobs ("#3 Upgrade to ..."), one per line; empty when none runs.
@@ -18957,8 +19151,9 @@ install_snapshots() {
 }
 
 # I: in a folder without an installation the new installation (install_new; first: the menu starts with
-# it on the first start here). In a folder that is installed already: repair (check, settings, files,
-# start), continue with the license and the data, update or remove. install_wizard [first]
+# it on the first start here), also on the files that option 99 or R left. In a folder that is installed
+# already: repair (check, settings, files, start), continue with the license and the data, update or
+# remove. install_wizard [first]
 install_wizard() {
   local -a steps=(Check Settings Files Start License Data Done)
   local jobs found choice rc ans step=1 installed="" npm note
@@ -18977,7 +19172,8 @@ install_wizard() {
     return 0
   fi
 
-  if ! wiz_installed; then
+  # only .env and docker-compose.yml, no container and no data: nothing to repair, a new installation
+  if nothing_installed "$(install_kind)"; then
     found="$(stack_foreign)" || found=""
     if [ -z "$found" ]; then
       found="$(first_installation_dir)"
@@ -19198,6 +19394,11 @@ install_new() {
     echo "  ${C_BLD}New installation.$C_RST A few questions - engine, domain, proxy, versions - then"
     echo "  the Catalog starts. 0 at any question opens the full menu."
     echo
+  elif [ -f "$ENV_FILE" ]; then
+    # the files that option 99 or R left (install_wizard)
+    echo "  ${C_BLD}New installation$C_RST on the files of this folder: no containers and no data"
+    echo "  are left, so the Catalog starts empty. The passwords in $ENV_FILE are kept."
+    echo
   fi
 
   # 1. Internet: the sites the installation needs, the proxy questions only when required ones fail
@@ -19225,7 +19426,7 @@ install_new() {
   fi
   # an engine that did not answer before may hold the installation of this folder: then its repair
   menu_scan_done
-  if wiz_installed; then
+  if ! nothing_installed "$(install_kind)"; then
     install_wizard
     return 0
   fi
@@ -19426,7 +19627,7 @@ install_finish() {
 # health check and the patch updates of the other components. update_wizard [STEP [NOTICE]]
 update_wizard() {
   local -a steps=(Installer Catalog Done)
-  local start="${1:-1}" notice="${2:-}" jobs rc ans before after target installed failed_before="no"
+  local start="${1:-1}" notice="${2:-}" jobs rc ans before after target installed failed_before="no" here
   jobs="$(wiz_running_jobs)"
   if [ -n "$jobs" ]; then
     warn "A background job is running - wait for it or follow it with J first:"
@@ -19437,8 +19638,13 @@ update_wizard() {
     err "The installer must be a writable file for an update (it keeps the settings and the version)."
     return 0
   fi
-  if ! wiz_installed; then
+  here="$(install_kind)"
+  if nothing_installed "$here"; then
     info "Nothing is installed in this folder yet - I installs the Catalog."
+    if [ "$here" = "files" ]; then
+      echo "  Only $ENV_FILE and $COMPOSE_FILE are here, no containers and no data."
+      echo "  Option 22 updates this installer."
+    fi
     return 0
   fi
 
@@ -19743,6 +19949,8 @@ remove_stack() {
     if "$ENGINE" volume inspect "$v" >/dev/null 2>&1 && "$ENGINE" volume rm "$v" >/dev/null 2>&1; then
       case "$v" in
         *_npm_data|*_npm_letsencrypt) rm -f -- "$NPM_CERT_FILE" "$NPM_LOGIN_FILE" ;;
+        # a failed upgrade has no data left to go back to
+        *_db_data) rm -f -- "$UPGRADE_FAILED_FILE" ;;
       esac
     fi
   done
@@ -19967,7 +20175,7 @@ remove_wizard() {
     fi
   fi
   ans=0
-  wiz_yes_no "Choose what to remove?" y || ans=$?
+  wiz_yes_no "Next: a numbered list to pick what to remove. Go on?" y || ans=$?
   if [ "$ans" -ne 0 ]; then
     info "Cancelled - nothing was removed."
     return 0
@@ -20170,14 +20378,15 @@ ui_fit() {
   printf '%s' "$text"
 }
 
-# wiz_card KEY INSTALLED STACK-STATE WIDTH [VERSION] -> TITLE|COLOR|LINE1|LINE2 of a card at the top
-# (INSTALLED: yes, incomplete or no - see install_state)
-# of the menu; short texts when the card has less than 34 characters of room. VERSION: the installed one.
+# wiz_card KEY KIND STACK-STATE WIDTH [VERSION] -> TITLE|COLOR|LINE1|LINE2 of a card at the top of the menu
+# (KIND: what is installed here, see install_kind); short texts when the card has less than 34 characters of
+# room. VERSION: the installed one (empty: not known - nothing is installed, the engine does not answer, the files
+# are incomplete).
 wiz_card() {
-  local installed="$2" state="$3" width="$4" target current="${5:-$CATALOG_VERSION}" l1 l2 n=0 missing things
+  local kind="$2" state="$3" width="$4" target current="${5:-}" l1 l2 n=0 missing things reach="yes"
   case "$1" in
     I)
-      if [ "$installed" = "incomplete" ]; then
+      if [ "$kind" = "incomplete" ]; then
         if [ ! -f "$ENV_FILE" ] && [ ! -f "$COMPOSE_FILE" ]; then
           missing="no files"
         elif [ ! -f "$ENV_FILE" ]; then
@@ -20206,7 +20415,21 @@ wiz_card() {
           l2="$(ui_fit "$width" "repair: check, write the files again, start" "repair: write the files")"
         fi
         printf '%s|%s|%s|%s' "INSTALL" "$C_GRN" "$l1" "$C_DIM$l2$C_RST"
-      elif [ "$installed" = "yes" ]; then
+      elif [ "$kind" = "data" ]; then
+        # option 13 removed the containers, the data is kept
+        if [ -n "$current" ]; then
+          l1="$(ui_fit "$width" "$C_GRN$UI_OK$C_RST Catalog $current $UI_SEP data kept, no containers" "$C_GRN$UI_OK$C_RST Data kept, no containers" "$C_GRN$UI_OK$C_RST Data kept")"
+        else
+          l1="$(ui_fit "$width" "$C_GRN$UI_OK$C_RST Data kept, no containers" "$C_GRN$UI_OK$C_RST Data kept")"
+        fi
+        l2="$(ui_fit "$width" "6 starts it again $UI_SEP or repair" "6 starts it again")"
+        printf '%s|%s|%s|%s' "INSTALL" "$C_GRN" "$l1" "$C_DIM$l2$C_RST"
+      elif [ "$kind" = "files" ]; then
+        # option 99, or R that kept the files: a start makes a new Catalog
+        l1="$(ui_fit "$width" "$C_YLW$WIZ_TODO$C_RST Not installed: no containers, no data" "$C_YLW$WIZ_TODO$C_RST No containers, no data")"
+        l2="$(ui_fit "$width" "6 starts a new, empty Catalog $UI_SEP I installs it step by step" "6 starts a new, empty Catalog" "6 starts a new Catalog")"
+        printf '%s|%s|%s|%s' "INSTALL" "$C_GRN" "$l1" "$C_DIM$l2$C_RST"
+      elif [ "$kind" != "none" ]; then
         case "$state" in
           "0 service(s) running")
             l1="stopped"
@@ -20219,14 +20442,19 @@ wiz_card() {
           unknown*)
             l1="$ENGINE_NAME not reachable"
             l2="16 checks the server"
+            reach="no"
             ;;
           *)
             l1="no $ENGINE_NAME"
             l2="16 checks the server"
+            reach="no"
             ;;
         esac
-        if [ -n "${5:-}" ]; then
-          l1="$(ui_fit "$width" "$C_GRN$UI_OK$C_RST Catalog $5 $UI_SEP $l1" "$C_GRN$UI_OK$C_RST Installed $UI_SEP $l1")"
+        if [ -n "$current" ]; then
+          l1="$(ui_fit "$width" "$C_GRN$UI_OK$C_RST Catalog $current $UI_SEP $l1" "$C_GRN$UI_OK$C_RST Installed $UI_SEP $l1")"
+        elif [ "$reach" = "no" ]; then
+          # without the engine, not even whether a Catalog is installed is known
+          l1="$C_YLW!$C_RST $l1"
         else
           l1="$C_GRN$UI_OK$C_RST Installed $UI_SEP $l1"
         fi
@@ -20239,11 +20467,15 @@ wiz_card() {
       ;;
     U)
       target="$LATEST_VERSION"
-      if [ "$installed" = "no" ]; then
+      if nothing_installed "$kind"; then
         printf '%s|%s|%s|%s' "UPDATE" "$C_YLW" "${C_DIM}Nothing installed yet$C_RST" "${C_DIM}install first (I)$C_RST"
         return 0
       fi
-      if [ "$HUB_STATUS" = "ok" ] && [ -n "$target" ] && is_version "$current" && version_gt "$target" "$current"; then
+      if [ -z "$current" ]; then
+        # which Catalog is installed is not known: no "up to date" for the version of the settings
+        l1="$UI_UP Installer and Catalog"
+        l2="backup $UI_SEP upgrade $UI_SEP checks"
+      elif [ "$HUB_STATUS" = "ok" ] && [ -n "$target" ] && is_version "$current" && version_gt "$target" "$current"; then
         l1="$C_YLW$UI_UP $target$C_RST available"
         l2="backup $UI_SEP upgrade $UI_SEP patches"
       elif [ "$HUB_STATUS" = "ok" ]; then
@@ -20253,14 +20485,17 @@ wiz_card() {
         l1="$UI_UP Installer and Catalog"
         l2="backup $UI_SEP upgrade $UI_SEP checks"
       fi
-      if [ "$installed" = "incomplete" ]; then
+      if [ "$kind" = "incomplete" ]; then
         l2="repair first (I), then U"
       fi
       printf '%s|%s|%s|%s' "UPDATE" "$C_YLW" "$l1" "$C_DIM$l2$C_RST"
       ;;
     R)
-      if [ "$installed" = "no" ]; then
+      if [ "$kind" = "none" ]; then
         printf '%s|%s|%s|%s' "REMOVE" "$C_RED" "${C_DIM}Nothing installed$C_RST" "${C_DIM}leftover files only$C_RST"
+      elif [ "$kind" = "files" ]; then
+        l2="$(ui_fit "$width" "you choose: images $UI_SEP files $UI_SEP backups" "you choose: images, files" "you choose what goes")"
+        printf '%s|%s|%s|%s' "REMOVE" "$C_RED" "$C_RED$UI_DEL$C_RST Remove what is left" "$C_DIM$l2$C_RST"
       else
         l2="$(ui_fit "$width" "you choose: data $UI_SEP images $UI_SEP files $UI_SEP backups" "you choose: data, images, files" "you choose what goes")"
         printf '%s|%s|%s|%s' "REMOVE" "$C_RED" "$C_RED$UI_DEL$C_RST Remove from this server" "$C_DIM$l2$C_RST"
@@ -20269,20 +20504,17 @@ wiz_card() {
   esac
 }
 
-# tui_cards COLS STACK-STATE [HEIGHT] -> the three cards (4 lines, or a 1-line strip), aligned with
-# the columns of the menu below them
+# tui_cards COLS STACK-STATE HEIGHT KIND VERSION -> the three cards (4 lines, or a 1-line strip), aligned with
+# the columns of the menu below them (KIND and VERSION: what tui_draw found installed - install_kind,
+# installed_catalog)
 tui_cards() {
-  local cols="$1" state="$2" height="${3:-4}" col_w w key title color l1 l2 spec r line inner installed i current=""
+  local cols="$1" state="$2" height="$3" here="$4" current="$5" col_w w key title color l1 l2 spec r line inner i
   local -a top=() mid1=() mid2=() bot=() strip=() bare=()
   col_w=$(((cols - 4) / 3))
   w=$((col_w - 2))
   inner=$((w - 2))
-  installed="$(install_state)"
-  if [ "$installed" != "no" ]; then
-    current="$(installed_catalog)"
-  fi
   for key in I U R; do
-    spec="$(wiz_card "$key" "$installed" "$state" $((inner - 2)) "$current")"
+    spec="$(wiz_card "$key" "$here" "$state" $((inner - 2)) "$current")"
     IFS='|' read -r title color l1 l2 <<< "$spec"
     top+=("$C_DIM$UI_TL$UI_H$C_RST $C_BLD$key$C_RST  $color$title$C_RST $C_DIM$(ui_repeat "$UI_H" $((inner - ${#key} - ${#title} - 5)))$UI_TR$C_RST")
     mid1+=("$C_DIM$UI_V$C_RST $(ui_pad "$l1" $((inner - 2))) $C_DIM$UI_V$C_RST")
@@ -20580,19 +20812,56 @@ tui_cell() {
 tui_draw() {
   reload_settings
   menu_scan
-  local tz_note sib cols="$1" rows="${2:-40}" line col key kind label desc what i n col_w found head2 head3 version state need cards keys cur inote dnote logo
+  local tz_note sib cols="$1" rows="${2:-40}" line col key kind label desc what i n col_w found head2 head3 version state here need cards keys cur="" inote dnote logo room next ni sni
   local -a c1=() c2=() c3=()
-  version="$(version_label)"
-  cur="$(installed_catalog)"
-  cur="${cur:-$CATALOG_VERSION}"
-  head2="Catalog $cur"
-  if [[ "$version" == *"update available"* ]]; then
-    head2="$head2   $C_YLW$UI_UP ${version#*update available: }$C_RST"
-    if [ -n "$LATEST_VERSION" ] && is_version "$cur" && version_gt "$LATEST_VERSION" "$cur"; then
-      head2="${head2%, option 8*}$C_YLW $UI_SEP U or option 21$C_RST"
+  local notes=() nh
+  state="$MENU_STACK"
+  here="$(install_kind "$state")"
+  if ! nothing_installed "$here"; then
+    cur="$(installed_catalog)"
+  fi
+  # the internet check of the menu start, once it is done (tui_menu draws again then)
+  nh="$(net_header)"
+  room=$((cols - 4))
+  case "$nh" in
+    ""|"Internet: "*) ;;
+    *) room=$((room - 3 - $(ui_len "$nh"))) ;;
+  esac
+  if nothing_installed "$here"; then
+    # no Catalog here: the version a start would install, the newest when it is newer, what option 2 writes
+    # when the files name another one than the settings (install_next_text)
+    next="$(next_catalog)"
+    ni="Catalog ${C_YLW}not installed$C_RST"
+    sni="${C_YLW}Not installed$C_RST"
+    if [ "$next" != "$CATALOG_VERSION" ]; then
+      head2="$(ui_fit "$room" "$ni $UI_SEP $next would be installed (the files) $UI_SEP ${C_YLW}option 2 writes $CATALOG_VERSION$C_RST" \
+        "$sni $UI_SEP $next would be installed $UI_SEP ${C_YLW}option 2 writes $CATALOG_VERSION$C_RST" \
+        "$sni $UI_SEP $next (the files) $UI_SEP ${C_YLW}2 writes $CATALOG_VERSION$C_RST" "$sni $UI_SEP $next would be installed" "$sni $UI_SEP $next")"
+    elif [ "$HUB_STATUS" = "ok" ] && is_version "$next" && version_gt "$LATEST_VERSION" "$next"; then
+      head2="$(ui_fit "$room" "$ni $UI_SEP $next would be installed   $C_YLW$UI_UP $(version_with_tag "$LATEST_VERSION") is newer $UI_SEP option 8$C_RST" \
+        "$ni $UI_SEP $next would be installed   $C_YLW$UI_UP $LATEST_VERSION is newer$C_RST" \
+        "$sni $UI_SEP $next would be installed   $C_YLW$UI_UP $LATEST_VERSION is newer$C_RST" \
+        "$sni $UI_SEP $next   $C_YLW$UI_UP $LATEST_VERSION is newer$C_RST" "$sni   $C_YLW$UI_UP $LATEST_VERSION is newer$C_RST")"
+    elif [ "$HUB_STATUS" = "ok" ] && [ "$LATEST_VERSION" = "$next" ]; then
+      head2="$(ui_fit "$room" "$ni $UI_SEP $next would be installed (the newest)" "$sni $UI_SEP $next would be installed (the newest)" \
+        "$sni $UI_SEP $next would be installed" "$sni $UI_SEP $next")"
+    else
+      head2="$(ui_fit "$room" "$ni $UI_SEP $next would be installed" "$sni $UI_SEP $next would be installed" "$sni $UI_SEP $next")"
     fi
-  elif [[ "$version" == *"up to date"* ]]; then
-    head2="$head2   $C_GRN$UI_OK up to date$C_RST"
+  elif [ -z "$cur" ]; then
+    # the engine cannot tell which Catalog is installed (or the files are incomplete): no status
+    head2="Catalog $CATALOG_VERSION $C_DIM(the settings)$C_RST"
+  else
+    version="$(version_label "$here")"
+    head2="Catalog $cur"
+    if [[ "$version" == *"update available"* ]]; then
+      head2="$head2   $C_YLW$UI_UP ${version#*update available: }$C_RST"
+      if [ -n "$LATEST_VERSION" ] && is_version "$cur" && version_gt "$LATEST_VERSION" "$cur"; then
+        head2="${head2%, option 8*}$C_YLW $UI_SEP U or option 21$C_RST"
+      fi
+    elif [[ "$version" == *"up to date"* ]]; then
+      head2="$head2   $C_GRN$UI_OK up to date$C_RST"
+    fi
   fi
   head3="Folder $WORK_DIR"
   if [ -n "$COMPOSE_PROJECT_NAME" ]; then
@@ -20600,26 +20869,23 @@ tui_draw() {
   fi
   head3="$head3 $UI_SEP .env $(if [ -f "$ENV_FILE" ]; then printf '%s' "$C_GRN$UI_OK$C_RST"; else printf '%s' "$C_YLW$UI_NO missing$C_RST"; fi)"
   head3="$head3 $UI_SEP compose $(if [ -f "$COMPOSE_FILE" ]; then printf '%s' "$C_GRN$UI_OK$C_RST"; else printf '%s' "$C_YLW$UI_NO missing$C_RST"; fi)"
-  state="$(stack_state)"
   case "$state" in
     *" exist"*) head3="$head3 $UI_SEP $state" ;;
     *) head3="$head3 $UI_SEP stack $state" ;;
   esac
-  local notes=() nh
   if [ ! -f "$ENV_FILE" ]; then
     found="$(first_installation_dir)"
     if [ -n "$found" ]; then
       notes+=("$C_YLW$UI_ARROW An installation exists in $found - option 23 takes it over$C_RST")
     fi
   fi
-  # the internet check of the menu start, once it is done (tui_menu draws again then)
-  nh="$(net_header)"
   case "$nh" in
     "") ;;
     "Internet: "*) notes+=("$C_YLW$UI_ARROW $nh$C_RST") ;;
     *) head2="$head2   $C_GRN$nh$C_RST" ;;
   esac
-  if [ -f "$UPGRADE_FAILED_FILE" ]; then
+  # (with nothing installed there is nothing to go back to)
+  if [ -f "$UPGRADE_FAILED_FILE" ] && ! nothing_installed "$here"; then
     notes+=("$C_YLW$UI_ARROW The last upgrade did not become healthy - option 21 can go back$C_RST")
   fi
   inote="$(install_note)"
@@ -20639,6 +20905,8 @@ tui_draw() {
     dnote="$(install_diff_note)"
     if [ -n "$dnote" ]; then
       notes+=("$(ui_fit $((cols - 4)) "$C_YLW$UI_ARROW $dnote - option 23 takes the installation's values over, option 2 writes the settings$C_RST" "$C_YLW$UI_ARROW $dnote - 23 takes them over, 2 writes the settings$C_RST" "$C_YLW$UI_ARROW The settings differ from the installation - 23 takes its values over, 2 writes the settings$C_RST")")
+    elif files_older; then
+      notes+=("$(ui_fit $((cols - 4)) "$C_YLW$UI_ARROW The files are from an older installer and differ from the settings - option 2 regenerates them$C_RST" "$C_YLW$UI_ARROW The files are from an older installer - option 2 regenerates them$C_RST")")
     else
       notes+=("$C_YLW$UI_ARROW The generated files differ from the settings - option 2 regenerates them$C_RST")
     fi
@@ -20689,7 +20957,7 @@ tui_draw() {
   fi
   ui_box "$cols" "RAYNET ONE TECHNOLOGY CATALOG $UI_SEP Installation Portal" "$head2" "$head3" ${notes[@]+"${notes[@]}"}
   echo
-  tui_cards "$cols" "$state" "$cards"
+  tui_cards "$cols" "$state" "$cards" "$here" "$cur"
   echo
   for ((i = 0; i < n; i++)); do
     printf '  %s%s%s\n' "$(tui_cell "${c1[i]:-}" "$col_w")" "$(tui_cell "${c2[i]:-}" "$col_w")" "$(tui_cell "${c3[i]:-}" "$col_w")"

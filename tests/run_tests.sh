@@ -260,9 +260,9 @@ check "broken edit restored + menu continues" '[ "$rc" -eq 0 ] && [ "$(cksum < "
 out="$(printf '1\ne\n0\n0\n' | EDITOR=ed-none bash "$D/gen.sh" menu 2>&1)"
 check "no-change edit says No changes" 'grep -q "No changes" <<< "$out"'
 out="$(printf '1\ne\n0\n' | EDITOR=ed-good bash "$D/gen.sh" menu 2>&1)"
-check "good edit reloads with new version" 'grep -q "Configuration reloaded" <<< "$out" && grep -q "Catalog 26.2.0.5" <<< "$out"'
+check "good edit reloads with new version (nothing installed: the version a start would install)" 'grep -q "Configuration reloaded" <<< "$out" && grep -q "Catalog not installed - 26.2.0.5 would be installed" <<< "$out"'
 out="$(printf '1\ne\n0\n' | EDITOR=ed-exit1 bash "$D/gen.sh" menu 2>&1)"
-check "editor rc!=0 with changes still reloads" 'grep -q "Catalog 27.0.0.1" <<< "$out"'
+check "editor rc!=0 with changes still reloads" 'grep -q "Catalog not installed - 27.0.0.1 would be installed" <<< "$out"'
 out="$(printf '1\ne\n0\n0\n' | EDITOR=no-such-editor bash -x "$D/gen.sh" menu 2>&1)"
 check "missing editor error visible before the screen is redrawn" 'grep -A12 "^ERROR Editor .no-such-editor. not found" <<< "$out" | grep -q "^+ ui_pause_tty"'
 
@@ -405,7 +405,7 @@ check "versions marks selected" 'grep -q "25.4.4191.133  (selected)" <<< "$out"'
 check "pagination followed with unescaped &" 'grep -q "page=2&page_size=30" "$SHIM_LOG"'
 check "catalog-only tags excluded (12.2.x)" '! bash "$D/gen.sh" set-version 12.2.1580.13 >/dev/null 2>&1'
 out="$(printf '0\n' | bash "$D/gen.sh" menu 2>&1)"
-check "header shows update available with stable" 'grep -q "update available: 26.3.4789.148 (stable), option 8" <<< "$out"'
+check "header, nothing installed: the version a start would install, the newer stable one, never up to date" 'grep -q "(Catalog not installed - 25.4.4191.133 would be installed, newer: 26.3.4789.148 (stable), option 8)" <<< "$out" && ! grep -q "up to date" <<< "$out"'
 
 cp "$D/gen.sh" "$T/ver_before.sh"
 : > "$SHIM_LOG"
@@ -414,7 +414,7 @@ check "option 8 sets CATALOG_VERSION in script" 'grep -q "^CATALOG_VERSION=\"26.
 check "only the CATALOG_VERSION line changed" '[ "$(diff "$T/ver_before.sh" "$D/gen.sh" | grep -c "^[<>]")" -eq 2 ]'
 check "web and worker image use the new version" 'grep -q "^CATALOG_IMAGE=raynetgmbh/rayventory-catalog:26.3.4789.148$" "$D/.env" && grep -q "^CATALOG_WORKER_IMAGE=raynetgmbh/rayventory-catalog-worker:26.3.4789.148$" "$D/.env"'
 check "option 8 apply started the stack" 'grep -q " up -d --remove-orphans" "$SHIM_LOG"'
-check "header up to date after selection" 'grep -q "Catalog 26.3.4789.148 - up to date" <<< "$out"'
+check "header after selection: the new version - the settings, as the fake stack names no catalog-web container" 'grep -q "Installation Portal   (Catalog 26.3.4789.148 (the settings))$" <<< "$out" && ! grep -q "Catalog 26.3.4789.148 - up to date" <<< "$out"'
 check "script still runs after self-edit" 'bash -n "$D/gen.sh" && bash "$D/gen.sh" check-settings >/dev/null 2>&1'
 
 out="$(printf '8\n1\n4\nn\n0\n\n0\n' | bash "$D/gen.sh" menu 2>&1)"
@@ -447,7 +447,7 @@ sed -i 's/^CHECK_FOR_UPDATES=.*/CHECK_FOR_UPDATES="false"/' "$D/gen.sh"
 : > "$SHIM_LOG"
 out="$(printf '0\n' | bash "$D/gen.sh" menu 2>&1)"
 check "CHECK_FOR_UPDATES=false skips lookup" '! grep -q "^curl" "$SHIM_LOG" && ! grep -q "Checking Docker Hub" <<< "$out"'
-check "header plain when disabled" 'grep -q "Installation Portal   (Catalog 26.3.4789.148)$" <<< "$out"'
+check "header plain when disabled" 'grep -q "Installation Portal   (Catalog not installed - 26.3.4789.148 would be installed)$" <<< "$out"'
 logo_row='|  \ /    |  |_ \_ | | |  | \_/ |_ \_/ \_|  |'
 out="$(printf '0\n' | COLUMNS=200 LINES=200 bash "$D/gen.sh" menu 2>&1)"
 check "plain menu without a terminal: no logo, even with room for it" '! grep -qF "$logo_row" <<< "$out" && grep -q "Installation Portal" <<< "$out"'

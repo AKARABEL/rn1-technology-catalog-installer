@@ -206,14 +206,17 @@ EOF
 # SHIM_FOREIGN_DIR: the containers of the project were started from that folder (SHIM_FOREIGN_IMAGE: the
 # image of its catalog-web). SHIM_PODMAN_DOWN: Podman does not answer. SHIM_VOL_BUSY: data volumes cannot
 # be removed. SHIM_CONFIG_FAIL: podman compose config fails (broken files). SHIM_SOCKET_DOWN: podman.socket
-# is not active (systemctl). SHIM_ROOTLESS: Podman runs rootless. A call the fakes do not know is written
-# to $BAD and fails.
+# is not active (systemctl). SHIM_ROOTLESS: Podman runs rootless. $ST/stopped: the containers exist, none
+# runs. $ST/web-gone: the container of catalog-web was removed, the others are there. A call the fakes do not
+# know is written to $BAD and fails.
 cat > "$T/bin/podman" <<'EOF'
 #!/usr/bin/env bash
 ARGS="$*"
 echo "podman $ARGS" >> "$LOG"
 bad() { echo "UNHANDLED podman $ARGS" | tee -a "$LOG" >> "$BAD"; echo "Error: the fake podman does not know: $ARGS" >&2; exit 125; }
 running() { [ -f "$ST/up" ]; }
+# the containers exist, but none runs
+stopped() { [ -f "$ST/stopped" ]; }
 # containers of another existing folder (a folder that is gone is this installation, moved)
 foreign() { [ -n "${SHIM_FOREIGN_DIR:-}" ] && [ -d "$SHIM_FOREIGN_DIR" ]; }
 wdir() { if [ -n "${SHIM_FOREIGN_DIR:-}" ]; then printf '%s' "$SHIM_FOREIGN_DIR"; else cat "$ST/wd" 2>/dev/null || printf '%s' "$PWD"; fi; }
@@ -227,7 +230,7 @@ img_of() {
     c3) echo "docker.io/raynetgmbh/rayventory-catalog-worker:$(tag)" ;;
   esac
 }
-is_ct() { running && case "$1" in c1|c2|c3) true ;; *) false ;; esac; }
+is_ct() { running && case "$1" in c1|c3) true ;; c2) [ ! -f "$ST/web-gone" ] ;; *) false ;; esac; }
 img_id() { printf '%s' "$1" | cksum | cut -d' ' -f1; }
 # Podman gets qualified names from the installer (a short name would go through registries.conf)
 img_here() {
@@ -275,6 +278,7 @@ case "${1:-}" in
     [ -n "$quiet" ] || bad
     running || exit 0
     for id in c1 c2 c3; do
+      is_ct "$id" || continue
       ok=1
       for f in ${filters[@]+"${filters[@]}"}; do match "$id" "$f" || ok=0; done
       [ "$ok" = 1 ] && echo "$id"
@@ -292,7 +296,7 @@ case "${1:-}" in
       rp '{{index .Config.Labels "com.docker.compose.service"}}' "$(svc_of "$id")"
       rp '{{.Config.Image}}' "$(img_of "$id")"
       rp '{{.Name}}' "$(proj)-$(svc_of "$id")-1"
-      rp '{{.State.Status}}' running
+      rp '{{.State.Status}}' "$(if stopped; then echo exited; else echo running; fi)"
       # Podman 5.x: a container without a healthcheck has no .State.Health
       rp '{{with .State.Health}}{{or .Status "none"}}{{else}}none{{end}}' none
       rp '{{.RestartCount}}' 0
@@ -411,11 +415,11 @@ case "${1:-}" in
             [ $# -eq 2 ] || bad
             if running; then
               case "$2" in
-                mongo) echo c1 ;; catalog-web) echo c2 ;; worker-search) echo c3 ;;
+                mongo) echo c1 ;; catalog-web) is_ct c2 && echo c2 ;; worker-search) echo c3 ;;
                 nginx-proxy-manager) [ "$(envval INSTALL_NGINX_PROXY_MANAGER)" = true ] && echo c4 ;;
               esac
             fi ;;
-          "--services --filter status=running") running && printf '%s\n' mongo catalog-web worker-search ;;
+          "--services --filter status=running") if running && ! stopped; then printf '%s\n' mongo catalog-web worker-search; fi ;;
           "") echo "NAME STATUS"; running && printf '%s\n' "inst-mongo-1 Up" "inst-catalog-web-1 Up" "inst-worker-search-1 Up" ;;
           *) bad ;;
         esac ;;
@@ -424,11 +428,11 @@ case "${1:-}" in
       down)
         case "$*" in "--remove-orphans"|"-v --remove-orphans") ;; *) bad ;; esac
         [ -n "${SHIM_CONFIG_FAIL:-}" ] && exit 1
-        rm -f "$ST/up" "$ST/net"
+        rm -f "$ST/up" "$ST/net" "$ST/stopped"
         if [[ " $* " == *" -v "* ]] && [ -z "${SHIM_VOL_BUSY:-}" ]; then rm -f "$ST/vols" "$ST/vols.rm"; fi ;;
       up)
         [ "$*" = "-d --remove-orphans" ] || bad
-        touch "$ST/up" "$ST/net" "$ST/vols"; rm -f "$ST/vols.rm"
+        touch "$ST/up" "$ST/net" "$ST/vols"; rm -f "$ST/vols.rm" "$ST/stopped"
         printf '%s\n' "docker.io/library/mongo:$(envval MONGO_TAG)" "docker.io/$(envval CATALOG_IMAGE)" "docker.io/$(envval CATALOG_WORKER_IMAGE)" > "$ST/images"
         envval CATALOG_IMAGE | sed 's/.*://' > "$ST/catalog_tag"
         envval MONGO_TAG > "$ST/mongo_tag"
@@ -1241,6 +1245,142 @@ touch "$D/.setup-later"
 out="$(printf 'i\n\n\n\n\n\n\n\n0\n' | bash "$I" menu 2>&1)"
 check "I with .setup-later: the new installation runs, the marker goes when it is done" 'grep -q "Install .* step 2 of 9" <<< "$out" && grep -q "The Catalog is installed" <<< "$out" && [ ! -e "$D/.setup-later" ]'
 
+# 30. What is installed here - the containers, the data volumes, the files - in the header, the I and U cards,
+#     status (9) and check (16): "up to date" only for an installed Catalog. After option 99, or R that kept the
+#     files, nothing is installed: the header names the version a start would install, I is a new installation.
+# states_installed -> Catalog 26.3 (the newest on Docker Hub) installed by this installer and running
+states_installed() {
+  installed
+  sed -i 's/^CATALOG_VERSION=.*/CATALOG_VERSION="26.3.4789.148"/; s/^CHECK_FOR_UPDATES=.*/CHECK_FOR_UPDATES="true"/' "$I"
+  (cd "$D" && bash rn1-technology-catalog-installer.sh generate </dev/null >/dev/null 2>&1)
+  echo "26.3.4789.148" > "$ST/catalog_tag"
+  : > "$LOG"
+}
+plain_menu() { printf '0\n' | COLUMNS=80 bash "$I" menu 2>&1; }
+# installed: the header and the cards of the plain menu (VERSION STATE-TEXT)
+installed_cards() {
+  grep -q "Installation Portal   (Catalog 26.3.4789.148 - up to date)$" <<< "$out" && grep -Eq "I\) INSTALL +.* $1$" <<< "$out" \
+    && grep -Eq "U\) UPDATE +.* Catalog up to date$" <<< "$out" && ! grep -q "not installed" <<< "$out"
+}
+# nothing installed, only the files: the header, the cards, no "up to date"
+files_cards() {
+  grep -q "Installation Portal   (Catalog not installed - 26.3.4789.148 would be installed (the newest))$" <<< "$out" \
+    && grep -Eq "I\) INSTALL +.* Not installed: no containers, no data$" <<< "$out" && grep -Eq "U\) UPDATE +Nothing installed yet$" <<< "$out" \
+    && grep -Eq "R\) REMOVE +.* Remove what is left$" <<< "$out" && ! grep -q "up to date" <<< "$out"
+}
+fresh 's/^CHECK_FOR_UPDATES=.*/CHECK_FOR_UPDATES="true"/'
+out="$(plain_menu)"
+check "state none: not installed - the version a start would install and the newer one, never up to date" 'grep -q "Installation Portal   (Catalog not installed - 25.4.4191.133 would be installed, newer: 26.3.4789.148 (stable), option 8)$" <<< "$out" && grep -Eq "I\) INSTALL +.* New installation, step by step$" <<< "$out" && grep -Eq "U\) UPDATE +Nothing installed yet$" <<< "$out" && grep -Eq "R\) REMOVE +Nothing installed$" <<< "$out" && ! grep -q "up to date" <<< "$out"'
+states_installed
+out="$(plain_menu)"
+check "state running: the installed Catalog up to date, the I card with the services" 'installed_cards "Catalog 26\.3\.4789\.148 . 3 running"'
+touch "$ST/stopped"
+out="$(plain_menu)"
+check "state stopped (containers, none runs): installed, up to date, the I card says stopped" 'installed_cards "Catalog 26\.3\.4789\.148 . stopped" && grep -q "^Stack  : 0 service(s) running$" <<< "$out"'
+out="$(bash "$I" status </dev/null 2>&1)"
+check "state stopped: status names it" 'grep -q "^Catalog 26.3.4789.148 installed, stopped - .* up. starts it$" <<< "$out"'
+rm -f "$ST/stopped"
+out="$(printf '13\ny\n\n0\n' | bash "$I" menu 2>&1)"
+check "option 13: the containers go, the data volumes stay" '[ ! -f "$ST/up" ] && [ -f "$ST/vols" ] && grep -q "Stack stopped. Data volumes are kept" <<< "$out"'
+out="$(plain_menu)"
+check "state data only (after 13): installed, up to date, the I card says the data is kept" 'installed_cards "Data kept, no containers"'
+out="$(printf '9\n\n16\n\n0\n' | bash "$I" menu 2>&1)"
+check "state data only: status and check say the same" 'grep -q "^Catalog 26.3.4789.148 installed: its data is kept, no containers - menu option 6 starts it again$" <<< "$out" && grep -q "Catalog 26.3.4789.148 is installed here: its data is kept, no containers - menu option 6 starts it again." <<< "$out"'
+
+# after option 99: the files of this installer stay, nothing else - no note about them (the host name and the
+# cache of MongoDB in .env are what the next generate writes too)
+states_installed
+p1="$(envv MONGO_INITDB_ROOT_PASSWORD)"
+out="$(printf '99\nDELETE\n\n0\n' | bash "$I" menu 2>&1)"
+check "option 99: containers and data volumes gone, the files kept" '[ ! -f "$ST/up" ] && [ ! -f "$ST/vols" ] && [ -f "$D/.env" ] && [ -f "$D/docker-compose.yml" ] && grep -q "Containers and data volumes removed." <<< "$out"'
+rm -f "$ST/license"
+out="$(plain_menu)"
+check "after 99: not installed - the version a start would install, the cards, never up to date" 'files_cards'
+check "after 99: the files of this installer are no difference (no note)" '! grep -q -e "option 2 regenerates them" -e "do not match the settings" -e "differ from" <<< "$out"'
+out="$(printf '9\n\n16\n\n0\n' | bash "$I" menu 2>&1)"
+check "after 99: status says nothing is installed and what a start installs" 'grep -q "^Catalog not installed: no containers and no data volumes, only .env and docker-compose.yml.$" <<< "$out" && grep -q "^A start makes a new, empty Catalog - 26.3.4789.148 would be installed (the newest).$" <<< "$out" && grep -q "^Start it with menu option 6, or step by step with I.$" <<< "$out" && ! grep -q "installed: its data\|installed, stopped" <<< "$out"'
+check "after 99: check says the same" 'grep -q "Catalog not installed here: no containers and no data volumes, only .env and docker-compose.yml - a start makes a new, empty Catalog: 26.3.4789.148 would be installed (the newest).$" <<< "$out"'
+: > "$LOG"
+out="$(printf 'u\n\n21\n\n0\n' | bash "$I" menu 2>&1)"
+check "after 99: U and option 21 have nothing to update" 'grep -q "Nothing is installed in this folder yet - I installs the Catalog." <<< "$out" && grep -q "Only .env and docker-compose.yml are here, no containers and no data." <<< "$out" && grep -q "There is nothing to upgrade - option 8 picks the versions, I or option 6 installs the Catalog." <<< "$out" && ! grep -q -e "The Catalog is up to date" -e "Update . step" -e "Installed Catalog:" <<< "$out" && ! grep -Eq "$MUTATING" "$LOG"'
+sed -i 's/^CATALOG_VERSION=.*/CATALOG_VERSION="25.4.4191.133"/' "$I"
+out="$(plain_menu)"
+check "after 99, older settings: a start installs what the files name, option 2 what the settings say" 'grep -q "(Catalog not installed - 26.3.4789.148 would be installed (the files; option 2 writes 25.4.4191.133))$" <<< "$out" && ! grep -q "up to date" <<< "$out"'
+out="$(bash "$I" status </dev/null 2>&1)"
+check "after 99, older settings: status names the version of the files" 'grep -q "^A start makes a new, empty Catalog - 26.3.4789.148 would be installed (the files; option 2 writes 25.4.4191.133).$" <<< "$out"'
+sed -i 's/^CATALOG_VERSION=.*/CATALOG_VERSION="26.3.4789.148"/' "$I"
+# I on these files: a new installation (the versions of a new one, the passwords of the files), not a repair
+: > "$LOG"
+out="$(printf 'i\n\n\n\n\n\n\n\n0\n' | bash "$I" menu 2>&1)"
+check "I after 99: a new installation on the files, not a repair of nothing" 'grep -q "New installation on the files of this folder: no containers and no data" <<< "$out" && grep -q "Install .* step 6 of 9" <<< "$out" && ! grep -q -e "already has an installation" -e "Repair:" -e "passwords, data and version are kept" <<< "$out"'
+check "I after 99: the recommended versions, the passwords of the files, started" 'grep -q "recommended" <<< "$out" && [ "$(setting CATALOG_VERSION)" = 26.3.4789.148 ] && [ "$(envv MONGO_INITDB_ROOT_PASSWORD)" = "$p1" ] && grep -q "up -d --remove-orphans" "$LOG" && [ -f "$ST/up" ] && grep -q "The Catalog is installed" <<< "$out"'
+out="$(plain_menu)"
+check "I after 99: then installed and running again" 'installed_cards "Catalog 26\.3\.4789\.148 . 3 running"'
+
+# R that keeps the files: the same as after 99
+states_installed
+out="$(printf 'r\nn\ny\n3\n\nDELETE\n\n0\n' | bash "$I" menu 2>&1)"
+check "R keeping the files: the containers and the data volumes gone, the files kept" '[ ! -f "$ST/up" ] && [ ! -f "$ST/vols" ] && [ -f "$D/.env" ] && [ -f "$D/docker-compose.yml" ] && grep -q "The Catalog was removed from this server" <<< "$out"'
+out="$(plain_menu)"
+check "after R keeping the files: not installed, never up to date, no note about the files" 'files_cards && ! grep -q -e "option 2 regenerates them" -e "do not match the settings" <<< "$out"'
+
+# a licensed catalog-web that kept its container ID as host name (the repair of older files), the cache of
+# MongoDB in .env: after 99 no note either - the next generate keeps that name and writes the cache anew
+installed; sed -i '/^CATALOG_HOSTNAME=/d' "$D/.env"
+printf 'i\n1\ny\ny\n\ny\ny\ny\n0\n\n0\n' | bash "$I" menu >/dev/null 2>&1
+printf '99\nDELETE\n\n0\n' | bash "$I" menu >/dev/null 2>&1
+out="$(plain_menu)"
+check "after 99, the container ID kept as host name and the cache in .env: not installed, no note" '[ "$(envv CATALOG_HOSTNAME)" = c2 ] && [ -n "$(envv MONGO_WT_CACHE_GB)" ] && [ ! -f "$ST/vols" ] && grep -q "Installation Portal   (Catalog not installed - 25.4.4191.133 would be installed)$" <<< "$out" && ! grep -q -e "option 2 regenerates them" -e "do not match the settings" <<< "$out"'
+
+# the files of an installer older than the fixed host name: after 99 they really differ from what option 2 writes
+states_installed
+sed -i '/^CATALOG_HOSTNAME=/d' "$D/.env"
+printf '99\nDELETE\n\n0\n' | bash "$I" menu >/dev/null 2>&1
+out="$(plain_menu)"
+check "after 99, files of an older installer: not installed, the note names the older installer" 'files_cards && grep -q "The generated files do not match the settings above (written by an older installer) - option 2 regenerates them." <<< "$out"'
+
+# after 99, older settings written into the files (option 2): the version of the settings, the newer one with option 8
+states_installed
+printf '99\nDELETE\n\n0\n' | bash "$I" menu >/dev/null 2>&1
+sed -i 's/^CATALOG_VERSION=.*/CATALOG_VERSION="25.4.4191.133"/' "$I"
+(cd "$D" && bash rn1-technology-catalog-installer.sh generate </dev/null >/dev/null 2>&1)
+out="$(plain_menu)"
+check "after 99 and option 2 with older settings: the newer version named with option 8, never up to date" '[ "$(envv CATALOG_IMAGE)" = raynetgmbh/rayventory-catalog:25.4.4191.133 ] && grep -q "(Catalog not installed - 25.4.4191.133 would be installed, newer: 26.3.4789.148 (stable), option 8)$" <<< "$out" && ! grep -q -e "up to date" -e "regenerates them" <<< "$out"'
+out="$(printf '8\n0\n\n0\n' | bash "$I" menu 2>&1)"
+check "after 99: option 8 names the Catalog not installed, never up to date" 'grep -q "Catalog + 4 workers .*25.4.4191.133 .*newer available - not installed" <<< "$out" && ! grep -q "Catalog + 4 workers.*up to date" <<< "$out"'
+
+# the engine cannot tell what is installed: the version of the settings, no "up to date" anywhere
+states_installed
+printf '99\nDELETE\n\n0\n' | bash "$I" menu >/dev/null 2>&1
+out="$(printf '0\n' | SHIM_SOCKET_DOWN=1 COLUMNS=80 bash "$I" menu 2>&1)"
+check "after 99, Podman's API down: the settings named, not up to date, U without a claim" 'grep -q "Installation Portal   (Catalog 26.3.4789.148 (the settings))$" <<< "$out" && grep -Eq "I\) INSTALL +! Podman not reachable$" <<< "$out" && grep -Eq "U\) UPDATE +.* Installer and Catalog$" <<< "$out" && ! grep -q "up to date" <<< "$out"'
+rm -f "$D/docker-compose.yml"
+out="$(plain_menu)"
+check "only .env left, nothing else: incomplete, the settings named, not up to date" 'grep -q "Installation Portal   (Catalog 26.3.4789.148 (the settings))$" <<< "$out" && grep -q "Incomplete: no compose file" <<< "$out" && grep -Eq "U\) UPDATE +.* Installer and Catalog .* repair first \(I\), then U$" <<< "$out" && ! grep -q "up to date" <<< "$out"'
+
+# catalog-web's container removed, the other containers of the stack there but stopped: stopped, not "no containers"
+states_installed
+touch "$ST/stopped" "$ST/web-gone"
+out="$(plain_menu)"
+check "catalog-web removed, the rest stopped: installed and stopped (from the data), not data only" 'installed_cards "Catalog 26\.3\.4789\.148 . stopped" && ! grep -q "no containers" <<< "$out"'
+out="$(bash "$I" status </dev/null 2>&1)"
+check "catalog-web removed, the rest stopped: status says stopped" 'grep -q "^Catalog 26.3.4789.148 installed, stopped - .* up. starts it$" <<< "$out" && ! grep -q "no containers" <<< "$out"'
+rm -f "$ST/stopped" "$ST/web-gone"
+
+# a failed upgrade leaves a mark (option 21 offers going back): 99 and R with the data remove it - nothing to go
+# back to; an older mark is removed by option 21 where nothing is installed
+states_installed
+echo "25.4.4191.133|26.3.4789.148|backups/mongo-x.archive.gz" > "$D/.upgrade-failed"
+printf '99\nDELETE\n\n0\n' | bash "$I" menu >/dev/null 2>&1
+check "option 99: the mark of a failed upgrade goes with the data" '[ ! -f "$D/.upgrade-failed" ] && [ ! -f "$ST/vols" ]'
+echo "25.4.4191.133|26.3.4789.148|backups/mongo-x.archive.gz" > "$D/.upgrade-failed"
+out="$(printf '21\n\n0\n' | bash "$I" menu 2>&1)"
+check "after 99, an older mark: option 21 has nothing to go back to and removes it" 'grep -q "There is nothing to upgrade" <<< "$out" && ! grep -q "Go back to" <<< "$out" && [ ! -f "$D/.upgrade-failed" ]'
+states_installed
+echo "25.4.4191.133|26.3.4789.148|backups/mongo-x.archive.gz" > "$D/.upgrade-failed"
+out="$(printf 'r\nn\ny\n3 4\n\nDELETE\n\n0\n' | bash "$I" menu 2>&1)"
+check "R removing the data, keeping the files and the job logs: the mark of a failed upgrade goes with the data" 'grep -q "Job logs, stored API keys and markers" <<< "$out" && [ ! -f "$ST/vols" ] && [ -f "$D/.env" ] && [ -d "$D/.jobs" ] && [ ! -f "$D/.upgrade-failed" ]'
+
 # 21. Full screen and terminal: the first start, and the lines above the prompt say what the typed number does
 if command -v script >/dev/null 2>&1 && [ "$(uname -s)" = "Linux" ]; then
   # tty_run COMMAND [PATTERN KEYS]... -> runs COMMAND in a pseudo-terminal (TTY_SIZE, default 120x40): waits
@@ -1374,6 +1514,65 @@ if command -v script >/dev/null 2>&1 && [ "$(uname -s)" = "Linux" ]; then
   check "logo: not in the plain menu when it does not fit (100x40)" '! grep -qF -- "${LOGO_U[3]:0:30}" <<< "$out" && grep -q "Raynet One Technology Catalog - Installation Portal" <<< "$out"'
   out="$(TTY_SIZE=120x50 tty_run "LC_ALL=C bash $I menu" "Select:" q)"
   check "logo: ASCII in a C locale, centred the same" '[ ${#LOGO_A[@]} -eq 4 ] && logo_at 22 "${LOGO_A[@]}" && ! grep -qF -- "${LOGO_U[1]:48:3}" <<< "$out" || { printf "%s\n" "$out" | head -n 12 | sed "s/^/  | /"; false; }'
+
+  # 30 in full screen: the header and the cards of each state, at 120x40 and 200x50 (the cards side by side
+  # on one line), no text cut
+  tui_state() { TTY_SIZE="$1" tty_run "bash $I menu" "Select:" q; }
+  uncut() { ! grep -E "running|stopped|starts|kept|containers|installed" <<< "$out" | grep -q "~ "; }
+  states_installed
+  out="$(tui_state 120x40)"
+  check "full screen 120x40, running: up to date, the cards" '{ grep -q "Catalog 26.3.4789.148 .* up to date" <<< "$out" && grep -q "Installed .* 3 running .*Catalog up to date" <<< "$out" && ! grep -q "not installed" <<< "$out" && uncut; } || { printf "%s\n" "$out" | head -n 12 | sed "s/^/  | /"; false; }'
+  out="$(tui_state 200x50)"
+  check "full screen 200x50, running: the version in the I card" 'grep -q "Catalog 26.3.4789.148 .* up to date" <<< "$out" && grep -q "Catalog 26.3.4789.148 .* 3 running .*Catalog up to date" <<< "$out" && uncut'
+  touch "$ST/stopped"
+  out="$(tui_state 120x40)"
+  check "full screen 120x40, stopped: up to date, the I card says stopped" 'grep -q "Catalog 26.3.4789.148 .* up to date" <<< "$out" && grep -q "Installed .* stopped .*Catalog up to date" <<< "$out" && grep -q "6 starts it .* or repair .*installer and patches" <<< "$out" && uncut'
+  out="$(tui_state 200x50)"
+  check "full screen 200x50, stopped: the version in the I card" 'grep -q "Catalog 26.3.4789.148 .* stopped .*Catalog up to date" <<< "$out" && uncut'
+  rm -f "$ST/stopped"
+  printf '13\ny\n\n0\n' | bash "$I" menu >/dev/null 2>&1
+  out="$(tui_state 120x40)"
+  check "full screen 120x40, data only (after 13): up to date, the data kept" 'grep -q "Catalog 26.3.4789.148 .* up to date" <<< "$out" && grep -q "Data kept, no containers .*Catalog up to date" <<< "$out" && grep -q "6 starts it again .* or repair" <<< "$out" && uncut'
+  out="$(tui_state 200x50)"
+  check "full screen 200x50, data only: the version in the I card" 'grep -q "Catalog 26.3.4789.148 .* data kept, no containers .*Catalog up to date" <<< "$out" && uncut'
+  states_installed
+  printf '99\nDELETE\n\n0\n' | bash "$I" menu >/dev/null 2>&1
+  for size in 100x40 120x40; do
+    out="$(tui_state "$size")"
+    check "full screen $size, after 99: not installed, the version a start would install, never up to date" '{ grep -q "Catalog not installed .* 26.3.4789.148 would be installed (the newest)" <<< "$out" && grep -q "No containers, no data .*Nothing installed yet .*Remove what is left" <<< "$out" && grep -q "6 starts a new.*install first (I)" <<< "$out" && ! grep -q -e "up to date" -e "option 2 regenerates" <<< "$out" && uncut; } || { printf "%s\n" "$out" | head -n 12 | sed "s/^/  | /"; false; }'
+  done
+  out="$(tui_state 200x50)"
+  check "full screen 200x50, after 99: the long texts of the cards" 'grep -q "Catalog not installed .* 26.3.4789.148 would be installed (the newest)" <<< "$out" && grep -q "Not installed: no containers, no data .*Nothing installed yet" <<< "$out" && grep -q "6 starts a new, empty Catalog .* I installs it step by step .*install first (I)" <<< "$out" && ! grep -q "up to date" <<< "$out" && uncut'
+  # the settings changed after 99: the version of the files, what option 2 writes
+  sed -i 's/^CATALOG_VERSION=.*/CATALOG_VERSION="25.4.4191.133"/' "$I"
+  for size in 100x40 120x40 200x50; do
+    out="$(tui_state "$size")"
+    check "full screen $size, after 99, older settings: the version of the files, option 2" '{ grep -q "ot installed .*26.3.4789.148 .*option 2 writes 25.4.4191.133" <<< "$out" && ! grep -q "up to date" <<< "$out" && ! grep "ot installed" <<< "$out" | grep -q "~"; } || { printf "%s\n" "$out" | head -n 12 | sed "s/^/  | /"; false; }'
+  done
+  # option 2 writes the older settings: the newer version, shortened beside the internet line (2 optional sites
+  # blocked, the check of the menu start in its cache) - nothing cut
+  (cd "$D" && bash rn1-technology-catalog-installer.sh generate </dev/null >/dev/null 2>&1)
+  mkdir -p "$D/.jobs"
+  { printf '%s|%s|5\n' "$(date +%s)" "$(RN1_NET_CHECK=on bash "$I" __net signature)"
+    printf '%s\n' "hub|OK|req|site-1.example:443|images|" "cloud|BLOCKED|opt|site-2.example:443|catalog data|" "license|BLOCKED|opt|site-3.example:443|license|"
+  } > "$D/.jobs/internet-check"
+  for size in 100x40 120x40; do
+    out="$(TTY_SIZE="$size" tty_run "RN1_NET_CHECK=on bash $I menu" "Select:" q)"
+    check "full screen $size, nothing installed, older settings, the internet line: the newer version, nothing cut" '{ grep -q "ot installed .*26.3.4789.148 is newer .*Internet .* 2 optional sites blocked" <<< "$out" && ! grep "ot installed" <<< "$out" | grep -q "~"; } || { printf "%s\n" "$out" | head -n 12 | sed "s/^/  | /"; false; }'
+  done
+  # the plain menu at 100 columns: the state of the Catalog on a line of its own, no line wider than the terminal;
+  # the logo exactly when the whole menu fits below it
+  out="$(TTY_SIZE=100x200 tty_run "RVC_UI=plain LC_ALL=C bash $I menu" "Select an option:" '0\n')"
+  wide="$(sed -n '/^Raynet One Technology Catalog - Installation Portal/,/Select an option:/p' <<< "$out" | awk 'length($0) > 100')"
+  check "plain menu at 100 columns, nothing installed: the title alone, the Catalog on its own line, nothing wider" '{ grep -qx "Raynet One Technology Catalog - Installation Portal" <<< "$out" && grep -qx "Catalog: not installed - 25.4.4191.133 would be installed, newer: 26.3.4789.148 (stable), option 8" <<< "$out" && [ -z "$wide" ]; } || { printf "%s\n" "$wide" | head -5; false; }'
+  first="$(grep -n -m1 -xF -- "$(printf '%12s' '')${LOGO_A[0]}" <<< "$out" | cut -d: -f1)"
+  last="$(grep -n -m1 "Select an option:" <<< "$out" | cut -d: -f1)"
+  fit=$((${last:-0} - ${first:-0} + 1))
+  out="$(TTY_SIZE="100x$fit" tty_run "RVC_UI=plain LC_ALL=C bash $I menu" "Select an option:" '0\n')"
+  check "plain menu at 100 columns: the logo when the whole menu fits below it (100x$fit)" '[ -n "$first" ] && logo_at 12 "${LOGO_A[@]}" || { printf "%s\n" "$out" | head -n 8 | sed "s/^/  | /"; false; }'
+  out="$(TTY_SIZE="100x$((fit - 1))" tty_run "RVC_UI=plain LC_ALL=C bash $I menu" "Select an option:" '0\n')"
+  check "plain menu at 100 columns: no logo a row shorter (100x$((fit - 1)))" '! grep -qF -- "${LOGO_A[3]:0:30}" <<< "$out" && grep -qx "Raynet One Technology Catalog - Installation Portal" <<< "$out"'
+  rm -rf "$D/.jobs"
 else
   echo "SKIP: script (util-linux) missing - no test of the first start and of the full screen typing hints"
 fi

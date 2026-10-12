@@ -389,14 +389,20 @@ inst "" 8.0.32 26.1.4475.137
 out="$(printf '21\nn\n0\n' | SHIM_STABLE=bbbb bash "$I" menu 2>&1)"
 check "stable 26.1, newest 26.3: option 21 upgrades to the newest" 'grep -q "Newest Catalog:    26.3.4789.148$" <<< "$out" && grep -q "CATALOG_VERSION 26.1.4475.137 -> 26.3.4789.148" <<< "$out" && grep -q "Cancelled - nothing was changed." <<< "$out" && [ "$(setting CATALOG_VERSION)" = 26.1.4475.137 ]'
 if command -v script >/dev/null 2>&1 && [ "$(uname -s)" = "Linux" ]; then
+  # tui_header -> the full screen menu at 120x40 (the first start put off: no new installation)
+  tui_header() {
+    local log="$T/tui.log" n
+    touch "$D/.setup-later"
+    { for n in $(seq 1 120); do grep -q "Select:" "$log" 2>/dev/null && break; sleep 0.5; done; sleep 1; printf q; sleep 2; } \
+      | SHIM_STABLE=bbbb TERM=xterm LANG=C.UTF-8 timeout 90 script -qfec "stty cols 120 rows 40; bash $I menu" /dev/null > "$log" 2>&1
+    sed 's/\x1b[[(][0-9;?]*[A-Za-z]//g; s/\x1b[78]//g' "$log" | tr -d '\r'
+  }
+  inst 's/^CHECK_FOR_UPDATES=.*/CHECK_FOR_UPDATES="true"/' 8.0.32 26.1.4475.137
+  out="$(tui_header)"
+  check "full screen, Catalog 26.1 (stable) installed, newest 26.3: the header points to U or option 21" 'grep -q "Catalog 26.1.4475.137 .*26.3.4789.148 .*U or option 21" <<< "$out" && ! grep -q "26.3.4789.148, option 8" <<< "$out"'
   fresh 's/^CHECK_FOR_UPDATES=.*/CHECK_FOR_UPDATES="true"/; s/^CATALOG_VERSION=.*/CATALOG_VERSION="26.1.4475.137"/'
-  # the first start was put off: the menu opens without the new installation
-  touch "$D/.setup-later"
-  log="$T/tui.log"
-  { for n in $(seq 1 120); do grep -q "Select:" "$log" 2>/dev/null && break; sleep 0.5; done; sleep 1; printf q; sleep 2; } \
-    | SHIM_STABLE=bbbb TERM=xterm LANG=C.UTF-8 timeout 90 script -qfec "stty cols 120 rows 40; bash $I menu" /dev/null > "$log" 2>&1
-  out="$(sed 's/\x1b[[(][0-9;?]*[A-Za-z]//g; s/\x1b[78]//g' "$log" | tr -d '\r')"
-  check "full screen, Catalog 26.1 (stable), newest 26.3: the header points to U or option 21" 'grep -q "Catalog 26.1.4475.137 .*26.3.4789.148 .*U or option 21" <<< "$out" && ! grep -q "26.3.4789.148, option 8" <<< "$out"'
+  out="$(tui_header)"
+  check "full screen, nothing installed, the settings 26.1 (stable), newest 26.3: the version a start would install, option 8" 'grep -q "Catalog not installed .* 26.1.4475.137 would be installed .* 26.3.4789.148 is newer .* option 8" <<< "$out" && ! grep -q -e "U or option 21" -e "up to date" <<< "$out"'
 else
   echo "SKIP: script (util-linux) missing - no full screen header test"
 fi
