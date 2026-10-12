@@ -221,10 +221,14 @@ tags() { printf '%s|' "$(setting CATALOG_VERSION)" "$(setting MONGO_TAG)" "$(set
 choose() { printf "$1" | bash "$I" __choose_versions 2>&1; }
 OLD_TAGS='0,/^MONGO_TAG=/s/^MONGO_TAG=.*/MONGO_TAG="8"/; 0,/^RABBITMQ_TAG=/s/^RABBITMQ_TAG=.*/RABBITMQ_TAG="3-management-alpine"/; 0,/^NGINX_PROXY_MANAGER_TAG=/s/^NGINX_PROXY_MANAGER_TAG=.*/NGINX_PROXY_MANAGER_TAG="latest"/'
 OUTSIDE='9\.0\.2|8\.3\.11|8\.2\.12|3\.9\.0|3\.3\.2|4\.2\.9|4\.3\.6|v3'
+# a Catalog older than the newest on Docker Hub (the default is the newest stable one of the release)
+OLD_CATALOG='s/^CATALOG_VERSION=.*/CATALOG_VERSION="25.4.4191.133"/'
+# the default of a release: the newest stable Catalog on the fake Docker Hub
+RELEASE_CATALOG='s/^CATALOG_VERSION=.*/CATALOG_VERSION="26.3.4789.148"/'
 
-# 1. Defaults: inside the series, so installs without the wizard stay there
+# 1. Defaults: inside the series, so installs without the wizard stay there; the Catalog an exact version
 fresh
-check "defaults: MongoDB 8.0, OpenSearch 2, RabbitMQ 3.13, Nginx Proxy Manager 2" '[ "$(tags)" = "25.4.4191.133|8.0|2|2|3.13-management-alpine|RELEASE.2025-10-15T17-29-55Z|2|" ]'
+check "defaults: an exact Catalog, MongoDB 8.0, OpenSearch 2, RabbitMQ 3.13, Nginx Proxy Manager 2" '[[ "$(tags)" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+\|8\.0\|2\|2\|3\.13-management-alpine\|RELEASE\.2025-10-15T17-29-55Z\|2\|$ ]]'
 check "the allowed series sit below the settings section (the installer update brings them)" 'grep -q "^declare -A SERIES_ALLOWED=(\[mongo\]=\"8.0\" \[opensearch\]=\"2\" \[rabbitmq\]=\"3\" \[npm\]=\"2\" \[minio\]=\"\")$" "$I" && [ "$(grep -n "^declare -A SERIES_ALLOWED=" "$I" | cut -d: -f1)" -gt "$(grep -n "^# DO NOT CHANGE ANYTHING BELOW" "$I" | cut -d: -f1)" ]'
 
 # 2. Option 8 table (updates): recommended = the newest inside the series, the Catalog the newest
@@ -272,8 +276,8 @@ out="$(printf '8\np\n0\n' | bash "$I" menu 2>&1)"
 check "pin: a moving tag that points outside the series is not pinned" 'grep -q "MongoDB: \"8\" points to 8.3.11, outside the series 8.0 Raynet runs - not pinned" <<< "$out" && [ "$(setting MONGO_TAG)" = 8 ]'
 check "pin: moving tags inside the series pinned (RabbitMQ 3.13.7, Nginx Proxy Manager 2.16.0)" '[ "$(setting RABBITMQ_TAG)" = 3.13.7-management-alpine ] && [ "$(setting NGINX_PROXY_MANAGER_TAG)" = 2.16.0 ] && [ "$(setting OPENSEARCH_TAG)" = 2.19.6 ]'
 
-# 4. The versions screen of the wizard (choose_versions)
-fresh
+# 4. The versions screen of the wizard (choose_versions), a download with an older Catalog than the newest
+fresh "$OLD_CATALOG"
 cp "$I" "$T/before.sh"
 out="$(choose '\n')"; rc=$?
 check "versions screen: reads the registries once, one row each, NPM included" '[ "$rc" -eq 0 ] && [ "$(grep -c "Checking Docker Hub and GHCR" <<< "$out")" -eq 1 ] && grep -q "Catalog + 4 workers" <<< "$out" && grep -q "Nginx Proxy Manager" <<< "$out" && grep -q "MinIO" <<< "$out"'
@@ -283,6 +287,15 @@ check "versions screen: nothing outside the series shown, the newer series named
 check "versions screen: the settings are named" 'grep -q "MONGO_TAG = \"8.0.32\"" <<< "$out" && grep -q "CATALOG_VERSION = \"26.3.4789.148\"" <<< "$out"'
 out="$(choose '\n')"; rc=$?
 check "versions screen again: nothing to change" '[ "$rc" -eq 0 ] && grep -q "The versions stay as they are." <<< "$out"'
+# a download of a release: its default is the newest stable Catalog - CURRENT is SELECTED, recommended, no
+# upgrade, and Enter leaves CATALOG_VERSION as it is
+for loc in C C.UTF-8; do
+  fresh "$RELEASE_CATALOG"
+  out="$(LC_ALL=$loc choose '\n')"; rc=$?
+  row="$(grep "Catalog + 4 workers" <<< "$out" | head -n 1)"
+  check "release download ($loc): the Catalog row CURRENT = SELECTED, stable and recommended, no arrow" '[ "$rc" -eq 0 ] && [[ "$row" =~ Catalog\ \+\ 4\ workers\ +26\.3\.4789\.148\ +26\.3\.4789\.148\ .*stable.*recommended ]] && ! grep -q -e "->" -e "→" -e "your choice" -e "kept" <<< "$row" || { echo "  | $row"; false; }'
+  check "release download ($loc): Enter does not write CATALOG_VERSION, the others pinned" '[ "$(setting CATALOG_VERSION)" = 26.3.4789.148 ] && ! grep -q "CATALOG_VERSION = " <<< "$out" && grep -q "MONGO_TAG = \"8.0.32\"" <<< "$out"'
+done
 
 fresh
 out="$(choose '3\n2\n1\n26.1.4475.137\n2\n9.0.2\n8.3.11\n2\n\n')"; rc=$?
@@ -308,16 +321,16 @@ fresh 's/^INSTALL_NGINX_PROXY_MANAGER=.*/INSTALL_NGINX_PROXY_MANAGER="false"/'
 out="$(choose '\n')"; rc=$?
 check "versions screen without Nginx Proxy Manager: no row, its tag stays" '[ "$rc" -eq 0 ] && ! grep -q "Nginx Proxy Manager" <<< "$out" && [ "$(setting NGINX_PROXY_MANAGER_TAG)" = 2 ] && [ "$(setting MONGO_TAG)" = 8.0.32 ]'
 
-# 5. Registry not reachable: the moving tags of the series, the Catalog stays
-fresh "$OLD_TAGS"
+# 5. Registry not reachable: the moving tags of the series, the Catalog stays (an older one: with Docker Hub it would change)
+fresh "$OLD_TAGS; $OLD_CATALOG"
 out="$(SHIM_REG_DOWN=1 choose '\n')"; rc=$?
 check "registry down: the series tags (8.0, 3.13-management-alpine, 2), the Catalog kept, said so" '[ "$rc" -eq 0 ] && [ "$(tags)" = "25.4.4191.133|8.0|2|2|3.13-management-alpine|RELEASE.2025-10-15T17-29-55Z|2|" ] && grep -q "could not be read" <<< "$out" && grep -q "the Catalog stays 25.4.4191.133" <<< "$out"'
 fresh '0,/^MONGO_TAG=/s/^MONGO_TAG=.*/MONGO_TAG="8.0.30"/'
 out="$(SHIM_REG_DOWN=1 choose '\n')"; rc=$?
 check "registry down: an exact version inside the series is kept" '[ "$rc" -eq 0 ] && [ "$(setting MONGO_TAG)" = 8.0.30 ] && [ "$(setting RABBITMQ_TAG)" = 3.13-management-alpine ]'
 
-# 6. A folder that is installed already: versions outside the series and the Catalog are kept
-fresh "$OLD_TAGS; 0,/^RABBITMQ_TAG=/s/^RABBITMQ_TAG=.*/RABBITMQ_TAG=\"3.12.14-management-alpine\"/"
+# 6. A folder that is installed already (Catalog 25.4): versions outside the series and the Catalog are kept
+fresh "$OLD_TAGS; $OLD_CATALOG; 0,/^RABBITMQ_TAG=/s/^RABBITMQ_TAG=.*/RABBITMQ_TAG=\"3.12.14-management-alpine\"/"
 echo "MONGO_TAG=8" > "$D/.env"
 out="$(choose '\n')"; rc=$?
 check "installed: MongoDB 8.3.11 outside the series kept with a warning (never downgraded automatically)" '[ "$rc" -eq 0 ] && [ "$(setting MONGO_TAG)" = 8 ] && grep -q "MongoDB 8.3.11 is outside the series 8.0 Raynet runs with the Catalog - kept: it is never downgraded automatically." <<< "$out"'
@@ -381,7 +394,7 @@ out="$(choose '1\n1\n0\n\n')"; rc=$?
 check "installed Catalog 25.4: a newer one picked on the versions screen is refused" '[ "$rc" -eq 0 ] && [ "$(setting CATALOG_VERSION)" = 25.4.4191.133 ] && grep -q "U or option 21 upgrades the Catalog of an installation (MongoDB backup, health check, rollback) - not this screen." <<< "$out" && grep -q "25.4.4191.133 .*installed" <<< "$out"'
 
 # the newest Catalog is not the stable one: the newest is recommended and the upgrade target
-fresh
+fresh "$OLD_CATALOG"
 out="$(SHIM_STABLE=bbbb choose '1\n0\n\n')"; rc=$?
 check "stable 26.1, newest 26.3: the row marks 26.1 stable and 26.3 recommended" 'grep -E "^   [0-9]  26\.1\.4475\.137 " <<< "$out" | grep -q "stable" && ! grep -E "^   [0-9]  26\.1\.4475\.137 " <<< "$out" | grep -q "recommended" && grep -E "^   [0-9]  26\.3\.4789\.148 " <<< "$out" | grep -q "recommended" && ! grep -E "^   [0-9]  26\.3\.4789\.148 " <<< "$out" | grep -q "stable"'
 check "stable 26.1, newest 26.3: Enter writes the newest" '[ "$rc" -eq 0 ] && [ "$(setting CATALOG_VERSION)" = 26.3.4789.148 ]'
@@ -438,6 +451,42 @@ kill -TERM "$pid"
 wait "$pid"; rc=$?
 check "interrupted registry check: cancelled, nothing changed, exit 1 (not 130)" '[ "$rc" -eq 1 ] && grep -q "Cancelled - nothing was changed." "$T/int.out" && [ "$(cksum < "$I")" = "$before" ]'
 sleep 3
+
+# 9. The release check of CI (tests/check_release_default.sh): the default Catalog is on Docker Hub and not
+#    behind the newest stable one there, which the installer itself reads (__recommended_catalog);
+#    GITHUB_ACTIONS empty for the plain output (GitHub Actions sets it for the tests too)
+RCHECK="$(cd "$(dirname "$0")" && pwd)/check_release_default.sh"
+fresh "$RELEASE_CATALOG"
+check "release check hook: what the versions screen selects, the stable one, the default listed" '[ "$(bash "$I" __recommended_catalog)" = "26.3.4789.148 26.3.4789.148 listed" ] && [ "$(SHIM_STABLE=bbbb bash "$I" __recommended_catalog)" = "26.3.4789.148 26.1.4475.137 listed" ] && [ "$(SHIM_STABLE=zzzz bash "$I" __recommended_catalog)" = "26.3.4789.148 - listed" ]'
+out="$(GITHUB_ACTIONS= bash "$RCHECK" "$I" 2>&1)"; rc=$?
+check "release check: the default is the newest stable Catalog - passes, no warning" '[ "$rc" -eq 0 ] && grep -q "Docker Hub.s newest stable Catalog is 26.3.4789.148" <<< "$out" && ! grep -q "WARNING" <<< "$out"'
+# a typo of the version, or one Docker Hub does not have (yet): sort would put it above the stable one
+fresh 's/^CATALOG_VERSION=.*/CATALOG_VERSION="26.3.4789.184"/'
+out="$(GITHUB_ACTIONS= bash "$RCHECK" "$I" 2>&1)"; rc=$?
+check "release check: a default Docker Hub does not have fails and names what to set" '[ "$(bash "$I" __recommended_catalog)" = "26.3.4789.148 26.3.4789.148 missing" ] && [ "$rc" -eq 1 ] && grep -qxF "ERROR CATALOG_VERSION 26.3.4789.184 is not on Docker Hub for the Catalog and its worker - set the newest stable Catalog, 26.3.4789.148, before publishing" <<< "$out"'
+# no version has the stable tag: the newest one counts, and the message says so
+fresh "$OLD_CATALOG"
+out="$(SHIM_STABLE=zzzz GITHUB_ACTIONS= bash "$RCHECK" "$I" 2>&1)"; rc=$?
+check "release check without a stable tag: the newest counts, named as such" '[ "$rc" -eq 1 ] && grep -qxF "ERROR CATALOG_VERSION is 25.4.4191.133 but Docker Hub'"'"'s newest Catalog (no stable tag) is 26.3.4789.148 - set the default before publishing" <<< "$out"'
+fresh "$OLD_CATALOG"
+out="$(GITHUB_ACTIONS= bash "$RCHECK" "$I" 2>&1)"; rc=$?
+check "release check: an older default fails and names what to set" '[ "$rc" -eq 1 ] && grep -qxF "ERROR CATALOG_VERSION is 25.4.4191.133 but Docker Hub'"'"'s newest stable Catalog is 26.3.4789.148 - set the default before publishing" <<< "$out"'
+out="$(GITHUB_ACTIONS=true bash "$RCHECK" "$I" 2>&1)"; rc=$?
+check "release check on GitHub Actions: an error annotation" '[ "$rc" -eq 1 ] && grep -q "^::error::CATALOG_VERSION is 25.4.4191.133 but" <<< "$out"'
+out="$(SHIM_STABLE=bbbb GITHUB_ACTIONS= bash "$RCHECK" "$I" 2>&1)"; rc=$?
+check "release check: the stable tag counts, not a newer version without it" '[ "$rc" -eq 1 ] && grep -q "newest stable Catalog is 26.1.4475.137 - set the default" <<< "$out"'
+fresh 's/^CATALOG_VERSION=.*/CATALOG_VERSION="26.1.4475.137"/'
+out="$(SHIM_STABLE=bbbb GITHUB_ACTIONS= bash "$RCHECK" "$I" 2>&1)"; rc=$?
+check "release check: the stable one while a newer is not stable yet - passes" '[ "$rc" -eq 0 ] && grep -q "newest stable Catalog is 26.1.4475.137, the versions screen of a new installation selects 26.3.4789.148" <<< "$out"'
+# ... with a warning: the versions screen of a new installation selects the newer one
+out="$(SHIM_STABLE=bbbb GITHUB_ACTIONS=true bash "$RCHECK" "$I" 2>&1)"; rc=$?
+check "release check: a newer Catalog without the stable tag - a warning annotation, no failure" '[ "$rc" -eq 0 ] && grep -qxF "::warning::Docker Hub has Catalog 26.3.4789.148, newer than CATALOG_VERSION 26.1.4475.137 but without the stable tag: the versions screen of a new installation selects it - set it as the default once it is stable" <<< "$out"'
+fresh "$OLD_CATALOG"
+out="$(SHIM_REG_DOWN=1 GITHUB_ACTIONS=true bash "$RCHECK" "$I" 2>&1)"; rc=$?
+check "release check without Docker Hub: a warning, no failure" '[ "$rc" -eq 0 ] && grep -q "^::warning::Docker Hub could not be read - CATALOG_VERSION 25.4.4191.133 was not compared" <<< "$out"'
+fresh 's/^CATALOG_VERSION=.*/CATALOG_VERSION="stable"/'
+out="$(GITHUB_ACTIONS= bash "$RCHECK" "$I" 2>&1)"; rc=$?
+check "release check: a tag as the default fails" '[ "$rc" -eq 1 ] && grep -q "the default must be an exact version" <<< "$out"'
 
 check "no Podman, Compose, systemctl or curl call the fakes do not know" '[ ! -s "$UNH" ] || { sort -u "$UNH"; false; }'
 

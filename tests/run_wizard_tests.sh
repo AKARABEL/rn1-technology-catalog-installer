@@ -710,8 +710,9 @@ fresh() {
   LISTEN_PORTS=""
   : > "$LOG"
 }
+# installed -> an installation of Catalog 25.4 that runs (named here: the default is the newest Catalog of the release)
 installed() {
-  fresh
+  fresh 's/^CATALOG_VERSION=.*/CATALOG_VERSION="25.4.4191.133"/'
   (cd "$D" && bash rn1-technology-catalog-installer.sh generate </dev/null >/dev/null 2>&1)
   touch "$ST/up" "$ST/net" "$ST/vols" "$ST/license"; echo "25.4.4191.133" > "$ST/catalog_tag"; echo 8.0 > "$ST/mongo_tag"; echo "$D" > "$ST/wd"
   printf '%s\n' docker.io/library/mongo:8.0 docker.io/raynetgmbh/rayventory-catalog:25.4.4191.133 docker.io/raynetgmbh/rayventory-catalog-worker:25.4.4191.133 > "$ST/images"
@@ -736,8 +737,9 @@ check "menu without a terminal: no automatic start of the new installation" '! g
 check "help: guided tasks explained, 7 no longer the start" 'out2="$(printf "h\n\n0\n" | bash "$I" menu 2>&1)"; grep -q "START HERE - GUIDED TASKS" <<< "$out2" && ! grep -q "Start here on a new server" <<< "$out2" && grep -q "engine, domain name, Nginx Proxy Manager" <<< "$out2"'
 
 # 2. New installation with Enter only: Podman, no domain, no Nginx Proxy Manager, the recommended versions,
-# files written, stack started with a health check, the license later (the data then too), summary
-fresh
+# files written, stack started with a health check, the license later (the data then too), summary. A
+# download older than Docker Hub's newest Catalog: Enter must write the newest
+fresh 's/^CATALOG_VERSION=.*/CATALOG_VERSION="25.4.4191.133"/'
 out="$(printf 'i\n\n\n\n\n\n\n\n0\n' | bash "$I" menu 2>&1)"
 check "install: the nine steps shown - the data step skipped without a license" '( for s in 1 2 3 4 5 6 7 9; do grep -q "Install .* step $s of 9" <<< "$out" || exit 1; done ) && ! grep -q "Install .* step 8 of 9" <<< "$out"'
 check "install: the engines listed, Podman ready and the default" 'grep -Eq "1  Podman +[^ ]+ ready" <<< "$out" && grep -Eq "2  Docker Engine +installed - the setup completes it" <<< "$out" && [ "$(setting CONTAINER_ENGINE)" = podman ] && grep -q "Podman is ready" <<< "$out"'
@@ -780,9 +782,10 @@ check "repair: the steps of a repair (check, settings, files, start)" 'grep -q "
 # 4b. 26.3 runs, a new download of the installer says 25.4 (and port 8080 instead of 8181): the start offers
 #     the values of the installation (declined here), the repair offers them again before it writes anything
 installed
+# (catalog-web of 26.3 first: generate does not raise a running 25.4 without asking)
+echo "26.3.4789.148" > "$ST/catalog_tag"
 sed -i 's/^CATALOG_VERSION=.*/CATALOG_VERSION="26.3.4789.148"/; 0,/^CATALOG_WEB_PORT=/s/^CATALOG_WEB_PORT=.*/CATALOG_WEB_PORT="8181"/' "$I"
 (cd "$D" && bash rn1-technology-catalog-installer.sh generate </dev/null >/dev/null 2>&1)
-echo "26.3.4789.148" > "$ST/catalog_tag"
 sed -i 's/^CATALOG_VERSION=.*/CATALOG_VERSION="25.4.4191.133"/; 0,/^CATALOG_WEB_PORT=/s/^CATALOG_WEB_PORT=.*/CATALOG_WEB_PORT="8080"/' "$I"
 : > "$LOG"
 out="$(printf 'n\n\ni\n1\ny\ny\ny\n\ny\ny\nn\n\n0\n' | bash "$I" menu 2>&1)"
@@ -802,23 +805,23 @@ installed
 sed -i 's/^CATALOG_HOSTNAME=.*/CATALOG_HOSTNAME=c2/; s/^MONGO_WT_CACHE_GB=.*/MONGO_WT_CACHE_GB=3/' "$D/.env"
 out="$(printf 'i\n1\ny\ny\n\ny\ny\nn\n\n0\n' | bash "$I" menu 2>&1)"
 check "repair with the derived host name and cache: nothing offered, the name kept, the cache for the memory" '! grep -q -e "differ from the installation" -e "Taking them over writes" <<< "$out" && [ "$(envv CATALOG_HOSTNAME)" = c2 ] && [ "$(envv MONGO_WT_CACHE_GB)" = 11 ] && [ -z "$(setting CATALOG_HOSTNAME)" ] && [ -z "$(setting MONGO_CACHE_GB)" ] && grep -q "Install .* step 4 of 7" <<< "$out"'
-# 4e. Below 24 GB the repair asks at its check (step 1), before it writes: no and 0 stop it with the files as
-#     they were, yes goes on with the cache for that memory
+# 4e. Below 24 GB the repair asks at its check (step 1), before it writes: the line of the check is the one
+#     warning; no and 0 stop it with the files as they were, yes goes on with the cache for that memory
 installed
 before="$(cksum < "$D/.env")"
 out="$(printf 'i\n1\ny\nn\n\n0\n' | SHIM_MEMTOTAL=15032385536 bash "$I" menu 2>&1)"
-check "repair below 24 GB, no: stopped at the check, nothing written" 'grep -q "This engine has 14 GB of memory; at least 24 GB is recommended." <<< "$out" && back_in_menu && ! grep -q "Install .* step 2 of 7" <<< "$out" && [ "$(cksum < "$D/.env")" = "$before" ] && ! grep -q "compose.* up" "$LOG"'
+check "repair below 24 GB, no: one memory warning (the line of the check), stopped at the check, nothing written" '[ "$(grep -c "GB for the containers - at least 24 GB is recommended" <<< "$out")" -eq 1 ] && grep -q "^WARN Memory: 14 GB for the containers - at least 24 GB is recommended$" <<< "$out" && ! grep -q "This engine has" <<< "$out" && back_in_menu && ! grep -q "Install .* step 2 of 7" <<< "$out" && [ "$(cksum < "$D/.env")" = "$before" ] && ! grep -q "compose.* up" "$LOG"'
 out="$(printf 'i\n1\ny\n0\n\n0\n' | SHIM_MEMTOTAL=15032385536 bash "$I" menu 2>&1)"
 check "repair below 24 GB, 0: stopped, nothing written" 'back_in_menu && ! grep -q "Install .* step 2 of 7" <<< "$out" && [ "$(cksum < "$D/.env")" = "$before" ]'
 out="$(printf 'i\n1\ny\ny\ny\n\ny\ny\nn\n\n0\n' | SHIM_MEMTOTAL=15032385536 bash "$I" menu 2>&1)"
-check "repair below 24 GB, yes: the steps go on, the cache for 14 GB" 'grep -q "This engine has 14 GB of memory" <<< "$out" && grep -q "Install .* step 4 of 7" <<< "$out" && [ "$(envv MONGO_WT_CACHE_GB)" = 2 ] && grep -q "up -d --remove-orphans" "$LOG"'
+check "repair below 24 GB, yes: the steps go on, the cache for 14 GB" '[ "$(grep -c "GB for the containers - at least 24 GB is recommended" <<< "$out")" -eq 1 ] && grep -q "^WARN Memory: 14 GB for the containers - at least 24 GB is recommended$" <<< "$out" && ! grep -q "This engine has" <<< "$out" && grep -q "Install .* step 4 of 7" <<< "$out" && [ "$(envv MONGO_WT_CACHE_GB)" = 2 ] && grep -q "up -d --remove-orphans" "$LOG"'
 # 4f. An older MongoDB in the settings than the installation's, the take-over declined: the repair stops
-#     before the check and the memory question, nothing written
+#     before the check, its Memory line (the one warning below 24 GB) and the question, nothing written
 installed
 sed -i '0,/^MONGO_TAG=/s/^MONGO_TAG=.*/MONGO_TAG="7.0"/' "$I"
 before="$(cksum < "$D/.env")"
 out="$(printf 'n\n\ni\n1\nn\n\n0\n' | SHIM_MEMTOTAL=15032385536 bash "$I" menu 2>&1)"
-check "repair with MongoDB 7.0 against the installed 8.0, take-over declined twice: stopped before the check" '[ "$(grep -c "MONGO_TAG *7.0 -> 8.0" <<< "$out")" -eq 2 ] && grep -q "MongoDB 7.0 would replace the" <<< "$out" && grep -q "take the installation.s values over first (option 23)" <<< "$out" && ! grep -q -e "This engine has" -e "Install .* step 2 of 7" <<< "$out" && [ "$(cksum < "$D/.env")" = "$before" ] && [ "$(setting MONGO_TAG)" = 7.0 ]'
+check "repair with MongoDB 7.0 against the installed 8.0, take-over declined twice: stopped before the check" '[ "$(grep -c "MONGO_TAG *7.0 -> 8.0" <<< "$out")" -eq 2 ] && grep -q "MongoDB 7.0 would replace the" <<< "$out" && grep -q "take the installation.s values over first (option 23)" <<< "$out" && ! grep -q -e "Checking the engine" -e "GB for the containers" -e "anyway?" -e "Install .* step 2 of 7" <<< "$out" && [ "$(cksum < "$D/.env")" = "$before" ] && [ "$(setting MONGO_TAG)" = 7.0 ]'
 # 0 at the time zone question stops the repair; outside the guided tasks (option 2) 0 is a no, as before
 TZDATA="no"
 if [ -f /usr/share/zoneinfo/America/New_York ] && [ -f /usr/share/zoneinfo/Europe/Berlin ]; then TZDATA="yes"; fi
@@ -850,14 +853,14 @@ check "install again: - removes the domain" '[ -z "$(setting CATALOG_DOMAIN)" ] 
 out="$(printf 'i\n\ncatalog.example.com\n\n\n0\n\n0\n' | bash "$I" menu 2>&1)"
 check "install again: a new domain - Nginx Proxy Manager defaults to yes again" '[ "$(setting CATALOG_DOMAIN)" = catalog.example.com ] && grep -q "Let.s Encrypt needs a real e-mail address" <<< "$out" && [ "$(setting INSTALL_NGINX_PROXY_MANAGER)" = false ]'
 
-# 5a. Below 24 GB of memory the Install step says so after the check and asks (on Linux there is nothing to
-# offer); no stops before the files, yes goes on with the cache of MongoDB for that memory
+# 5a. Below 24 GB of memory the Install step says so once - the line of the check - and asks (on Linux there is
+# nothing to offer); no stops before the files, yes goes on with the cache of MongoDB for that memory
 fresh
 out="$(printf 'i\n\n\n\n\nn\n\n0\n' | SHIM_MEMTOTAL=15032385536 bash "$I" menu 2>&1)"
-check "install below 24 GB: the line of the check and the warning; no stops before the files" 'grep -q "^WARN Memory: 14 GB for the containers - at least 24 GB is recommended$" <<< "$out" && grep -q "^      A full snapshot import loads MongoDB, the Catalog and OpenSearch at once.$" <<< "$out" && grep -q "This engine has 14 GB of memory; at least 24 GB is recommended." <<< "$out" && back_in_menu && [ ! -f "$D/.env" ] && ! grep -q "compose.* up" "$LOG"'
+check "install below 24 GB: one memory warning, the line of the check (not said again); no stops before the files" '[ "$(grep -c "GB for the containers - at least 24 GB is recommended" <<< "$out")" -eq 1 ] && grep -q "^WARN Memory: 14 GB for the containers - at least 24 GB is recommended$" <<< "$out" && ! grep -q "This engine has" <<< "$out" && grep -q "^      A full snapshot import loads MongoDB, the Catalog and OpenSearch at once.$" <<< "$out" && back_in_menu && [ ! -f "$D/.env" ] && ! grep -q "compose.* up" "$LOG"'
 fresh
 out="$(printf 'i\n\n\n\n\ny\n\n\n\n0\n' | SHIM_MEMTOTAL=15032385536 bash "$I" menu 2>&1)"
-check "install below 24 GB: yes goes on - the cache of MongoDB for 14 GB, the Catalog started" 'grep -q "This engine has 14 GB of memory" <<< "$out" && grep -qx "MONGO_WT_CACHE_GB=2" "$D/.env" && grep -q "up -d --remove-orphans" "$LOG" && grep -q "The Catalog is installed" <<< "$out"'
+check "install below 24 GB: yes goes on - the cache of MongoDB for 14 GB, the Catalog started" '[ "$(grep -c "GB for the containers - at least 24 GB is recommended" <<< "$out")" -eq 1 ] && grep -q "^WARN Memory: 14 GB for the containers - at least 24 GB is recommended$" <<< "$out" && ! grep -q "This engine has" <<< "$out" && grep -qx "MONGO_WT_CACHE_GB=2" "$D/.env" && grep -q "up -d --remove-orphans" "$LOG" && grep -q "The Catalog is installed" <<< "$out"'
 fresh
 out="$(printf 'i\n\n\n\n\n\n\n\n0\n' | bash "$I" menu 2>&1)"
 check "install with 32 GB: no warning, no question, the cache of MongoDB for 32 GB" '! grep -q "This engine has" <<< "$out" && ! grep -q "WARN Memory" <<< "$out" && grep -qx "MONGO_WT_CACHE_GB=11" "$D/.env" && grep -q "The Catalog is installed" <<< "$out"'
@@ -876,7 +879,8 @@ check "stop at the question about a name not in DNS: the domain not saved" 'back
 fresh
 out="$(printf 'i\n\ncatalog.example.com\n\n0\n\n0\n' | bash "$I" menu 2>&1)"
 check "stop at the proxy: the domain kept, Nginx Proxy Manager unchanged" 'back_in_menu && [ "$(setting CATALOG_DOMAIN)" = catalog.example.com ] && [ "$(setting INSTALL_NGINX_PROXY_MANAGER)" = true ] && [ -z "$(setting NPM_ADMIN_EMAIL)" ]'
-fresh
+# (a download with an older Catalog than the newest: writing the versions would change it)
+fresh 's/^CATALOG_VERSION=.*/CATALOG_VERSION="25.4.4191.133"/'
 out="$(printf 'i\n\ncatalog.example.com\n\nn\n0\n\n0\n' | bash "$I" menu 2>&1)"
 check "stop at the versions: the proxy answer kept, the versions unchanged" 'back_in_menu && [ "$(setting INSTALL_NGINX_PROXY_MANAGER)" = false ] && [ "$(setting BASEURL)" = "http://catalog.example.com:8080" ] && [ "$(setting MONGO_TAG)" = 8.0 ] && [ "$(setting CATALOG_VERSION)" = 25.4.4191.133 ]'
 fresh 's/^INSTALL_NGINX_PROXY_MANAGER=.*/INSTALL_NGINX_PROXY_MANAGER="false"/'
@@ -1251,9 +1255,10 @@ check "I with .setup-later: the new installation runs, the marker goes when it i
 # states_installed -> Catalog 26.3 (the newest on Docker Hub) installed by this installer and running
 states_installed() {
   installed
+  # (catalog-web of 26.3 first: generate does not raise a running 25.4 without asking)
+  echo "26.3.4789.148" > "$ST/catalog_tag"
   sed -i 's/^CATALOG_VERSION=.*/CATALOG_VERSION="26.3.4789.148"/; s/^CHECK_FOR_UPDATES=.*/CHECK_FOR_UPDATES="true"/' "$I"
   (cd "$D" && bash rn1-technology-catalog-installer.sh generate </dev/null >/dev/null 2>&1)
-  echo "26.3.4789.148" > "$ST/catalog_tag"
   : > "$LOG"
 }
 plain_menu() { printf '0\n' | COLUMNS=80 bash "$I" menu 2>&1; }
@@ -1268,7 +1273,7 @@ files_cards() {
     && grep -Eq "I\) INSTALL +.* Not installed: no containers, no data$" <<< "$out" && grep -Eq "U\) UPDATE +Nothing installed yet$" <<< "$out" \
     && grep -Eq "R\) REMOVE +.* Remove what is left$" <<< "$out" && ! grep -q "up to date" <<< "$out"
 }
-fresh 's/^CHECK_FOR_UPDATES=.*/CHECK_FOR_UPDATES="true"/'
+fresh 's/^CHECK_FOR_UPDATES=.*/CHECK_FOR_UPDATES="true"/; s/^CATALOG_VERSION=.*/CATALOG_VERSION="25.4.4191.133"/'
 out="$(plain_menu)"
 check "state none: not installed - the version a start would install and the newer one, never up to date" 'grep -q "Installation Portal   (Catalog not installed - 25.4.4191.133 would be installed, newer: 26.3.4789.148 (stable), option 8)$" <<< "$out" && grep -Eq "I\) INSTALL +.* New installation, step by step$" <<< "$out" && grep -Eq "U\) UPDATE +Nothing installed yet$" <<< "$out" && grep -Eq "R\) REMOVE +Nothing installed$" <<< "$out" && ! grep -q "up to date" <<< "$out"'
 states_installed

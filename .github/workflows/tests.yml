@@ -50,6 +50,10 @@ jobs:
         run: bash tests/run_memory_tests.sh "$PWD/rn1-technology-catalog-installer.sh"
       - name: Internet access, the proxy questions and the proxy of the package managers
         run: bash tests/run_network_tests.sh "$PWD/rn1-technology-catalog-installer.sh"
+      # last, and also after a failed suite: a new stable Catalog on Docker Hub does not hide the test results
+      - name: The default Catalog is the newest stable one on Docker Hub (a warning when Docker Hub cannot be read)
+        if: ${{ !cancelled() }}
+        run: bash tests/check_release_default.sh "$PWD/rn1-technology-catalog-installer.sh"
 
   distributions:
     name: ${{ matrix.name }}

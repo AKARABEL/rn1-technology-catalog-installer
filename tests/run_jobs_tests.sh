@@ -164,5 +164,39 @@ if command -v script >/dev/null 2>&1; then
   check "menu box: the job without a result as such, not as failed" 'grep -q "#61 Snapshot import (x-61.tar.gz)" <<< "$out" && grep -q "result unknown" <<< "$out" && ! grep -q "unfollowed" <<< "$out"'
 fi
 
+# 7. The live view of a job takes the whole width of the terminal, also beyond 100 columns: the frame, the
+# progress bar (the width less 30) and the log lines, wrapped at the width less 6 (ASCII frame: LC_ALL=C)
+if command -v script >/dev/null 2>&1; then
+  mkdir -p "$D/.jobs/62"; echo "Snapshot import (wide.tar.gz)" > "$D/.jobs/62/title"; echo done > "$D/.jobs/62/state"
+  date '+%Y-%m-%d %H:%M:%S' > "$D/.jobs/62/started"; echo "40.0|Importing|" > "$D/.jobs/62/progress"
+  long="$(printf 'word%03d ' $(seq 1 40))"
+  printf '%s\n' "10:00:00 Import started" "${long% }" > "$D/.jobs/62/log"
+  for cols in 160 220; do
+    out="$( { sleep 3; } | TERM=xterm LC_ALL=C timeout 60 script -qfec "stty cols $cols rows 40; bash $D/rn1-technology-catalog-installer.sh jobs follow 62" /dev/null 2>&1 | sed 's/\x1b[[(][0-9;?]*[A-Za-z]//g; s/\x1b[78]//g' | tr -d '\r')"
+    box="$(sed -n '/^+- Job #62 /,/^+-*+$/p' <<< "$out")"
+    # words of 8 characters per row: the width less 6, plus the space a row does not end with
+    per=$(((cols - 6 + 1) / 8)); fill=$((40 * (cols - 30) / 100))
+    check "job view at $cols columns: every line of the frame $cols wide" '{ [ "$(grep -c . <<< "$box")" -ge 6 ] && [ -z "$(awk -v w="$cols" "length(\$0) != w" <<< "$box")" ] && grep -q "^+-*+$" <<< "$box"; } || { printf "%s\n" "$out" | head -n 12 | sed "s/^/  | /"; false; }'
+    check "job view at $cols columns: the progress bar $((cols - 30)) wide" 'grep -Eq "^\| ok done   #{$fill}-{$((cols - 30 - fill))}  40\.0% +\|$" <<< "$box"'
+    check "job view at $cols columns: the log wrapped at $((cols - 6)) - $per words on its first row" 'grep -Eq "^\| > word001( word[0-9]{3}){$((per - 1))} +\|$" <<< "$box" && grep -q "^|   word$(printf %03d $((per + 1))) " <<< "$box"'
+  done
+  # the terminal made narrower while the job runs (160 -> 120): it wraps the old lines again, so the view clears
+  # the screen once and draws itself at the new width from the top, then in place again
+  mkdir -p "$D/.jobs/63"; echo "Snapshot import (resize.tar.gz)" > "$D/.jobs/63/title"; echo running > "$D/.jobs/63/state"
+  date '+%Y-%m-%d %H:%M:%S' > "$D/.jobs/63/started"; echo "40.0|Importing|" > "$D/.jobs/63/progress"
+  printf '%s\n' "10:00:00 Import started" "${long% }" > "$D/.jobs/63/log"
+  sleep 30 & jp=$!
+  echo "$jp" > "$D/.jobs/63/pid"
+  ( sleep 8; echo done > "$D/.jobs/63/state" ) & dp=$!
+  raw="$( { sleep 10; } | TERM=xterm LC_ALL=C timeout 60 script -qfec "stty cols 160 rows 40; (sleep 4; stty cols 120 < /dev/tty) & bash $D/rn1-technology-catalog-installer.sh jobs follow 63" /dev/null 2>&1 | tr -d '\r')"
+  wait "$dp"; kill "$jp" 2>/dev/null; wait "$jp" 2>/dev/null
+  clr=$'\033[H\033[2J'
+  frames() { sed 's/\x1b[[(][0-9;?]*[A-Za-z]//g; s/\x1b[78]//g' | grep -E '^[+|]'; }
+  pre="$(frames <<< "${raw%%"$clr"*}")"; post="$(frames <<< "${raw#*"$clr"}")"
+  check "job view made narrower: the screen cleared once, the frames 160 wide before and 120 wide after" '{ [ "$(grep -oF "$clr" <<< "$raw" | wc -l)" -eq 1 ] && grep -q "^+- Job #63 " <<< "$pre" && grep -q "^+- Job #63 " <<< "$post" && [ -z "$(awk "length(\$0) != 160" <<< "$pre")" ] && [ -z "$(awk "length(\$0) != 120" <<< "$post")" ]; } || { sed "s/\x1b/^[/g" <<< "$raw" | tail -n 20 | sed "s/^/  | /"; false; }'
+else
+  echo "SKIP: script (util-linux) missing - no test of the width of the job view"
+fi
+
 echo "== $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]

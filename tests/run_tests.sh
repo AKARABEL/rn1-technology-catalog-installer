@@ -148,11 +148,14 @@ restart_always() {
 series_tags() {
   sed 's|^MONGO_TAG="8"$|MONGO_TAG="8.0"|; s|^RABBITMQ_TAG="3-management-alpine"$|RABBITMQ_TAG="3.13-management-alpine"|; s|^NGINX_PROXY_MANAGER_TAG="latest"$|NGINX_PROXY_MANAGER_TAG="2"|'
 }
+# The default Catalog is the newest stable one at each release, the original has 25.4.4191.133: the comparison
+# runs with the Catalog of the original (Catalog 26 adds the upload limit, checked further down)
+ORIG_CATALOG="$(sed -n 's/^CATALOG_VERSION="\(.*\)"$/\1/p' "$SP/original.sh")"
 
 # 1. Byte-identical output vs original (NPM true / false), apart from the restart policy and the series tags
 for npm in true false; do
   D="$(newdir "id_$npm")"; O="$T/orig_$npm"; rm -rf "$O"; mkdir -p "$O"
-  sed -i "s/^INSTALL_NGINX_PROXY_MANAGER=\"true\"/INSTALL_NGINX_PROXY_MANAGER=\"$npm\"/" "$D/gen.sh"
+  sed -i "s/^INSTALL_NGINX_PROXY_MANAGER=\"true\"/INSTALL_NGINX_PROXY_MANAGER=\"$npm\"/; s/^CATALOG_VERSION=.*/CATALOG_VERSION=\"$ORIG_CATALOG\"/" "$D/gen.sh"
   sed "s/^INSTALL_NGINX_PROXY_MANAGER=\"true\"/INSTALL_NGINX_PROXY_MANAGER=\"$npm\"/" "$SP/original.sh" | sed 's|^MINIO_TAG="latest"|MINIO_TAG="RELEASE.2025-10-15T17-29-55Z"|; s|image: minio/minio:|image: ghcr.io/golithus/minio:|' | series_tags > "$O/gen.sh"
   (cd "$O" && bash gen.sh >/dev/null)
   restart_always "$O/docker-compose.yml" > "$O/podman-compose.yml"
@@ -287,7 +290,8 @@ for w in 60 70 99 100 120 160 200; do
   check "screen fits $w columns" '[ "$max" -gt 0 ] && [ "$max" -le "$lim" ]'
 done
 out="$(printf '1\n0\n0\n' | LC_ALL=C COLUMNS=100 bash "$D/gen.sh" menu 2>&1)"
-check "100 columns: short values are not cut" 'grep -q "VERSION \.* 25.4.4191.133" <<< "$out" && grep -q "TZ \.* Europe/Berlin" <<< "$out" && grep -q "INSTALL_NGINX_P[A-Z_]*~* \. true" <<< "$out"'
+cv="$(sed -n 's/^CATALOG_VERSION="\(.*\)"$/\1/p' "$D/gen.sh")"
+check "100 columns: short values are not cut" 'grep -q "VERSION \.* $cv" <<< "$out" && grep -q "TZ \.* Europe/Berlin" <<< "$out" && grep -q "INSTALL_NGINX_P[A-Z_]*~* \. true" <<< "$out"'
 out="$(printf '1\n/port\n0\n0\n' | COLUMNS=120 bash "$D/gen.sh" menu 2>&1)"
 out="$(sed -n '/Filter "port": /,$p' <<< "$out")"
 check "filter shows only matching settings" 'grep -q "WEB_PORT" <<< "$out" && ! grep -q "ENV_FILE" <<< "$out"'
@@ -394,8 +398,8 @@ check "docker-compose 1.25 as provider rejected" '[ "$rc" -ne 0 ] && grep -q "bi
 out="$(RN1_COMPOSE_PROVIDER="$T/bin_old/none" bash "$D/gen.sh" validate </dev/null 2>&1)"; rc=$?
 check "missing provider rejected with the install hint" '[ "$rc" -ne 0 ] && grep -q "is missing (.*bin_old/none) - .*install-podman" <<< "$out"'
 
-# 13. Catalog versions from Docker Hub
-D="$(newdir ver)"
+# 13. Catalog versions from Docker Hub - a download whose default is older than the newest Catalog there
+D="$(newdir ver)"; sed -i 's/^CATALOG_VERSION=.*/CATALOG_VERSION="25.4.4191.133"/' "$D/gen.sh"
 out="$(bash "$D/gen.sh" versions 2>&1)"; rc=$?
 check "versions rc 0" '[ "$rc" -eq 0 ]'
 check "versions lists exactly 4" '[ "$(grep -cE "^  [0-9]+\.[0-9]+\.[0-9]+\.[0-9]+" <<< "$out")" -eq 4 ]'
@@ -406,6 +410,12 @@ check "pagination followed with unescaped &" 'grep -q "page=2&page_size=30" "$SH
 check "catalog-only tags excluded (12.2.x)" '! bash "$D/gen.sh" set-version 12.2.1580.13 >/dev/null 2>&1'
 out="$(printf '0\n' | bash "$D/gen.sh" menu 2>&1)"
 check "header, nothing installed: the version a start would install, the newer stable one, never up to date" 'grep -q "(Catalog not installed - 25.4.4191.133 would be installed, newer: 26.3.4789.148 (stable), option 8)" <<< "$out" && ! grep -q "up to date" <<< "$out"'
+# a download of a release: its default is the newest stable Catalog on Docker Hub
+D2="$(newdir ver_release)"; sed -i 's/^CATALOG_VERSION=.*/CATALOG_VERSION="26.3.4789.148"/' "$D2/gen.sh"
+out="$(bash "$D2/gen.sh" versions 2>&1)"
+check "release download: versions marks the newest stable one selected" '[ "$(grep -E "^  [0-9]" <<< "$out" | head -n 1)" = "  26.3.4789.148 (stable)  (selected)" ]'
+out="$(printf '0\n' | bash "$D2/gen.sh" menu 2>&1)"
+check "release download, header: the newest would be installed, no newer one, never up to date" 'grep -q "(Catalog not installed - 26.3.4789.148 would be installed (the newest))" <<< "$out" && ! grep -q -e "newer: " -e "up to date" <<< "$out"'
 
 cp "$D/gen.sh" "$T/ver_before.sh"
 : > "$SHIM_LOG"
@@ -424,7 +434,8 @@ check "typed version accepted (downgrade declined)" 'grep -q "26.1.4475.136 is O
 out="$(printf '8\n1\n9\n0\n0\n\n0\n' | bash "$D/gen.sh" menu 2>&1)"
 check "out-of-range choice rejected" 'grep -q "Invalid choice: 9" <<< "$out"'
 
-D="$(newdir ver_cli)"
+# (an older Catalog than the stable one: set-version stable must write what the tag points to)
+D="$(newdir ver_cli)"; sed -i 's/^CATALOG_VERSION=.*/CATALOG_VERSION="25.4.4191.133"/' "$D/gen.sh"
 out="$(bash "$D/gen.sh" set-version stable 2>&1)"; rc=$?
 check "set-version stable" '[ "$rc" -eq 0 ] && grep -q "^CATALOG_VERSION=\"26.3.4789.148\"$" "$D/gen.sh"'
 bash "$D/gen.sh" set-version latest >/dev/null 2>&1; rc=$?
@@ -434,8 +445,8 @@ check "set-version without arg rc 2" '[ "$rc" -eq 2 ]'
 out="$(bash "$D/gen.sh" set-version 26.1.4475.136 2>&1)"; rc=$?
 check "set-version older warns but sets" '[ "$rc" -eq 0 ] && grep -q "OLDER" <<< "$out" && grep -q "^CATALOG_VERSION=\"26.1.4475.136\"$" "$D/gen.sh"'
 
-# 14. Docker Hub not reachable / disabled
-D="$(newdir ver_off)"
+# 14. Docker Hub not reachable / disabled (an older Catalog: the offline set-version must write the newer one)
+D="$(newdir ver_off)"; sed -i 's/^CATALOG_VERSION=.*/CATALOG_VERSION="25.4.4191.133"/' "$D/gen.sh"
 out="$(printf '8\n1\n0\n\n0\n' | SHIM_HUB_FAIL=1 bash "$D/gen.sh" menu 2>&1)"
 check "header says Docker Hub not reachable" 'grep -q "Docker Hub not reachable" <<< "$out"'
 check "option 8 errors when offline" 'grep -q "Could not read the versions from Docker Hub" <<< "$out"'

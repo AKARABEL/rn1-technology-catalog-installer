@@ -528,10 +528,12 @@ check "the license cannot be read (a damaged one): named, the activation replace
 rm -f "$SRV/license"
 why() { printf 'root\n%s\n' "$ROOTPW" | SHIM_LIC_ERROR="$1" run license file "$LIC"; }
 whyo() { printf 'root\n%s\n%s\nTest User\nExample GmbH\nit@mail.example.net\n' "$ROOTPW" "$ORDER" | SHIM_LIC_ERROR="$1" run license order; }
+# the Catalog of this installation: the one .env names
+catv() { local v; v="$(envv CATALOG_IMAGE)"; printf '%s' "${v##*:}"; }
 check "invalid-hardware-id: another server, the host name named" 'out="$(why license.messages.invalid-hardware-id)"; grep -q "This license is for another server: the hardware ID does not match." <<< "$out" && grep -q "host name of catalog-web: lic-test01$" <<< "$out" && grep -q "A license made for another name works with that name in CATALOG_HOSTNAME$" <<< "$out" && grep -q "(at the top of rn1-technology-catalog-installer.sh, then .*generate. and .*up.)." <<< "$out"'
 check "license-expired" 'why license.messages.license-expired | grep -q "This license has expired - Raynet makes a new one."'
 check "another-product" 'why license.messages.another-product | grep -q "This license is for another Raynet product, not the Technology Catalog."'
-check "wrong-version: an older Catalog, the version of this one" 'why license.messages.wrong-version | grep -q "This license is for an older Catalog - this one is 25.4.4191.133."'
+check "wrong-version: an older Catalog, the version of this one" '[ -n "$(catv)" ] && why license.messages.wrong-version | grep -qF "This license is for an older Catalog - this one is $(catv)."'
 check "check-connection: Raynet's license server not reached" 'out="$(why license.messages.check-connection)"; grep -q "could not reach Raynet.s license server (licenses.raynet.de)" <<< "$out" && grep -q "HTTPS (port 443)" <<< "$out"'
 check "Could not connect to the activation server." 'whyo "Could not connect to the activation server." | grep -q "could not reach Raynet.s license server"'
 check "Unable to connect ... (server error: ...)" 'whyo "Unable to connect to activation server (server error: ServiceUnavailable)." | grep -q "Raynet.s license server failed (server error: ServiceUnavailable)."'
@@ -562,7 +564,7 @@ out="$(printf '25\n\n%s\n0\n\n0\n' "$ROOTPW" | run menu)"
 check "option 25, a license of another server: why and the host name" 'grep -Eq "License +.* not valid \(InvalidHardwareId\)" <<< "$out" && grep -q "The license is for another server: the hardware ID does not match." <<< "$out" && grep -q "host name of catalog-web: lic-test01$" <<< "$out" && grep -q "(option 1, then 2 and 6). The order number gets a license for this name." <<< "$out" && grep -q "Cancelled." <<< "$out"'
 echo OldVersion > "$SRV/license"
 out="$(printf '25\n\n%s\n0\n\n0\n' "$ROOTPW" | run menu)"
-check "option 25, a license for an older Catalog (no product in the answer): this version named" 'grep -Eq "License +.* not valid \(OldVersion\)" <<< "$out" && grep -q "The license is for an older Catalog - this one is 25.4.4191.133." <<< "$out" && ! grep -Eq "For +Catalog up to" <<< "$out" && ! grep -Eq "Edition +" <<< "$out"'
+check "option 25, a license for an older Catalog (no product in the answer): this version named" 'grep -Eq "License +.* not valid \(OldVersion\)" <<< "$out" && [ -n "$(catv)" ] && grep -qF "The license is for an older Catalog - this one is $(catv)." <<< "$out" && ! grep -Eq "For +Catalog up to" <<< "$out" && ! grep -Eq "Edition +" <<< "$out"'
 rm -f "$SRV/license"
 out="$(printf '25\n\n%s\n2\n/none/1\n2\n/none/2\n2\n/none/3\n2\n%s\n\n0\n' "$ROOTPW" "$LIC" | run menu)"
 check "option 25: three failures stop it (no endless loop)" 'grep -q "Stopped after 3 failed attempts - option 25 tries again." <<< "$out" && [ "$(grep -c "No license file at" <<< "$out")" -eq 3 ] && [ ! -f "$SRV/license" ]'

@@ -363,7 +363,9 @@ rm -f "$SN/2026-10-04-cumulative-7d.tar.gz"
 out="$(bash "$D/rn1-technology-catalog-installer.sh" import-chain "$SINCECHAIN" </dev/null 2>&1)"; rc=$?
 check "missing chain file found before any upload" '[ "$rc" -ne 0 ] && grep -q "2026-10-04-cumulative-7d.tar.gz of the chain is missing" <<< "$out" && [ "$(grep -c . "$SRV/uploads.log")" -eq 1 ]'
 
-# 18. Upload limit: Catalog 25.x has a fixed 10 GB limit, newer versions use SYNC_MAX_UPLOAD
+# 18. Upload limit: Catalog 25.x has a fixed 10 GB limit, newer versions use SYNC_MAX_UPLOAD (Catalog 25.4
+#     named here: the default is the newest Catalog of the release)
+sed -i 's/^CATALOG_VERSION=.*/CATALOG_VERSION="25.4.4191.133"/' "$D/rn1-technology-catalog-installer.sh"
 printf 'SYNC_MAX_UPLOAD=100\n' > "$D/.env"; rm -f "$SRV/polls"
 out="$(bash "$D/rn1-technology-catalog-installer.sh" import "$SN/2026-10-04-full.tar.gz" </dev/null 2>&1)"; rc=$?
 check "25.x: SYNC_MAX_UPLOAD not used (fixed 10 GB)" '[ "$rc" -eq 0 ] && grep -q "Import finished." <<< "$out"'

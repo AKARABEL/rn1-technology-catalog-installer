@@ -390,9 +390,11 @@ fresh() {
   sed -i "s/^CONTAINER_ENGINE=.*/CONTAINER_ENGINE=\"${1-docker}\"/; s/^CHECK_FOR_UPDATES=.*/CHECK_FOR_UPDATES=\"false\"/; s/^HEALTH_TIMEOUT=.*/HEALTH_TIMEOUT=\"10\"/" "$I"
   : > "$LOG"; : > "$SUDO_LOG"
 }
-# installed: the files, and a running stack in Docker started from this folder
+# installed: the files, and a running stack of Catalog 25.4 in Docker started from this folder (the version named
+# here: the default is the newest Catalog of the release)
 installed() {
   fresh "${1-docker}"
+  sed -i 's/^CATALOG_VERSION=.*/CATALOG_VERSION="25.4.4191.133"/' "$I"
   (cd "$D" && bash "$I" generate </dev/null >/dev/null 2>&1)
   touch "$ST/up" "$ST/net" "$ST/vols"; echo 25.4.4191.133 > "$ST/catalog_tag"; echo 8 > "$ST/mongo_tag"; echo "$D" > "$ST/wd"
   printf '%s\n' mongo:8 raynetgmbh/rayventory-catalog:25.4.4191.133 raynetgmbh/rayventory-catalog-worker:25.4.4191.133 > "$ST/images"

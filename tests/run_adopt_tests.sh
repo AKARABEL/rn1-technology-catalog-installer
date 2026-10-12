@@ -253,8 +253,10 @@ rm -f "$W/old-copy.sh" "$W/$N"
 out="$(SHIM_NO_LABELS=1 bash "$W/catalog.sh" generate </dev/null 2>&1)"; rc=$?
 check "owner alone again: the edit is generated" '[ "$rc" -eq 0 ] && grep -q "^CATALOG_WEB_PORT=9494$" "$W/.env"'
 
-# 11. Only CATALOG_VERSION differs: the guided upgrade refuses too; adopt of this folder lists, a named file is taken over
-V="$T/version"; installer "$V" catalog.sh 's/^CATALOG_VERSION=.*/CATALOG_VERSION="26.3.4789.148"/'; gen "$V" catalog.sh; installer "$V" "$N"
+# 11. Only CATALOG_VERSION differs (catalog.sh 26.3 made the files, the new download says 25.4): the guided upgrade
+#     refuses too; adopt of this folder lists, a named file is taken over
+V="$T/version"; installer "$V" catalog.sh 's/^CATALOG_VERSION=.*/CATALOG_VERSION="26.3.4789.148"/'; gen "$V" catalog.sh
+installer "$V" "$N" 's/^CATALOG_VERSION=.*/CATALOG_VERSION="25.4.4191.133"/'
 envv="$(cksum < "$V/.env")"
 out="$(SHIM_NO_LABELS=1 bash "$V/$N" upgrade </dev/null 2>&1)"; rc=$?
 check "version only: upgrade refuses" '[ "$rc" -ne 0 ] && grep -q "has other settings than $N" <<< "$out" && [ "$(cksum < "$V/.env")" = "$envv" ]'

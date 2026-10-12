@@ -225,9 +225,10 @@ if [ "${1:-}" = "-r" ]; then echo "${SHIM_KERNEL:-6.8.0-generic}"; else exec "%s
 chmod +x "$T/bin/uname"
 export PATH="$T/bin:$PATH"
 
+# setup -> an installation of Catalog 25.4 that runs (named here: the default is the newest Catalog of the release)
 setup() {
   rm -rf "$T/inst" "$ST"/*; mkdir -p "$T/inst"; cp "$NEW" "$T/inst/rn1-technology-catalog-installer.sh"
-  sed -i '0,/^OPENSEARCH_TAG=/s/^OPENSEARCH_TAG=.*/OPENSEARCH_TAG="2.19.5"/; 0,/^OPENSEARCH_DASHBOARDS_TAG=/s/^OPENSEARCH_DASHBOARDS_TAG=.*/OPENSEARCH_DASHBOARDS_TAG="2.19.5"/; 0,/^RABBITMQ_TAG=/s/^RABBITMQ_TAG=.*/RABBITMQ_TAG="3.13.6-management-alpine"/; 0,/^NGINX_PROXY_MANAGER_TAG=/s/^NGINX_PROXY_MANAGER_TAG=.*/NGINX_PROXY_MANAGER_TAG="2.16.0"/; s/^CHECK_FOR_UPDATES=.*/CHECK_FOR_UPDATES="false"/; s/^HEALTH_TIMEOUT=.*/HEALTH_TIMEOUT="10"/' "$T/inst/rn1-technology-catalog-installer.sh"
+  sed -i 's/^CATALOG_VERSION=.*/CATALOG_VERSION="25.4.4191.133"/; 0,/^OPENSEARCH_TAG=/s/^OPENSEARCH_TAG=.*/OPENSEARCH_TAG="2.19.5"/; 0,/^OPENSEARCH_DASHBOARDS_TAG=/s/^OPENSEARCH_DASHBOARDS_TAG=.*/OPENSEARCH_DASHBOARDS_TAG="2.19.5"/; 0,/^RABBITMQ_TAG=/s/^RABBITMQ_TAG=.*/RABBITMQ_TAG="3.13.6-management-alpine"/; 0,/^NGINX_PROXY_MANAGER_TAG=/s/^NGINX_PROXY_MANAGER_TAG=.*/NGINX_PROXY_MANAGER_TAG="2.16.0"/; s/^CHECK_FOR_UPDATES=.*/CHECK_FOR_UPDATES="false"/; s/^HEALTH_TIMEOUT=.*/HEALTH_TIMEOUT="10"/' "$T/inst/rn1-technology-catalog-installer.sh"
   (cd "$T/inst" && bash rn1-technology-catalog-installer.sh generate </dev/null >/dev/null 2>&1)
   touch "$ST/up"; echo "25.4.4191.133" > "$ST/catalog_tag"; echo "8.0.4" > "$ST/mongo_version"; (cd "$T/inst" && pwd -P) > "$ST/wd"; cp "$T/inst/.env" "$ST/upenv"
   : > "$LOG"
@@ -316,9 +317,11 @@ out="$(printf '21\ny\nn\n\n\n0\n' | SHIM_LICENSE_HOST=4f9c2d71e8a3 bash "$D/rn1-
 check "upgrade of older files, licensed catalog-web named like a container ID: the name kept (.env, compose file), said once in the job log" 'grep -q "Catalog upgraded: 25.4.4191.133 -> 26.3.4789.148." <<< "$out" && grep -q "^CATALOG_HOSTNAME=4f9c2d71e8a3$" "$D/.env" && grep -q "^    hostname: \${CATALOG_HOSTNAME}$" "$D/docker-compose.yml" && [ "$(cat "$ST/hostname")" = 4f9c2d71e8a3 ] && [ "$(grep -c "catalog-web keeps its host name 4f9c2d71e8a3: the Catalog.s license$" "$D/.jobs/1/log")" -eq 1 ] && grep -q "^  is bound to it (CATALOG_HOSTNAME in .env).$" "$D/.jobs/1/log" && ! grep -q "keeps its host name" "$D/.jobs/2/log"'
 check "the license survives the upgrade and the patch updates: the checks afterwards stay quiet" 'grep -q "^MONGO_TAG=\"8.0.32\"$" "$D/rn1-technology-catalog-installer.sh" && ! grep -q -e "no valid license after the restart" -e "needs a license" <<< "$out"'
 setup
+# (an installation of 26.3: its catalog-web first - generate does not raise a running 25.4 without asking)
+echo 26.3.4789.148 > "$ST/catalog_tag"
 sed -i 's/^CATALOG_VERSION=.*/CATALOG_VERSION="26.3.4789.148"/' "$D/rn1-technology-catalog-installer.sh"
 (cd "$D" && bash rn1-technology-catalog-installer.sh generate </dev/null >/dev/null 2>&1)
-echo 26.3.4789.148 > "$ST/catalog_tag"; sed -i '/^CATALOG_HOSTNAME=/d' "$D/.env"
+sed -i '/^CATALOG_HOSTNAME=/d' "$D/.env"
 out="$(printf '21\n\n\n0\n' | SHIM_LICENSE_HOST=4f9c2d71e8a3 bash "$D/rn1-technology-catalog-installer.sh" menu 2>&1)"
 check "patch updates of older files, licensed catalog-web: the name kept, the check afterwards quiet" 'grep -q "The Catalog is up to date." <<< "$out" && grep -q "^CATALOG_HOSTNAME=4f9c2d71e8a3$" "$D/.env" && grep -q "catalog-web keeps its host name 4f9c2d71e8a3" "$D/.jobs/1/log" && [ "$(cat "$ST/hostname")" = 4f9c2d71e8a3 ] && grep -q "^MONGO_TAG=\"8.0.32\"$" "$D/rn1-technology-catalog-installer.sh" && ! grep -q "no valid license after the restart" <<< "$out"'
 setup
@@ -327,21 +330,24 @@ out="$(printf '21\ny\nn\n\n\n0\n' | SHIM_LICENSE_VALID=false bash "$D/rn1-techno
 check "license not accepted after the upgrade and the patch updates: named in both jobs" 'grep -q "Catalog upgraded: 25.4.4191.133 -> 26.3.4789.148." <<< "$out" && [ "$(grep -c "The Catalog has no valid license after the restart - option 25 shows why." <<< "$out")" -eq 2 ] && grep -q "A license for an older Catalog version or another host name of catalog-web" <<< "$out" && grep -q "no valid license after the restart" "$D/.jobs/1/log"'
 check "older files without a valid license: the name of this server (nothing to lose)" 'h="$(sed -n "s/^CATALOG_HOSTNAME=//p" "$D/.env")"; [ -n "$h" ] && [ "$h" != 4f9c2d71e8a3 ] && [ "$h" = "$(cd "$D" && bash rn1-technology-catalog-installer.sh __server_hostname)" ] && grep -q "catalog-web now has the fixed host name $h (CATALOG_HOSTNAME)." "$D/.jobs/1/log" && ! grep -q "keeps its host name" "$D/.jobs/1/log"'
 
-# 10. The installer upgraded this folder to 26.3 (MongoDB 8.0.32, port 8181), then a new download of it
-#     brought back the default settings (Catalog 25.4)
+# 10. The installer upgraded this folder to 26.3 (MongoDB 8.0.32, port 8181), then a new download of an
+#     installer whose default was older brought back the default settings (Catalog 25.4)
 export SHIM_TZ="Etc/UTC"
 N="rn1-technology-catalog-installer.sh"
 installation26() {
   setup
+  # catalog-web of 26.3 first: generate does not raise a running 25.4 without asking
+  echo "26.3.4789.148" > "$ST/catalog_tag"
   sed -i 's/^CATALOG_VERSION=.*/CATALOG_VERSION="26.3.4789.148"/; 0,/^MONGO_TAG=/s/^MONGO_TAG=.*/MONGO_TAG="8.0.32"/; 0,/^CATALOG_WEB_PORT=/s/^CATALOG_WEB_PORT=.*/CATALOG_WEB_PORT="8181"/; 0,/^TZ=/s#^TZ=.*#TZ="Etc/UTC"#; 0,/^AUTOSYNC_CRON=/s/^AUTOSYNC_CRON=.*/AUTOSYNC_CRON="30 5 * * *"/' "$D/$N"
   (cd "$D" && bash "$N" generate </dev/null >/dev/null 2>&1)
-  echo "26.3.4789.148" > "$ST/catalog_tag"; echo "8.0.32" > "$ST/mongo_version"; cp "$D/.env" "$ST/upenv"
+  echo "8.0.32" > "$ST/mongo_version"; cp "$D/.env" "$ST/upenv"
   env26="$(cksum < "$D/.env")"; compose26="$(cksum < "$D/docker-compose.yml")"
   : > "$LOG"
 }
-# the published file with the time zone of the server (option 2 of the old installer aligned it)
+# the published file with the default Catalog 25.4 and the time zone of the server (option 2 of the old
+# installer aligned it)
 FRESH="$T/fresh.sh"
-sed '0,/^TZ=/s#^TZ=.*#TZ="Etc/UTC"#; 0,/^AUTOSYNC_CRON=/s/^AUTOSYNC_CRON=.*/AUTOSYNC_CRON="30 5 * * *"/' "$NEW" > "$FRESH"
+sed 's/^CATALOG_VERSION=.*/CATALOG_VERSION="25.4.4191.133"/; 0,/^TZ=/s#^TZ=.*#TZ="Etc/UTC"#; 0,/^AUTOSYNC_CRON=/s/^AUTOSYNC_CRON=.*/AUTOSYNC_CRON="30 5 * * *"/' "$NEW" > "$FRESH"
 nocompose() { ! grep -Eq "compose.* (up|down|pull)" "$LOG"; }
 
 # 10a. The screenshot: settings 25.4, .env and the running catalog-web 26.3
@@ -555,6 +561,50 @@ check "older backups not put back: the start keeps the license" '[ "$rc" -eq 0 ]
 old_state
 out="$(printf 'y\nn\n\n0\n' | SHIM_LICENSE_VALID=false bash "$D/$N" menu 2>&1)"
 check "older backups, no valid license: the host name not offered" 'grep -q "Took over" <<< "$out" && ! grep -q "CATALOG_HOSTNAME " <<< "$out" && grep -qxF "CATALOG_HOSTNAME=\"\"" "$D/$N"'
+
+# 10o. A new download with the default of a release (the newest Catalog, 26.3) next to an installation of 25.4:
+#      the menu names it and offers nothing at the start; setup, generate, up and options 2, 6 and 7 ask before
+#      they raise the Catalog without the upgrade's MongoDB backup (no answer, or no: nothing written or
+#      started); option 21 upgrades it with the backup, option 23 keeps 25.4
+newer_download() {
+  setup
+  sed 's/^CATALOG_VERSION=.*/CATALOG_VERSION="26.3.4789.148"/' "$NEW" > "$D/$N"
+  env25="$(cksum < "$D/.env")"
+}
+newer_download
+out="$(printf '0\n' | bash "$D/$N" menu 2>&1)"
+check "newer download: the menu names it - U or 21 upgrades, 23 keeps 25.4 - nothing offered at the start" 'grep -q "The settings say Catalog 26.3.4789.148, 25.4.4191.133 is installed - U or option 21 upgrades it (MongoDB backup, health check, rollback), option 23 keeps 25.4.4191.133\.$" <<< "$out" && grep -q "Installation Portal *(Catalog 25.4.4191.133" <<< "$out" && ! grep -q -e "Taking them over writes" -e "option 2 regenerates them" <<< "$out" && nocompose'
+out="$(bash "$D/$N" status </dev/null 2>&1)"
+check "newer download: status names it with the commands" 'grep -q "Catalog 25.4.4191.133 installed (the settings say 26.3.4789.148)" <<< "$out" && grep -q "The settings say Catalog 26.3.4789.148, 25.4.4191.133 is installed - .*upgrade. upgrades it (MongoDB backup, health check, rollback), .*adopt \.. keeps 25.4.4191.133\.$" <<< "$out"'
+for c in setup generate; do
+  out="$(bash "$D/$N" "$c" </dev/null 2>&1)"; rc=$?
+  check "newer download: '$c' without an answer - no upgrade without the backup, nothing written or started" '[ "$rc" -ne 0 ] && grep -q "Catalog 26.3.4789.148 would replace the installed 25.4.4191.133 without a MongoDB backup, health check or rollback" <<< "$out" && grep -q "upgrade. upgrades it with them; .*adopt \.. keeps Catalog 25.4.4191.133\." <<< "$out" && grep -q "Nothing was written." <<< "$out" && [ "$(cksum < "$D/.env")" = "$env25" ] && nocompose && [ ! -d "$D/backups" ]'
+done
+out="$(printf 'n\n' | bash "$D/$N" setup 2>&1)"; rc=$?
+check "newer download: 'setup' answered no - nothing written or started" '[ "$rc" -ne 0 ] && grep -q "would replace the installed 25.4.4191.133 without a MongoDB backup" <<< "$out" && grep -q "Nothing was written." <<< "$out" && [ "$(cksum < "$D/.env")" = "$env25" ] && nocompose'
+out="$(printf '2\nn\n\n7\nn\n\n6\nn\n\n0\n' | bash "$D/$N" menu 2>&1)"
+check "newer download: options 2 and 7 ask (no: nothing written), option 6 names it and starts only the files as they are" '[ "$(grep -c "would replace the installed 25.4.4191.133 without a MongoDB backup" <<< "$out")" -eq 2 ] && [ "$(grep -c "Nothing was written." <<< "$out")" -eq 2 ] && grep -q "U or option 21 upgrades it with them; option 23 keeps Catalog 25.4.4191.133." <<< "$out" && grep -q "WARN The settings say Catalog 26.3.4789.148, 25.4.4191.133 is installed - U or option 21" <<< "$out" && grep -q "Cancelled." <<< "$out" && [ "$(cksum < "$D/.env")" = "$env25" ] && nocompose'
+# answered yes, the user's choice: written and started, asked once
+out="$(printf 'y\n' | bash "$D/$N" setup 2>&1)"; rc=$?
+check "newer download: 'setup' answered yes - asked once, 26.3 written and started" '[ "$rc" -eq 0 ] && [ "$(grep -c "would replace the installed" <<< "$out")" -eq 1 ] && grep -qx "CATALOG_IMAGE=raynetgmbh/rayventory-catalog:26.3.4789.148" "$D/.env" && [ "$(cat "$ST/catalog_tag")" = 26.3.4789.148 ]'
+# 'generate' answered yes: the files name 26.3, 25.4 runs - named, 'up' and option 6 ask, option 21 upgrades with the backup
+newer_download
+out="$(printf 'y\n' | bash "$D/$N" generate 2>&1)"; rc=$?
+check "newer download: 'generate' answered yes writes 26.3 and starts nothing" '[ "$rc" -eq 0 ] && grep -qx "CATALOG_IMAGE=raynetgmbh/rayventory-catalog:26.3.4789.148" "$D/.env" && nocompose'
+out="$(printf '0\n' | bash "$D/$N" menu 2>&1)"
+check "files of 26.3 next to the running 25.4: the menu names them" 'grep -q "The files say Catalog 26.3.4789.148, 25.4.4191.133 is installed - U or option 21 upgrades it (MongoDB backup, health check, rollback), option 23 keeps 25.4.4191.133\.$" <<< "$out"'
+out="$(bash "$D/$N" up </dev/null 2>&1)"; rc=$?
+check "files of 26.3: 'up' without an answer starts nothing" '[ "$rc" -ne 0 ] && grep -q "names Catalog 26.3.4789.148, the catalog-web container has 25.4.4191.133\.$" <<< "$out" && grep -q "Nothing was started." <<< "$out" && nocompose'
+out="$(printf '6\nn\n\n0\n' | bash "$D/$N" menu 2>&1)"
+check "files of 26.3: option 6 asks, no - nothing started" 'grep -q "would replace the installed 25.4.4191.133 without a MongoDB backup" <<< "$out" && grep -q "Nothing was started." <<< "$out" && nocompose && [ "$(cat "$ST/catalog_tag")" = 25.4.4191.133 ]'
+out="$(printf '21\ny\ny\n0\n\n0\n' | bash "$D/$N" menu 2>&1)"
+check "files of 26.3: option 21 upgrades 25.4 with the MongoDB backup, asks nothing about it" 'grep -q "Installed Catalog: 25.4.4191.133" <<< "$out" && ls "$D"/backups/mongo-*.archive.gz >/dev/null 2>&1 && grep -q "Catalog upgraded: 25.4.4191.133 -> 26.3.4789.148." <<< "$out" && ! grep -q "without a backup anyway" <<< "$out" && [ "$(cat "$ST/catalog_tag")" = 26.3.4789.148 ]'
+# option 23 keeps the installed Catalog: the settings take 25.4, the files stay
+newer_download
+out="$(printf '23\ny\n\n0\n' | bash "$D/$N" menu 2>&1)"
+check "newer download: option 23 keeps 25.4 - the settings take the installed Catalog, the files stay" 'grep -q "CATALOG_VERSION *26.3.4789.148 -> 25.4.4191.133" <<< "$out" && grep -qxF "CATALOG_VERSION=\"25.4.4191.133\"" "$D/$N" && [ "$(cksum < "$D/.env")" = "$env25" ] && nocompose'
+out="$(printf '0\n' | bash "$D/$N" menu 2>&1)"
+check "newer download kept at 25.4: afterwards no note" '! grep -q -e "The settings say" -e "The files say" <<< "$out"'
 
 check "no Podman, Compose or systemctl call the fakes do not know" '[ ! -s "$UNH" ] || { cat "$UNH"; false; }'
 

@@ -47,7 +47,8 @@ inspect() {
     rp '{{index .Config.Labels "com.docker.compose.service"}}' "$(svc_of "$id")"
     rp '{{.State.Status}}|{{with .State.Health}}{{or .Status "none"}}{{else}}none{{end}}|{{.RestartCount}}' "running|none|0"
     rp '{{.RestartCount}}' "$(cat "$ST/restarts.$id" 2>/dev/null || echo 0)"
-    rp '{{.Config.Image}}' "$(if [ "$id" = c1 ]; then echo docker.io/library/mongo:8.0; else echo docker.io/raynetgmbh/rayventory-catalog:25.4.4191.133; fi)"
+    # catalog-web runs the Catalog .env named at its start (an installer's default is the newest of its release)
+    rp '{{.Config.Image}}' "$(if [ "$id" = c1 ]; then echo docker.io/library/mongo:8.0; else echo "docker.io/$(if [ -s "$ST/catalog_image" ]; then cat "$ST/catalog_image"; else echo raynetgmbh/rayventory-catalog:25.4.4191.133; fi)"; fi)"
     case "$out" in *'{{'*) echo "UNHANDLED $ENGINE_FAKE container inspect --format $fmt" >> "$BAD"; return 125 ;; esac
     printf '%s\n' "$out"
   done
@@ -62,6 +63,7 @@ compose() {
     "config --quiet") ;;
     "up -d --remove-orphans")
       touch "$ST/up"
+      envval CATALOG_IMAGE > "$ST/catalog_image"
       c="$(envval MONGO_WT_CACHE_GB)"
       # a changed cache is a changed command of mongo: Compose creates it again, which clears OOMKilled
       if [ "$c" != "$(cat "$ST/cache" 2>/dev/null)" ]; then
@@ -105,7 +107,16 @@ if [ "${1:-}" = machine ]; then
       [ -n "${SHIM_SET_FAIL:-}" ] && { echo "Error: setting memory: invalid argument" >&2; exit 125; }
       # SHIM_SET_NOOP: accepted, but the machine starts with its old memory
       [ -n "${SHIM_SET_NOOP:-}" ] || echo "$4" > "$ST/machine.mb" ;;
+    # what podman machine start says on a Mac (the helper for the Docker API socket, DOCKER_HOST);
+    # SHIM_START_FAIL: it does not start; SHIM_START_STOP: stopped while it starts, the installer as well (TERM,
+    # which it traps like Ctrl+C: a suite started in the background ignores SIGINT, and so does all it starts)
     "machine start $m")
+      echo "Starting machine \"$m\""
+      if [ -n "${SHIM_START_FAIL:-}" ]; then echo "Error: vfkit exited unexpectedly with exit code 1" >&2; exit 125; fi
+      if [ -n "${SHIM_START_STOP:-}" ]; then kill -TERM "$PPID"; exit 143; fi
+      echo "The system helper service is not installed; the default Docker API socket address can't be used by podman."
+      echo "        export DOCKER_HOST='unix:///var/folders/xy/T/podman/$m-api.sock'"
+      echo "Machine \"$m\" started successfully"
       echo running > "$ST/machine"
       rm -f "$ST/restart.n"
       [ -n "${SHIM_START_DEAD:-}" ] && touch "$ST/dead"
@@ -328,10 +339,12 @@ installed() {
   : > "$LOG"; rm -f "$ST/uploads"
 }
 before() { [ "$(grep -n -m1 -- "$1" "$LOG" | cut -d: -f1)" -lt "$(grep -n -m1 -- "$2" "$LOG" | cut -d: -f1)" ]; }
+# obefore OUT A B -> true when the first line of OUT with A comes before the first with B
+obefore() { local a b; a="$(grep -n -m1 -- "$2" <<< "$1" | cut -d: -f1)"; b="$(grep -n -m1 -- "$3" <<< "$1" | cut -d: -f1)"; [ -n "$a" ] && [ -n "$b" ] && [ "$a" -lt "$b" ]; }
 MEMWARN="GB for the containers - at least 24 GB is recommended"
 MEMOK="GB for the containers - enough for a full snapshot import"
 # narrow OUT -> true when the lines of the memory messages in OUT fit into 80 columns; else prints the wider ones
-NEWMSG='stopped by the kernel|The engine has|macOS gives|restarts \(about|More memory for|has to be raised|VM settings or hardware|does not limit the cache|about half of the memory|This Mac has|and keep 8 GB|A daily snapshot builds|option 19, a chain|A snapshot import replaces|Memory: [0-9]+ GB|A full snapshot import loads|This engine has|Docker Desktop: Settings|A job is running|when the job is done|still has|of memory now|MongoDB gets a cache|restarts with 24 GB|does not answer after|could not be changed|does not run cleanly|in the background \(J\)|podman machine (stop|set|start) podman|colima stop|brew services|memory: 24 in|Linux VM gets|a Mac with 32'
+NEWMSG='stopped by the kernel|The engine has|macOS gives|can get 24 GB|STOPPED and STARTED|every container in it|keeps its memory|runs again|did not start again|More memory for|has to be raised|VM settings or hardware|does not limit the cache|about half of the memory|This Mac has|and keep 8 GB|A daily snapshot builds|option 19, a chain|A snapshot import replaces|Memory: [0-9]+ GB|A full snapshot import loads|This engine has|Docker Desktop: Settings|A job is running|when the job is done|still has|of memory now|MongoDB gets a cache|restarts with 24 GB|does not answer after|could not be changed|does not run cleanly|in the background \(J\)|podman machine (stop|set|start) podman|colima stop|brew services|memory: 24 in|Linux VM gets|a Mac with 32|starts again \(about|Stopped while the'
 narrow() { ! sed 's/\x1b\[[0-9;]*m//g' <<< "$1" | grep -E "$NEWMSG" | awk 'length($0) > 80 { print "  | " length($0) ": " $0; bad = 1 } END { exit !bad }'; }
 
 # 1. The memory of the engine in the check: whole GB, 92 % of 24 GB counts as enough
@@ -397,8 +410,11 @@ check "MONGO_CACHE_GB changed: the menu names the files stale" 'grep -q "do not 
 : > "$LOG"; out="$(run up)"
 check "start: the set value reaches .env and mongo" '[ "$(envv MONGO_WT_CACHE_GB)" = 3 ] && grep -q "compose: mongo created with cache=3$" "$LOG"'
 
-# 4. Files of an older installer: .env without the cache (and a compose file without it, or with it)
-fresh
+# 4. Files of an older installer: .env without the cache (and a compose file without it, or with it). The
+#    settings name the Catalog of those files (the default is the newest one of the release: setup would ask
+#    before it upgrades the running Catalog without a backup)
+ORIG_CATALOG="$(sed -n 's/^CATALOG_VERSION="\(.*\)"$/\1/p' "$SP/original.sh")"
+fresh "s/^CATALOG_VERSION=.*/CATALOG_VERSION=\"$ORIG_CATALOG\"/"
 mkdir -p "$T/old"; (cd "$T/old" && bash "$SP/original.sh" >/dev/null 2>&1); cp "$T/old/.env" "$T/old/docker-compose.yml" "$D/"
 out="$(run up)"; rc=$?
 check "old .env and compose file: they start as they are (no cache added)" '[ "$rc" -eq 0 ] && ! grep -q MONGO_WT_CACHE_GB "$D/.env" && ! grep -q wiredTiger "$D/docker-compose.yml" && grep -q "do not match the settings" <<< "$out"'
@@ -484,27 +500,49 @@ fresh; mem $(((14336 - 408) * 1048576))
 out="$(run setup)"; rc=$?
 check "setup without a terminal: the warning, then on" '[ "$rc" -eq 0 ] && grep -q "This engine has 14 GB of memory" <<< "$out" && [ -f "$D/.env" ] && [ "$(envv MONGO_WT_CACHE_GB)" = 2 ]'
 
-# 8. macOS with a Podman machine of 14 GB on a Mac with 48 GB: the offer, only after a yes, without sudo
+# 8. macOS with a Podman machine of 14 GB on a Mac with 48 GB: the offer warns that the machine is stopped and
+# started again, and only the typed PODMAN REBOOT restarts it (without sudo)
 mac_fresh() { fresh "${1:-}"; echo running > "$ST/machine"; echo 14336 > "$ST/machine.mb"; mem $(((14336 - 408) * 1048576)); }
+# untouched -> true when the Podman machine was not stopped, set or started
+untouched() { ! grep -q -e "^podman machine stop" -e "^podman machine set" -e "^podman machine start" "$LOG"; }
 mac_fresh
-out="$(SHIM_OS=Darwin menu '7\nn\nn\n\n0\n')"
-check "macOS: no to the offer - the machine untouched, no to going on - nothing written" '! grep -q "^podman machine stop" "$LOG" && ! grep -q "^podman machine set" "$LOG" && grep -q "Cancelled." <<< "$out" && [ ! -f "$D/.env" ]'
+out="$(SHIM_OS=Darwin menu '7\n\nn\n\n0\n')"
+check "macOS: the offer warns that the machine is STOPPED and STARTED again, every container with it" 'grep -q "^WARN This engine has 14 GB of memory; at least 24 GB is recommended.$" <<< "$out" && grep -q "^  The Podman machine can get 24 GB; macOS gives it memory only as it uses it.$" <<< "$out" && grep -q "^WARN For that the Podman machine is STOPPED and STARTED again (about a minute):$" <<< "$out" && grep -q "^  every container in it stops.$" <<< "$out" && narrow "$out"'
+check "macOS: Enter at the offer - the machine untouched, its memory kept; no to going on - nothing written" 'grep -q "^==> The Podman machine keeps its memory.$" <<< "$out" && ! grep -q "Not PODMAN REBOOT" <<< "$out" && ! grep -q "^podman machine stop" "$LOG" && ! grep -q "^podman machine set" "$LOG" && grep -q "Cancelled." <<< "$out" && [ ! -f "$D/.env" ]'
+# a y out of habit, the words in lower case or in part, more than the words, 0 outside I: the memory is kept
+for a in y "podman reboot" PODMAN "PODMAN REBOOT NOW" 0; do
+  mac_fresh
+  out="$(SHIM_OS=Darwin menu "7\n$a\nn\n\n0\n")"
+  check "macOS: \"$a\" at the offer is not PODMAN REBOOT - the memory kept, then the question" 'grep -q "^==> Not PODMAN REBOOT: the Podman machine keeps its memory.$" <<< "$out" && untouched && grep -q "Cancelled." <<< "$out" && [ ! -f "$D/.env" ]'
+done
 mac_fresh
-out="$(SHIM_OS=Darwin menu '7\ny\n\n0\n')"
-check "macOS: yes - stop, set --memory 24576, start, in this order, as the user" 'before "^podman machine stop podman-machine-default$" "^podman machine set --memory 24576 podman-machine-default$" && before "^podman machine set --memory 24576" "^podman machine start podman-machine-default$" && ! grep -q sudo "$BAD"'
+out="$(SHIM_OS=Darwin menu '7\nPODMAN REBOOT\n\n0\n')"
+check "macOS: PODMAN REBOOT - stop, set --memory 24576, start, in this order, as the user" 'before "^podman machine stop podman-machine-default$" "^podman machine set --memory 24576 podman-machine-default$" && before "^podman machine set --memory 24576" "^podman machine start podman-machine-default$" && ! grep -q sudo "$BAD"'
 check "macOS: after the start it waits while podman-restart.service starts the containers, then writes the files" '[ "$(grep -c "^podman machine ssh podman-machine-default systemctl is-active podman-restart.service$" "$LOG")" -eq 2 ] && before "^podman machine start" "^podman machine ssh" && before "^podman machine ssh" "compose: mongo created" && narrow "$out"'
 check "macOS: the machine has 24 GB, the installation goes on without asking" 'grep -q "The Podman machine has 24 GB of memory now." <<< "$out" && [ "$(envv MONGO_WT_CACHE_GB)" = 7 ] && before "^podman machine start" "compose: mongo created with cache=7"'
+check "macOS: what podman machine start says is not shown when it starts (the helper, DOCKER_HOST), only that it runs" '! grep -q -e "Starting machine" -e "system helper service" -e DOCKER_HOST -e "started successfully" <<< "$out" && grep -q "^ OK The Podman machine runs again.$" <<< "$out" && before "^podman machine start" "^podman machine ssh"'
+check "macOS: while the hidden start runs, the installer says that the machine starts again" 'grep -q "^==> The Podman machine starts again (about a minute)...$" <<< "$out" && obefore "$out" "^==> The Podman machine restarts with 24 GB:$" "starts again (about a minute)" && obefore "$out" "starts again (about a minute)" "^ OK The Podman machine runs again.$"'
+mac_fresh
+out="$(SHIM_OS=Darwin SHIM_START_FAIL=1 menu '7\nPODMAN REBOOT\n\n0\n')"
+check "macOS: the machine does not start again - its own output shown, how to start it, nothing written" 'grep -q "^Starting machine \"podman-machine-default\"$" <<< "$out" && grep -q "^Error: vfkit exited unexpectedly with exit code 1$" <<< "$out" && grep -q "^ERROR The Podman machine did not start again - start it:$" <<< "$out" && grep -q "^      podman machine start podman-machine-default$" <<< "$out" && ! grep -q "runs again" <<< "$out" && grep -q "Cancelled." <<< "$out" && [ ! -f "$D/.env" ] && [ "$(cat "$ST/machine")" = stopped ] && narrow "$out"'
+check "macOS: the start that fails - first that it starts again, then its own output" 'obefore "$out" "starts again (about a minute)" "^Starting machine" && obefore "$out" "^Error: vfkit" "^ERROR The Podman machine did not start again"'
+# Ctrl+C while the machine starts: the task stops (130, the menu says Interrupted) with how to start it; the file
+# of its output is gone
+mac_fresh
+mkdir -p "$T/tmpdir"; rm -rf "$T/tmpdir"/*
+out="$(SHIM_OS=Darwin SHIM_START_STOP=1 TMPDIR="$T/tmpdir" menu '7\nPODMAN REBOOT\n\n0\n')"
+check "macOS: stopped while the machine starts - interrupted, how to start it, no file of its output left, nothing written" '{ grep -q "^WARN Stopped while the Podman machine started - if it does not run, start it:$" <<< "$out" && grep -q "^      podman machine start podman-machine-default$" <<< "$out" && obefore "$out" "Stopped while the Podman machine" "^WARN Interrupted.$" && ! grep -q -e "Starting machine" -e "runs again" -e "^ERROR" -e "Cancelled." -e "anyway?" <<< "$out" && ! grep -rqs "Starting machine" "$T/tmpdir" && [ ! -f "$D/.env" ] && narrow "$out"; } || { ls -la "$T/tmpdir" | sed "s/^/  | /"; grep -n -B6 -A14 "restarts with 24 GB" <<< "$out" | sed "s/^/  | /"; false; }'
 mac_fresh
 out="$(SHIM_OS=Darwin SHIM_MEMSIZE=$((24 * GIB)) menu '7\nn\n\n0\n')"
 check "macOS with 24 GB: no offer (macOS keeps 8 GB), then the question" 'grep -q "^  This Mac has 24 GB: not enough to give the containers 24 GB$" <<< "$out" && grep -q "^  and keep 8 GB for macOS.$" <<< "$out" && ! grep -q "^podman machine stop" "$LOG" && grep -q "Cancelled." <<< "$out"'
 mac_fresh
-out="$(SHIM_OS=Darwin SHIM_SET_FAIL=1 menu '7\ny\nn\n\n0\n')"
+out="$(SHIM_OS=Darwin SHIM_SET_FAIL=1 menu '7\nPODMAN REBOOT\nn\n\n0\n')"
 check "macOS: the memory cannot be set - the machine started again, said so, then the question" 'before "^podman machine set --memory" "^podman machine start podman-machine-default$" && grep -q "The memory of the Podman machine could not be changed (see above)." <<< "$out" && grep -q "Cancelled." <<< "$out" && [ "$(cat "$ST/machine")" = running ] && [ ! -f "$D/.env" ]'
 mac_fresh
-out="$(SHIM_OS=Darwin SHIM_SET_NOOP=1 menu '7\ny\nn\n\n0\n')"
+out="$(SHIM_OS=Darwin SHIM_SET_NOOP=1 menu '7\nPODMAN REBOOT\nn\n\n0\n')"
 check "macOS: the machine comes back with its old memory - a warning, not OK, then the question" 'grep -q "^WARN The Podman machine still has 14 GB of memory.$" <<< "$out" && ! grep -q "of memory now" <<< "$out" && grep -q "Cancelled." <<< "$out" && [ ! -f "$D/.env" ]'
 mac_fresh 's/^MEM_ENGINE_WAIT=.*/MEM_ENGINE_WAIT=3/'
-out="$(SHIM_OS=Darwin SHIM_START_DEAD=1 menu '7\ny\n\n0\n')"
+out="$(SHIM_OS=Darwin SHIM_START_DEAD=1 menu '7\nPODMAN REBOOT\n\n0\n')"
 check "macOS: Podman does not answer after the restart - said so, nothing written, no question" 'grep -q "Podman does not answer after the restart:" <<< "$out" && grep -q "start the Podman machine: podman machine start podman-machine-default." <<< "$out" && grep -q "Cancelled." <<< "$out" && ! grep -q "anyway?" <<< "$out" && [ ! -f "$D/.env" ]'
 mac_fresh
 mkdir -p "$D/.jobs/4"; echo stack > "$D/.jobs/4/class"; echo "Pull" > "$D/.jobs/4/title"; echo running > "$D/.jobs/4/state"
@@ -512,16 +550,24 @@ sleep 60 & echo $! > "$D/.jobs/4/pid"; sleeper=$!
 out="$(SHIM_OS=Darwin menu '7\nn\n\n0\n')"
 kill "$sleeper" 2>/dev/null; wait "$sleeper" 2>/dev/null
 check "macOS with a job running: no restart of the machine, then the question" 'grep -q "^  A job is running (J): the Podman machine gets more memory with a restart,$" <<< "$out" && ! grep -q "^podman machine stop" "$LOG" && grep -q "Cancelled." <<< "$out"'
-# I (the guided installation): 0 at the offer stops it like its other questions
+# I (the guided installation): the memory warned once (the line of the check), then the offer; 0 or the end of
+# input there stops it like its other questions, another answer keeps the memory and the question follows
 mac_fresh
 out="$(SHIM_OS=Darwin menu 'i\n\n\n\n\n0\n\n0\n')"
-check "macOS, I: 0 at the offer for the Podman machine stops the guided task, nothing changed" '{ grep -q "^  macOS gives the Podman machine memory only as it uses it.$" <<< "$out" && grep -q "Stopped. I starts it again" <<< "$out" && ! grep -q "^podman machine stop" "$LOG" && [ ! -f "$D/.env" ]; } || { tail -n 25 <<< "$out" | sed "s/^/  | /"; false; }'
+check "macOS, I: one memory warning - the line of the check - then the offer" '{ [ "$(grep -c "GB for the containers - at least 24 GB is recommended" <<< "$out")" -eq 1 ] && grep -q "^WARN Memory: 14 GB for the containers - at least 24 GB is recommended$" <<< "$out" && ! grep -q "This engine has" <<< "$out" && grep -q "^WARN For that the Podman machine is STOPPED and STARTED again (about a minute):$" <<< "$out"; } || { tail -n 25 <<< "$out" | sed "s/^/  | /"; false; }'
+check "macOS, I: 0 at the offer for the Podman machine stops the guided task, nothing changed" '{ grep -q "^  The Podman machine can get 24 GB; macOS gives it memory only as it uses it.$" <<< "$out" && grep -q "Stopped. I starts it again" <<< "$out" && ! grep -q "^podman machine stop" "$LOG" && [ ! -f "$D/.env" ]; } || { tail -n 25 <<< "$out" | sed "s/^/  | /"; false; }'
 mac_fresh
-out="$(SHIM_OS=Darwin menu 'i\n\n\n\n\ny\n\n\n\n0\n')"
-check "macOS, I: yes at the offer - the machine gets 24 GB, the installation goes on without the question" '{ before "^podman machine set --memory 24576" "compose: mongo created with cache=7" && grep -q "The Podman machine has 24 GB of memory now." <<< "$out" && grep -q "The Catalog is installed" <<< "$out"; } || { tail -n 25 <<< "$out" | sed "s/^/  | /"; false; }'
+out="$(SHIM_OS=Darwin menu 'i\n\n\n\n\n')"
+check "macOS, I: the end of input at the offer stops the guided task, nothing changed" '{ grep -q "STOPPED and STARTED again" <<< "$out" && grep -q "Stopped. I starts it again" <<< "$out" && ! grep -q "^podman machine stop" "$LOG" && [ ! -f "$D/.env" ]; } || { tail -n 25 <<< "$out" | sed "s/^/  | /"; false; }'
+mac_fresh
+out="$(SHIM_OS=Darwin menu 'i\n\n\n\n\ny\nn\n\n0\n')"
+check "macOS, I: y at the offer keeps the memory, then the question - no stops it" '{ grep -q "^==> Not PODMAN REBOOT: the Podman machine keeps its memory.$" <<< "$out" && grep -q "Stopped. I starts it again" <<< "$out" && untouched && [ ! -f "$D/.env" ]; } || { tail -n 25 <<< "$out" | sed "s/^/  | /"; false; }'
+mac_fresh
+out="$(SHIM_OS=Darwin menu 'i\n\n\n\n\nPODMAN REBOOT\n\n\n\n0\n')"
+check "macOS, I: PODMAN REBOOT at the offer - the machine gets 24 GB, the installation goes on without the question" '{ before "^podman machine set --memory 24576" "compose: mongo created with cache=7" && grep -q "The Podman machine has 24 GB of memory now." <<< "$out" && grep -q "The Catalog is installed" <<< "$out"; } || { tail -n 25 <<< "$out" | sed "s/^/  | /"; false; }'
 
-# 9. macOS, an import with the Catalog running: no to the offer and on with 14 GB - the out-of-memory stop;
-# then yes - the machine and the Catalog restart, the health check, then the same import again
+# 9. macOS, an import with the Catalog running: Enter at the offer and on with 14 GB - the out-of-memory stop;
+# then PODMAN REBOOT - the machine and the Catalog restart, the health check, then the same import again
 mac_running() {
   mac_fresh "${1:-}"
   (cd "$D" && SHIM_OS=Darwin bash "$I" generate </dev/null >/dev/null 2>&1 && SHIM_OS=Darwin bash "$I" up </dev/null >/dev/null 2>&1)
@@ -530,12 +576,13 @@ mac_running() {
   : > "$LOG"; rm -f "$ST/uploads"
 }
 mac_running; touch "$ST/fail-oom"
-out="$(SHIM_OS=Darwin menu '19\n1\nn\ny\ny\n\n\n0\n')"
+out="$(SHIM_OS=Darwin menu '19\n1\n\ny\nPODMAN REBOOT\n\n\n0\n')"
 check "macOS import: the stop named with the commands for the Podman machine, one per line" 'grep -q "MongoDB was stopped by the kernel: out of memory." <<< "$out" && grep -q "^  The engine has 14 GB of memory; at least 24 GB is recommended.$" <<< "$out" && grep -q "^  More memory for the Podman machine (macOS gives it only what it uses):$" <<< "$out" && grep -q "^      podman machine stop podman-machine-default$" <<< "$out" && grep -q "^      podman machine set --memory 24576 podman-machine-default$" <<< "$out" && grep -q "^      podman machine start podman-machine-default$" <<< "$out" && narrow "$out"'
+check "macOS import: the offer says that the Catalog is started again, after the stop the offer again" '[ "$(grep -c "^  every container in it stops; the Catalog is started again afterwards.$" <<< "$out")" -eq 2 ] && grep -q "^==> The Podman machine keeps its memory.$" <<< "$out" && grep -q "^ OK The Podman machine runs again.$" <<< "$out"'
 check "macOS import: 24 GB, the Catalog started again and healthy, then the same import again" 'before "^podman machine set --memory 24576" "compose: mongo created with cache=7" && grep -q "Job #2 finished: Start the Catalog again" <<< "$out" && grep -q "All 2 services run and Catalog Web answers" <<< "$out" && [ "$(grep -c . "$ST/uploads")" -eq 2 ] && grep -q "Job #3 finished: Snapshot import" <<< "$out"'
 check "macOS import: the start job before the second upload, mongo created again (OOMKilled gone)" '[ "$(grep -c "^podman machine start" "$LOG")" -eq 1 ] && [ ! -f "$ST/oom" ] && [ "$(envv MONGO_WT_CACHE_GB)" = 7 ] && grep -q "Start the Catalog again" "$D/.jobs/2/title" && grep -q "Snapshot import" "$D/.jobs/3/title"'
 mac_running 's/^HEALTH_TIMEOUT=.*/HEALTH_TIMEOUT="4"/'
-out="$(SHIM_OS=Darwin SHIM_UNHEALTHY=1 menu '19\n1\ny\n\n0\n')"
+out="$(SHIM_OS=Darwin SHIM_UNHEALTHY=1 menu '19\n1\nPODMAN REBOOT\n\n0\n')"
 check "macOS import: the Catalog does not become healthy after the restart - said so, the import cancelled" 'grep -q "The Podman machine has 24 GB of memory now." <<< "$out" && grep -q "Job #1 failed: Start the Catalog again" <<< "$out" && grep -q "^WARN The Catalog does not run cleanly again yet.$" <<< "$out" && grep -q "Cancelled." <<< "$out" && ! grep -q "anyway?" <<< "$out" && [ ! -s "$ST/uploads" ]'
 
 # 10. Colima and Docker Desktop
@@ -544,15 +591,19 @@ for kind in colima docker; do
   mkdir -p "$T/home/.colima/default" "$D/snapshots"; printf 'cpu: 6\nmemory: 14\nvmType: vz\n' > "$T/home/.colima/default/colima.yaml"
   touch "$ST/colima.running"; head -c 2000 /dev/urandom | gzip -1 > "$D/snapshots/2026-09-28-full.tar.gz"
   if [ "$kind" = colima ]; then
-    out="$(cd "$D" && printf '19\n1\ny\n0\n\n0\n' | SHIM_OS=Darwin SHIM_KIND=colima PATH="$DPATH" bash "$I" menu 2>&1)"
-    check "Colima: yes - colima stop, then colima start with its CPUs and 24 GB, no question after" 'grep -q "This engine has 14 GB of memory" <<< "$out" && before "^colima stop$" "^colima start --cpu 6 --memory 24$" && grep -q "The Colima VM has 24 GB of memory now." <<< "$out" && grep -q "Access to the local catalog" <<< "$out" && grep -q "^      colima stop && colima start --cpu 6 --memory 24$" <<< "$out" && ! grep -q "^brew services st" "$LOG" && narrow "$out"'
+    out="$(cd "$D" && printf '19\n1\nPODMAN REBOOT\nn\n\n0\n' | SHIM_OS=Darwin SHIM_KIND=colima PATH="$DPATH" bash "$I" menu 2>&1)"
+    check "Colima: the warning names the Colima VM, PODMAN REBOOT is not its word - the memory kept" 'grep -q "^WARN For that the Colima VM is STOPPED and STARTED again (about a minute):$" <<< "$out" && grep -q "^==> Not COLIMA REBOOT: the Colima VM keeps its memory.$" <<< "$out" && ! grep -q -e "^colima stop" -e "^colima start" "$LOG" && grep -q "Cancelled." <<< "$out" && narrow "$out"'
+    : > "$LOG"
+    out="$(cd "$D" && printf '19\n1\nCOLIMA REBOOT\n0\n\n0\n' | SHIM_OS=Darwin SHIM_KIND=colima PATH="$DPATH" bash "$I" menu 2>&1)"
+    check "Colima: COLIMA REBOOT - colima stop, then colima start with its CPUs and 24 GB, no question after" 'grep -q "This engine has 14 GB of memory" <<< "$out" && before "^colima stop$" "^colima start --cpu 6 --memory 24$" && grep -q "The Colima VM has 24 GB of memory now." <<< "$out" && grep -q "Access to the local catalog" <<< "$out" && grep -q "^      colima stop && colima start --cpu 6 --memory 24$" <<< "$out" && ! grep -q "^brew services st" "$LOG" && narrow "$out"'
     # brew services starts Colima at login: its colima start -f started the VM (SHIM_BREW_OWNS) or ends at once
     # while the VM runs ("stopped" for brew) - stopped through brew services, the memory into colima.yaml
     for svc in started stopped; do
       printf 'cpu: 6\nmemory: 14\nvmType: vz\n' > "$T/home/.colima/default/colima.yaml"; rm -f "$ST/colima.gb"
       touch "$ST/colima.running"; echo "$svc" > "$ST/brew.colima"; : > "$LOG"
-      out="$(cd "$D" && printf '19\n1\ny\n0\n\n0\n' | SHIM_OS=Darwin SHIM_KIND=colima SHIM_BREW_OWNS="$([ "$svc" = started ] && echo 1)" PATH="$DPATH" bash "$I" menu 2>&1)"
+      out="$(cd "$D" && printf '19\n1\nCOLIMA REBOOT\n0\n\n0\n' | SHIM_OS=Darwin SHIM_KIND=colima SHIM_BREW_OWNS="$([ "$svc" = started ] && echo 1)" PATH="$DPATH" bash "$I" menu 2>&1)"
       check "Colima under brew services ($svc): brew services stop, memory: 24 in colima.yaml, brew services start" 'before "^brew services stop colima$" "^brew services start colima$" && ! grep -q "^colima start" "$LOG" && grep -q "^memory: 24$" "$T/home/.colima/default/colima.yaml" && [ "$(grep -c "^memory:" "$T/home/.colima/default/colima.yaml")" -eq 1 ] && grep -q "The Colima VM has 24 GB of memory now." <<< "$out" && grep -q "^      brew services stop colima; colima stop$" <<< "$out" && grep -q "^      memory: 24 in $T/home/.colima/default/colima.yaml$" <<< "$out" && [ "$(cat "$ST/brew.colima")" = started ] && narrow "$out"'
+      check "Colima under brew services ($svc): it says that the VM starts again (brew services start is silent)" 'obefore "$out" "^==> The Colima VM starts again (about a minute)...$" "The Colima VM has 24 GB of memory now."'
       if [ "$svc" = started ]; then
         check "Colima under brew services, the VM stopped with it: no colima stop" '! grep -q "^colima stop" "$LOG"'
       else
@@ -611,11 +662,11 @@ if command -v script >/dev/null 2>&1 && [ "$(uname -s)" = "Linux" ]; then
   out="$(tty_run "bash $I import $D/snapshots/2026-09-28-full.tar.gz" "anyway?" 'y\n' "again?" '\n')"
   check "terminal, import: the question below 24 GB and the same file again" '{ grep -q "Continue with 14 GB anyway? \[y/N\]" <<< "$out" && grep -q "Import the same file again? \[Y/n\]" <<< "$out" && [ "$(grep -c . "$ST/uploads")" -eq 2 ] && grep -q TTY-END <<< "$out"; } || { tail -n 30 <<< "$out" | sed "s/^/  | /"; false; }'
   mac_fresh
-  out="$(SHIM_OS=Darwin tty_run "bash $I setup" "now?" 'n\n' "anyway?" 'n\n')"
-  check "terminal, macOS setup: the offer for the Podman machine, then the question; no - nothing done" '{ grep -q "^  macOS gives the Podman machine memory only as it uses it.$" <<< "$out" && grep -q "^  The machine restarts (about a minute).$" <<< "$out" && grep -q "^Give the Podman machine 24 GB now? \[Y/n\]" <<< "$out" && narrow "$out" && grep -q "Continue with 14 GB anyway? \[y/N\]" <<< "$out" && ! grep -q "^podman machine stop" "$LOG" && [ ! -f "$D/.env" ]; } || { tail -n 30 <<< "$out" | sed "s/^/  | /"; false; }'
+  out="$(SHIM_OS=Darwin tty_run "bash $I setup" "Enter: no)" 'podman reboot\n' "anyway?" 'n\n')"
+  check "terminal, macOS setup: the offer for the Podman machine, the words in lower case refused, then the question; no - nothing done" '{ grep -q "^  The Podman machine can get 24 GB; macOS gives it memory only as it uses it.$" <<< "$out" && grep -q "^WARN For that the Podman machine is STOPPED and STARTED again (about a minute):$" <<< "$out" && grep -q "^  every container in it stops.$" <<< "$out" && grep -q "^Type PODMAN REBOOT to restart it with 24 GB (Enter: no): podman reboot$" <<< "$out" && grep -q "^==> Not PODMAN REBOOT: the Podman machine keeps its memory.$" <<< "$out" && narrow "$out" && grep -q "Continue with 14 GB anyway? \[y/N\]" <<< "$out" && ! grep -q "^podman machine stop" "$LOG" && [ ! -f "$D/.env" ]; } || { tail -n 30 <<< "$out" | sed "s/^/  | /"; false; }'
   mac_running; touch "$ST/fail-oom"
-  out="$(SHIM_OS=Darwin tty_run "bash $I import $D/snapshots/2026-09-28-full.tar.gz" "now?" 'n\n' "anyway?" 'y\n' "now?" 'y\n' "again?" '\n')"
-  check "terminal, macOS import with the Catalog running: it restarts too; after the stop the offer, then the same file again" '{ grep -q "^  The machine restarts (about a minute), and the Catalog with it.$" <<< "$out" && [ "$(grep -c "^Give the Podman machine 24 GB now? \[Y/n\]" <<< "$out")" -eq 2 ] && narrow "$out" && grep -q "Import the same file again? \[Y/n\]" <<< "$out" && [ "$(grep -c . "$ST/uploads")" -eq 2 ] && grep -q "All 2 services run and Catalog Web answers" <<< "$out"; } || { tail -n 40 <<< "$out" | sed "s/^/  | /"; false; }'
+  out="$(SHIM_OS=Darwin tty_run "bash $I import $D/snapshots/2026-09-28-full.tar.gz" "Enter: no)" '\n' "anyway?" 'y\n' "Enter: no)" 'PODMAN REBOOT\n' "again?" '\n')"
+  check "terminal, macOS import with the Catalog running: it restarts too; after the stop the offer, then the same file again" '{ [ "$(grep -c "^  every container in it stops; the Catalog is started again afterwards.$" <<< "$out")" -eq 2 ] && [ "$(grep -c "^Type PODMAN REBOOT to restart it with 24 GB (Enter: no): " <<< "$out")" -eq 2 ] && grep -q "^Type PODMAN REBOOT to restart it with 24 GB (Enter: no): PODMAN REBOOT$" <<< "$out" && grep -q "^ OK The Podman machine runs again.$" <<< "$out" && ! grep -q "DOCKER_HOST" <<< "$out" && narrow "$out" && grep -q "Import the same file again? \[Y/n\]" <<< "$out" && [ "$(grep -c . "$ST/uploads")" -eq 2 ] && grep -q "All 2 services run and Catalog Web answers" <<< "$out"; } || { tail -n 40 <<< "$out" | sed "s/^/  | /"; false; }'
 else
   echo "SKIP: script (util-linux) missing - no test of the questions in a terminal"
 fi

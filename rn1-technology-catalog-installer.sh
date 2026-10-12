@@ -169,7 +169,7 @@ MONGO_TAG="8.0"
 MINIO_TAG="RELEASE.2025-10-15T17-29-55Z"
 RABBITMQ_TAG="3.13-management-alpine"
 
-CATALOG_VERSION="25.4.4191.133"
+CATALOG_VERSION="26.3.4789.148"
 CATALOG_IMAGE_REPO="raynetgmbh/rayventory-catalog"
 CATALOG_WORKER_IMAGE_REPO="raynetgmbh/rayventory-catalog-worker"
 CHECK_FOR_UPDATES="true"
@@ -2683,12 +2683,13 @@ mac_restart_wait() {
   done
 }
 
-# mem_raise wizard|confirm -> on macOS after a yes: MEM_RECOMMENDED_GB GB for the Podman machine or the Colima VM,
-# when the Mac keeps 8 GB for itself (the VM restarts; a running Catalog is started again and waited for); with
-# Docker Desktop where it is set. 0: raised, 1: not raised, 2: stopped (0 in the wizard), 3: the VM or the
-# Catalog does not run cleanly again (yet)
+# mem_raise wizard|confirm -> on macOS, after PODMAN REBOOT or COLIMA REBOOT is typed: MEM_RECOMMENDED_GB GB for
+# the Podman machine or the Colima VM, when the Mac keeps 8 GB for itself (the VM is stopped and started again; a
+# running Catalog is started again and waited for); with Docker Desktop where it is set. 0: raised, 1: not
+# raised (Enter or any other answer), 2: stopped (0 or the end of input in the wizard), 3: the VM or the Catalog
+# does not run cleanly again (yet). Ctrl+C while the Podman machine starts: exit 130 (the menu says Interrupted).
 mem_raise() {
-  local how="$1" ram what q ans=0 rc=0 m="" running="" mb yaml
+  local how="$1" ram what word stop="" answer ans=0 rc=0 m="" running="" mb yaml log traps cut="" started="yes"
   if [ "$OS_KIND" != "Darwin" ]; then
     return 1
   fi
@@ -2715,16 +2716,34 @@ mem_raise() {
   if [ -f "$ENV_FILE" ] && [ -f "$COMPOSE_FILE" ] && detect_compose >/dev/null 2>&1 && [ -n "$(compose ps -q catalog-web 2>/dev/null)" ]; then
     running="yes"
   fi
-  echo "  macOS gives the $what memory only as it uses it."
-  echo "  The ${what##* } restarts (about a minute)${running:+, and the Catalog with it}."
-  q="Give the $what $MEM_RECOMMENDED_GB GB now?"
-  if [ "$how" = "wizard" ]; then
-    wiz_yes_no "$q" y || ans=$?
-  else
-    confirm "$q" y || ans=1
+  # the restart stops every container: only the typed word starts it, not a y out of habit
+  word="PODMAN REBOOT"
+  if [ "$ENGINE_KIND" = "colima" ]; then
+    word="COLIMA REBOOT"
   fi
-  if [ "$ans" -ne 0 ]; then
-    return "$ans"
+  if [ "$how" = "wizard" ]; then
+    stop=", 0 stops"
+  fi
+  echo "  The $what can get $MEM_RECOMMENDED_GB GB; macOS gives it memory only as it uses it."
+  warn "For that the $what is STOPPED and STARTED again (about a minute):"
+  echo "  every container in it stops${running:+; the Catalog is started again afterwards}."
+  if ! read -r -p "Type $word to restart it with $MEM_RECOMMENDED_GB GB (Enter: no$stop): " answer; then
+    echo
+    if [ "$how" = "wizard" ]; then
+      return 2
+    fi
+    answer=""
+  fi
+  if [ "$answer" != "$word" ]; then
+    if [ "$how" = "wizard" ] && [ "$answer" = "0" ]; then
+      return 2
+    fi
+    if [ -n "$answer" ]; then
+      info "Not $word: the $what keeps its memory."
+    else
+      info "The $what keeps its memory."
+    fi
+    return 1
   fi
   info "The $what restarts with $MEM_RECOMMENDED_GB GB:"
   if [ "$ENGINE_KIND" = "colima" ]; then
@@ -2744,6 +2763,7 @@ mem_raise() {
       else
         printf 'memory: %s\n' "$MEM_RECOMMENDED_GB" >> "$yaml"
       fi
+      info "The Colima VM starts again (about a minute)..."
       if ! brew services start colima >/dev/null; then
         err "Colima did not start again - start it: brew services start colima"
         return 3
@@ -2762,17 +2782,38 @@ mem_raise() {
     mac_docker_pin
   else
     m="$(mac_machine)"
+    log="$(mktemp)" || return 1
     mem_vm_cmds podman "$m"
     if ! podman machine stop "$m"; then
+      rm -f -- "$log"
       err "The Podman machine did not stop - its memory stays as it is."
       return 1
     fi
     podman machine set --memory "$((MEM_RECOMMENDED_GB * 1024))" "$m" || ans=1
-    if ! podman machine start "$m"; then
+    # its own output (the helper for the Docker API socket, DOCKER_HOST) only when it fails; into a file, not a
+    # pipe, which a helper it leaves running could hold open. Ctrl+C: the file goes, how to start it is shown.
+    info "The Podman machine starts again (about a minute)..."
+    traps="$(trap -p INT TERM)"
+    trap 'cut="yes"' INT TERM
+    podman machine start "$m" > "$log" 2>&1 || started="no"
+    trap - INT TERM
+    eval "$traps"
+    if [ -n "$cut" ]; then
+      rm -f -- "$log"
+      echo
+      warn "Stopped while the Podman machine started - if it does not run, start it:"
+      echo "      podman machine start $m"
+      exit 130
+    fi
+    if [ "$started" = "no" ]; then
+      cat -- "$log"
+      rm -f -- "$log"
       err "The Podman machine did not start again - start it:"
       echo "      podman machine start $m"
       return 3
     fi
+    rm -f -- "$log"
+    ok "The Podman machine runs again."
   fi
   if ! mem_wait_engine; then
     err "$ENGINE_NAME does not answer after the restart:"
@@ -2805,10 +2846,10 @@ mem_raise() {
   [ "$ans" -eq 0 ]
 }
 
-# mem_ask wizard|confirm [import] -> below MEM_RECOMMENDED_GB: says so (before an import also when the files do
-# not limit the cache of MongoDB yet), offers more memory for the Linux VM on macOS, then asks whether to go on
-# with less. 0: go on, 1: no, 2: stopped (0 or the end of input in the wizard). Outside the menu without a
-# terminal only the warning, then on.
+# mem_ask wizard|confirm [import|said] -> below MEM_RECOMMENDED_GB: says so (before an import also when the files
+# do not limit the cache of MongoDB yet; "said": the check just printed it), offers more memory for the Linux VM
+# on macOS, then asks whether to go on with less. 0: go on, 1: no, 2: stopped (0 or the end of input in the
+# wizard). Outside the menu without a terminal only the warning, then on.
 mem_ask() {
   local how="$1" mb rc=0
   if [ "$MEM_ASKED" = "yes" ]; then
@@ -2818,7 +2859,9 @@ mem_ask() {
   if [ -z "$mb" ] || ! mem_low "$mb"; then
     return 0
   fi
-  warn "This engine has $(mem_gb "$mb") GB of memory; at least $MEM_RECOMMENDED_GB GB is recommended."
+  if [ "${2:-}" != "said" ]; then
+    warn "This engine has $(mem_gb "$mb") GB of memory; at least $MEM_RECOMMENDED_GB GB is recommended."
+  fi
   if [ "${2:-}" = "import" ]; then
     mongo_cache_note
   fi
@@ -3307,6 +3350,9 @@ select_version() {
     set_setting CATALOG_VERSION "$selected"
     CATALOG_VERSION="$selected"
     ok "CATALOG_VERSION set to $selected - catalog-web and all workers will use this version."
+    if is_version "$installed" && version_gt "$selected" "$installed"; then
+      warn "Catalog $installed is installed: applying $selected here comes without the MongoDB backup, health check and rollback of U and option 21."
+    fi
   fi
 
   if [ "$mode" = "no-apply" ]; then
@@ -3375,6 +3421,9 @@ set_version_cli() {
   echo "Apply it with:"
   echo "  $0 generate"
   echo "  $0 up"
+  if is_version "$installed" && version_gt "$wanted" "$installed"; then
+    echo "Catalog $installed is installed: both ask first, as they come without a MongoDB backup - '$0 upgrade' upgrades it with one, a health check and rollback."
+  fi
 }
 
 ###############################################################################
@@ -4098,7 +4147,7 @@ reload_settings() {
 }
 
 do_updates() {
-  local choice
+  local choice before
   if ! command -v curl >/dev/null 2>&1; then
     err "curl is needed to check for updates ($(pkg_hint curl))."
     return 1
@@ -4110,7 +4159,16 @@ do_updates() {
     ui_keys "1-6|pick a version" "p|pin floating tags" "r|check again" "s|apply (generate + start)" "d|offline bundle" "0|back"
     ui_ask choice "Select:" || choice="0"
     case "$choice" in
-      1) run_action select_version no-apply; reload_settings; ui_pause_tty ;;
+      1)
+        before="$CATALOG_VERSION"
+        run_action select_version no-apply
+        reload_settings
+        # a Catalog picked here is the user's choice: s applies it without asking again (upgrade_guard)
+        if [ "$CATALOG_VERSION" != "$before" ]; then
+          RVC_RAISE_OK="$CATALOG_VERSION"
+        fi
+        ui_pause_tty
+        ;;
       [2-6]) run_action pick_component "${UPD_KEYS[$((choice - 2))]}"; reload_settings; ui_pause_tty ;;
       p|P) run_action pin_floating_tags; reload_settings; ui_pause_tty ;;
       r|R) collect_updates || return $? ;;
@@ -7992,6 +8050,85 @@ install_note() {
   fi
 }
 
+# catalog_raise settings|files -> "NEWER INSTALLED" when CATALOG_VERSION (settings) or the env file (files)
+# names a newer Catalog than the installed one (the files: than the one of its container); empty otherwise
+catalog_raise() {
+  local catalog inst
+  if [ "$1" = "files" ]; then
+    catalog="$(env_value CATALOG_IMAGE)"
+    catalog="${catalog##*:}"
+    inst="$(running_catalog)"
+  else
+    catalog="$CATALOG_VERSION"
+    inst="$(installed_catalog)"
+  fi
+  if is_version "$catalog" && is_version "$inst" && version_gt "$catalog" "$inst"; then
+    printf '%s %s' "$catalog" "$inst"
+  fi
+}
+
+# What the menu says when the settings (or the files) name a newer Catalog than the installed one - a new
+# download of the installer has the newest stable Catalog as its default (empty: nothing). Only U and
+# option 21 upgrade with a MongoDB backup, a health check and the way back; option 23 keeps the installed one.
+raise_note() {
+  local v what="files"
+  # the files first: option 6 would start them
+  v="$(catalog_raise files)"
+  if [ -z "$v" ]; then
+    what="settings"
+    v="$(catalog_raise settings)"
+  fi
+  if [ -z "$v" ]; then
+    return 0
+  fi
+  if [ "$INTERACTIVE" = "true" ]; then
+    printf 'The %s say Catalog %s, %s is installed - U or option 21 upgrades it (MongoDB backup, health check, rollback), option 23 keeps %s' "$what" "${v% *}" "${v#* }" "${v#* }"
+  else
+    printf "The %s say Catalog %s, %s is installed - '%s upgrade' upgrades it (MongoDB backup, health check, rollback), '%s adopt .' keeps %s" "$what" "${v% *}" "${v#* }" "$0" "$0" "${v#* }"
+  fi
+}
+
+# Raising the installed Catalog is the upgrade's (U, option 21, 'upgrade'): a MongoDB backup first, then a
+# health check and the way back - the new version migrates the database, which cannot go back. A step that
+# would write (settings) or start (files) a newer Catalog than the installed one says so and asks first; no
+# answer, or no: nothing is written or started. A job asks nothing: the step that started it asked, and
+# settings it was not allowed are refused. RVC_RAISE_OK: the Catalog that may be written and started (the
+# upgrade's target, a version picked in option 8, or one confirmed here - exported for the jobs started
+# afterwards). upgrade_guard settings|files
+upgrade_guard() {
+  local v catalog inst
+  v="$(catalog_raise "$1")"
+  if [ -z "$v" ]; then
+    return 0
+  fi
+  catalog="${v% *}"
+  inst="${v#* }"
+  if [ "$catalog" = "${RVC_RAISE_OK:-}" ] || { [ "$1" = "files" ] && [ -n "$JOB_DIR" ]; }; then
+    return 0
+  fi
+  warn "Catalog $catalog would replace the installed $inst without a MongoDB backup, health check or rollback - it migrates the database, which cannot go back."
+  if [ "$1" = "files" ]; then
+    echo "  $ENV_FILE names Catalog $catalog, the catalog-web container has $inst."
+  else
+    echo "  The settings of $SCRIPT_NAME say Catalog $catalog (a new download of the installer has the newest one)."
+  fi
+  if [ "$INTERACTIVE" = "true" ]; then
+    echo "  U or option 21 upgrades it with them; option 23 keeps Catalog $inst."
+  else
+    echo "  '$0 upgrade' upgrades it with them; '$0 adopt .' keeps Catalog $inst."
+  fi
+  if [ -z "$JOB_DIR" ] && confirm "Upgrade to Catalog $catalog without a backup anyway?" n; then
+    export RVC_RAISE_OK="$catalog"
+    return 0
+  fi
+  if [ "$1" = "files" ]; then
+    echo "  Nothing was started."
+  else
+    echo "  Nothing was written."
+  fi
+  return 1
+}
+
 # install_differs NAME SETTING VALUE -> true when the setting NAME (SETTING) would change the VALUE the
 # installation has. An empty CATALOG_HOSTNAME is automatic: the next generate keeps the host name .env has,
 # so a valid one there is no difference (only a backup with another name than .env is - the license is
@@ -8010,7 +8147,7 @@ install_differs() {
 }
 
 # The values of the installation in this folder (its env file, see install_env) that the settings would
-# change, the versions aside (newer ones are an update, older ones are install_note's): "The settings
+# change, the versions aside (a newer Catalog is raise_note's, older versions install_note's): "The settings
 # differ from the installation in CATALOG_WEB_PORT, TZ" (empty: none). A new download of the installer
 # with the installed Catalog version has them, or settings changed after the files were written.
 install_diff_note() {
@@ -8521,6 +8658,7 @@ offer_patch_updates() {
   sibling_guard || return 1
   # the patch updates write all settings
   downgrade_guard settings || return 1
+  upgrade_guard settings || return 1
   run_job "Patch updates ($count component(s))" -- patch_apply "${specs[@]}"
 }
 
@@ -8743,6 +8881,8 @@ upgrade_run() {
   UPG_STAGE="pull"
   set_setting CATALOG_VERSION "$target"
   CATALOG_VERSION="$target"
+  # the upgrade itself raises the installed Catalog (upgrade_guard)
+  RVC_RAISE_OK="$target"
   do_generate keep no-next
   job_step "Pulling the images of $target"
   info "Pulling the images of $target"
@@ -9216,8 +9356,9 @@ adopt_installation() {
         info "Cancelled."
       fi
       return
-    elif [ "$this_folder" = "true" ] || [ -n "$(install_diff_note)" ]; then
-      # the installation here has other values than the settings; else installations in other folders
+    elif [ "$this_folder" = "true" ] || [ -n "$(raise_note)" ] || [ -n "$(install_diff_note)" ]; then
+      # the installation here has other values than the settings (or an older Catalog); else installations in
+      # other folders
       install_takeover "$mode"
       return
     fi
@@ -9694,12 +9835,13 @@ ui_hold_line() {
 # The live panel of one job: its progress and the last lines of its log, wrapped at the width of the panel,
 # as many as the terminal has room for. A job that has ended shows every line from its first step on (a
 # line that starts with a time, e.g. of an import), however long: nothing draws over it any more.
+# ui_job_panel ID STATE PCT TEXT [WIDTH] (default: the width of the terminal)
 ui_job_panel() {
-  local id="$1" state="$2" pct="$3" text="$4" width badge n w i j first line cut word room
+  local id="$1" state="$2" pct="$3" text="$4" width="${5:-}" badge n w i j first line cut word room
   local -a lines=() part=() rev=() shown=()
-  width="$(ui_cols)"
-  if [ "$width" -gt 100 ]; then
-    width=100
+  # the whole width of the terminal: long log lines (compose ps, paths) wrap less
+  if [ -z "$width" ]; then
+    width="$(ui_cols)"
   fi
   UI_PANEL_W="$width"
   # the rest of the panel takes 5 lines, the cursor one below it
@@ -10202,7 +10344,7 @@ job_summary() {
 
 # Live view of a job. q: back to the menu (the job continues), hold X: cancel.
 job_follow() {
-  local id="$1" dir="$JOBS_DIR/$1" state pct text detail key shown=0 n lines=0 last_draw=0 now
+  local id="$1" dir="$JOBS_DIR/$1" state pct text detail key shown=0 n lines=0 last_draw=0 now cols
   UI_HOLD_START=""
   UI_HOLD_PCT=0
   if [ ! -d "$dir" ]; then
@@ -10237,10 +10379,14 @@ job_follow() {
     now="$(ui_now_ms)"
     if [ "$state" != "running" ] || { [ "$UI_HOLD_PCT" -eq 0 ] && [ $((now - last_draw)) -ge 500 ]; }; then
       IFS='|' read -r pct text detail < "$dir/progress" 2>/dev/null || { pct=""; text=""; detail=""; }
-      if [ "$lines" -gt 0 ]; then
+      cols="$(ui_cols)"
+      if [ "$lines" -gt 0 ] && [ "$cols" != "$UI_PANEL_W" ]; then
+        # another width: a narrower terminal wraps the lines of the panel again, $lines up is no longer its top
+        printf '\033[H\033[2J'
+      elif [ "$lines" -gt 0 ]; then
         printf '\033[%dA\033[J' "$lines"
       fi
-      ui_job_panel "$id" "$state" "$pct" "$text${detail:+ $UI_SEP $detail}"
+      ui_job_panel "$id" "$state" "$pct" "$text${detail:+ $UI_SEP $detail}" "$cols"
       lines="$UI_LINES"
       last_draw="$now"
     elif [ "$UI_HOLD_PCT" -gt 0 ] && [ "$lines" -gt 0 ]; then
@@ -12271,7 +12417,7 @@ do_generate() {
     err "Fix the settings at the top of $SCRIPT_NAME first (menu option 1 opens them)."
     return 1
   fi
-  if ! downgrade_guard settings; then
+  if ! downgrade_guard settings || ! upgrade_guard settings; then
     GENERATE_CANCELLED="true"
     return 1
   fi
@@ -12635,6 +12781,7 @@ do_up() {
   require_engine || return 1
   engine_guard || return 1
   downgrade_guard files || return 1
+  upgrade_guard files || return 1
   net_ca_bundle_ensure
   if mongo_kernel_problem; then
     warn "MongoDB $(setting MONGO_TAG) refuses to start on kernel $(engine_kernel) without a workaround (SERVER-121912)."
@@ -12648,6 +12795,8 @@ do_up() {
     note="$(install_note)"
     if [ -n "$note" ]; then
       warn "$note: the settings are older than the installation - take its values over ($(hint 23 "adopt .")), do not regenerate."
+    elif note="$(raise_note)" && [ -n "$note" ]; then
+      warn "$note."
     elif note="$(install_diff_note)" && [ -n "$note" ]; then
       warn "$note - $(hint 23 "adopt .") takes the installation's values over, $(hint 2 generate) writes the settings."
     else
@@ -12717,6 +12866,8 @@ do_status() {
   note="$(install_note)"
   if [ -n "$note" ]; then
     warn "$note - $(hint 23 "adopt .") takes the installation's values over."
+  elif note="$(raise_note)" && [ -n "$note" ]; then
+    warn "$note."
   elif note="$(install_diff_note)" && [ -n "$note" ]; then
     warn "$note - $(hint 23 "adopt .") takes the installation's values over, $(hint 2 generate) writes the settings."
   fi
@@ -13089,6 +13240,8 @@ do_check() {
   v="$(install_note)"
   if [ -n "$v" ]; then
     warn "$v - $(hint 23 "adopt .") takes the installation's values over (older settings are not written into the files)."
+  elif v="$(raise_note)" && [ -n "$v" ]; then
+    warn "$v."
   elif v="$(install_diff_note)" && [ -n "$v" ]; then
     warn "$v - $(hint 23 "adopt .") takes the installation's values over, $(hint 2 generate) writes the settings."
   fi
@@ -18150,7 +18303,7 @@ stack_state() {
 
 # show_menu [LINES] -> the plain menu; LINES: what the caller prints below it (notices, prompt)
 show_menu() {
-  local found tz_note sib state here inote dnote below="${1:-0}" cols height item nh head version line
+  local found tz_note sib state here inote rnote="" dnote below="${1:-0}" cols height item nh head version line
   local -a notes=() items=() heads=()
   reload_settings
   menu_scan
@@ -18165,11 +18318,16 @@ show_menu() {
   inote="$(install_note)"
   if [ -n "$inote" ]; then
     notes+=("${C_YLW}$inote - option 23 takes the installation's values over.${C_RST}")
+  else
+    rnote="$(raise_note)"
+    if [ -n "$rnote" ]; then
+      notes+=("${C_YLW}$rnote.${C_RST}")
+    fi
   fi
   sib="$(conflicting_sibling)"
   if [ -n "$sib" ]; then
     notes+=("${C_YLW}$(basename -- "$sib") in this folder has other settings - option 23 takes them over (or rename it if it is no longer used).${C_RST}")
-  elif [ -n "$inote" ]; then
+  elif [ -n "$inote$rnote" ]; then
     :
   elif mongo_kernel_problem; then
     notes+=("${C_YLW}MongoDB needs the kernel workaround (SERVER-121912), and the files lack it - option 2 (or I - repair) writes them again.${C_RST}")
@@ -18268,11 +18426,14 @@ show_menu() {
 menu_up() {
   local note
   downgrade_guard files || return 1
+  upgrade_guard files || return 1
   if [ -f "$ENV_FILE" ] && [ -f "$COMPOSE_FILE" ] && settings_stale; then
     warn "$ENV_FILE / $COMPOSE_FILE do not match the settings at the top of $SCRIPT_NAME."
     note="$(install_note)"
     if [ -n "$note" ]; then
       warn "$note - option 23 takes the installation's values over."
+    elif note="$(raise_note)" && [ -n "$note" ]; then
+      warn "$note."
     elif note="$(install_diff_note)" && [ -n "$note" ]; then
       warn "$note - option 23 takes the installation's values over, option 2 writes the settings."
     fi
@@ -18286,8 +18447,10 @@ menu_up() {
 
 menu_full_setup() {
   engine_guard || return 1
-  # a start that would lower the installation is refused before the memory question
+  # a start that would lower the installation is refused before the memory question, one that would
+  # upgrade it without a backup asks first
   downgrade_guard settings || return 1
+  upgrade_guard settings || return 1
   if ! mem_ask confirm; then
     info "Cancelled."
     return 0
@@ -19267,7 +19430,7 @@ install_wizard() {
       wiz_yes_no "Some checks failed (see above). Continue anyway?" n || ans=$?
     fi
     if [ "$ans" -eq 0 ]; then
-      mem_ask wizard || ans=$?
+      mem_ask wizard said || ans=$?
     fi
     if [ "$ans" -ne 0 ]; then
       wiz_stop "I"
@@ -19484,7 +19647,7 @@ install_new() {
     wiz_yes_no "Some checks failed (see above). Continue anyway?" n || ans=$?
   fi
   if [ "$ans" -eq 0 ]; then
-    mem_ask wizard || ans=$?
+    mem_ask wizard said || ans=$?
   fi
   if [ "$ans" -ne 0 ]; then
     wiz_stop "I"
@@ -20812,7 +20975,7 @@ tui_cell() {
 tui_draw() {
   reload_settings
   menu_scan
-  local tz_note sib cols="$1" rows="${2:-40}" line col key kind label desc what i n col_w found head2 head3 version state here need cards keys cur="" inote dnote logo room next ni sni
+  local tz_note sib cols="$1" rows="${2:-40}" line col key kind label desc what i n col_w found head2 head3 version state here need cards keys cur="" inote rnote="" dnote logo room next ni sni
   local -a c1=() c2=() c3=()
   local notes=() nh
   state="$MENU_STACK"
@@ -20891,11 +21054,16 @@ tui_draw() {
   inote="$(install_note)"
   if [ -n "$inote" ]; then
     notes+=("$(ui_fit $((cols - 4)) "$C_YLW$UI_ARROW $inote - option 23 takes the installation's values over$C_RST" "$C_YLW$UI_ARROW $inote - option 23 takes them over$C_RST")")
+  else
+    rnote="$(raise_note)"
+    if [ -n "$rnote" ]; then
+      notes+=("$(ui_fit $((cols - 4)) "$C_YLW$UI_ARROW $rnote$C_RST" "$C_YLW$UI_ARROW ${rnote%% - *} - U upgrades it with a backup, 23 keeps it$C_RST" "$C_YLW$UI_ARROW ${rnote%% - *} - U upgrades it$C_RST")")
+    fi
   fi
   sib="$(conflicting_sibling)"
   if [ -n "$sib" ]; then
     notes+=("$C_YLW$UI_ARROW $(basename -- "$sib") in this folder has other settings - option 23 takes them over$C_RST")
-  elif [ -n "$inote" ]; then
+  elif [ -n "$inote$rnote" ]; then
     :
   elif mongo_kernel_problem; then
     notes+=("$C_YLW$UI_ARROW MongoDB needs the kernel workaround, the files lack it - option 2 or I (repair) adds it$C_RST")
@@ -21349,6 +21517,8 @@ main() {
   cd -- "$WORK_DIR"
   case "$cmd" in
     check-settings|__cron_convert|__settings_groups|__server_hostname) ;;
+    # the release check of CI reads Docker Hub only: the proxy of the settings, no container engine
+    __recommended_catalog) proxy_load ;;
     *)
       # the proxy of the settings for every download of this run (and the programs it starts)
       proxy_load
@@ -21382,6 +21552,7 @@ main() {
     setup|install)
       engine_guard
       downgrade_guard settings
+      upgrade_guard settings
       if ! mem_ask confirm; then
         info "Cancelled."
         return 0
@@ -21415,6 +21586,13 @@ main() {
     __engine_choose) engine_choose "${1:-}" ;;
     __wiz_engine_pick) wiz_engine_pick "$(engine_choices)" "${1:-}"; echo ;;
     __choose_versions) choose_versions ;;
+    # the release check (tests/check_release_default.sh): the Catalog the versions screen of a new installation
+    # selects, the one behind the stable tag ("-" without one), and whether CATALOG_VERSION exists for the
+    # Catalog and its worker ("listed" or "missing"); 1 when Docker Hub cannot be read
+    __recommended_catalog)
+      fetch_hub_versions || return 1
+      printf '%s %s %s\n' "$(recommended_catalog)" "${HUB_STABLE:--}" "$(if grep -qxF -- "$CATALOG_VERSION" <<< "$HUB_VERSIONS"; then echo listed; else echo missing; fi)"
+      ;;
     __domain_normalize) domain_normalize "${1:-}"; echo ;;
     __server_hostname) server_hostname; echo ;;
     __domain_checks) domain_checks "${1:-}"; echo "DOMAIN_DNS=$DOMAIN_DNS" ;;
