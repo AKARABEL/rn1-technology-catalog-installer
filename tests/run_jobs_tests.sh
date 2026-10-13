@@ -137,6 +137,8 @@ if command -v script >/dev/null 2>&1; then
     | TERM=xterm LANG=C.UTF-8 script -qfec "stty cols 120 rows 40; bash $D/rn1-technology-catalog-installer.sh menu" /dev/null 2>&1 | sed 's/\x1b[[(][0-9;?]*[A-Za-z]//g; s/\x1b[78]//g')"
   wait "$mp"
   check "menu shows the Current processes box with the job" 'grep -q "Current processes" <<< "$out" && grep -q "#3 Snapshot download" <<< "$out"'
+  # (the menu only sends the cancel; the job writes its state after it has cleaned up, which takes longer on a busy machine)
+  wait_for '[ "$(state 3)" = cancelled ]' 50
   check "holding X cancelled the job" '[ "$(state 3)" = cancelled ] && [ ! -e "$PART" ]'
   check "cancel animation shown" 'grep -q "keep holding X" <<< "$out"'
 else
