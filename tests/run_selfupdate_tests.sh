@@ -7,6 +7,8 @@ rm -rf "$T"; mkdir -p "$T/bin" "$T/srv" "$T/inst"
 sed 's/^CONTAINER_ENGINE=""$/CONTAINER_ENGINE="podman"/' "$1" > "${T%/*}/podman-installer.sh"; NEW="${T%/*}/podman-installer.sh"
 PASS=0; FAIL=0
 check() { if eval "$2"; then PASS=$((PASS+1)); echo "PASS: $1"; else FAIL=$((FAIL+1)); echo "FAIL: $1"; fi; }
+# cksum of an installer without its SETTINGS_PUBLISHED_SUM line (the installer blanks it once it wrote a setting or found the settings changed)
+body() { grep -v '^SETTINGS_PUBLISHED_SUM=' "$1" | cksum; }
 # the internet check (menu start, new installation, option 16, engine setup) has its own suite (run_network_tests)
 export RN1_NET_CHECK=off
 export SRV="$T/srv"
@@ -182,14 +184,14 @@ chmod +x "$F/bin/mktemp"
 for how in cli menu; do
   cp "$NEW" "$F/rn1-technology-catalog-installer.sh"
   sed -i 's/^CHECK_FOR_UPDATES=.*/CHECK_FOR_UPDATES="false"/; 0,/^CATALOG_WEB_PORT=/s/^CATALOG_WEB_PORT=.*/CATALOG_WEB_PORT="9090"/' "$F/rn1-technology-catalog-installer.sh"
-  before="$(cksum < "$F/rn1-technology-catalog-installer.sh")"
+  before="$(body "$F/rn1-technology-catalog-installer.sh")"
   ub="$(cat "$SRV/urls" 2>/dev/null | wc -l)"
   if [ "$how" = cli ]; then
     out="$(PATH="$F/bin:$PATH" REAL_MKTEMP="$REAL_MKTEMP" URLS_BEFORE="$ub" bash "$F/rn1-technology-catalog-installer.sh" self-update </dev/null 2>&1)"; rc=$?
-    check "full /tmp (command line): not updated, settings untouched" '[ "$rc" -ne 0 ] && grep -q "Cannot carry the setting .* over (disk full?) - not updated." <<< "$out" && ! grep -q "Installer updated" <<< "$out" && [ "$(cksum < "$F/rn1-technology-catalog-installer.sh")" = "$before" ]'
+    check "full /tmp (command line): not updated, settings untouched" '[ "$rc" -ne 0 ] && grep -q "Cannot carry the setting .* over (disk full?) - not updated." <<< "$out" && ! grep -q "Installer updated" <<< "$out" && [ "$(body "$F/rn1-technology-catalog-installer.sh")" = "$before" ]'
   else
     out="$(printf '22\n\n\n0\n' | PATH="$F/bin:$PATH" REAL_MKTEMP="$REAL_MKTEMP" URLS_BEFORE="$ub" bash "$F/rn1-technology-catalog-installer.sh" menu 2>&1)"
-    check "full /tmp (option 22): not updated, settings untouched" 'grep -q "not updated." <<< "$out" && ! grep -q "Installer updated" <<< "$out" && [ "$(cksum < "$F/rn1-technology-catalog-installer.sh")" = "$before" ]'
+    check "full /tmp (option 22): not updated, settings untouched" 'grep -q "not updated." <<< "$out" && ! grep -q "Installer updated" <<< "$out" && [ "$(body "$F/rn1-technology-catalog-installer.sh")" = "$before" ]'
   fi
 done
 
@@ -203,6 +205,45 @@ mkdir -p "$J/.jobs/1"; echo "Upgrade to Catalog 26.3.4789.148" > "$J/.jobs/1/tit
 out="$(bash "$J/rn1-technology-catalog-installer.sh" self-update </dev/null 2>&1)"; rc=$?
 kill "$sp" 2>/dev/null; wait "$sp" 2>/dev/null
 check "job running: no update, nothing downloaded, installer untouched" '[ "$rc" -ne 0 ] && grep -q "Jobs are running (J) - update the installer when they are done" <<< "$out" && [ ! -s "$SRV/urls" ] && [ "$(cksum < "$J/rn1-technology-catalog-installer.sh")" = "$before" ] && ! ls "$J"/rn1-technology-catalog-installer.sh.bak-* >/dev/null 2>&1'
+
+# 13. The update brings the sum of the published settings of the new version (SETTINGS_PUBLISHED_SUM): a new
+#     download whose carried settings are the defaults of the new version too is a new download afterwards (it
+#     takes the values of an installation over at its start); edited settings, or a default of the new version
+#     the carried value differs from, are not. Without an installation nothing is taken over.
+publish() { sed -i "s/^SETTINGS_PUBLISHED_SUM=.*/SETTINGS_PUBLISHED_SUM=\"$(bash "$1" __settings_hash)\"/" "$1"; }
+pristine() { [ "$(bash "$1" __settings_hash)" = "$(sed -n 's/^SETTINGS_PUBLISHED_SUM="\(.*\)"$/\1/p' "$1")" ]; }
+OLDP="$T/oldpub.sh"; sed 's/^CHECK_FOR_UPDATES=.*/CHECK_FOR_UPDATES="false"/' "$NEW" > "$OLDP"; publish "$OLDP"
+sed -e 's/^HEALTH_TIMEOUT="600"$/HEALTH_TIMEOUT="600"\nNEW_SETTING="default-of-new-version"/' \
+    -e 's/Raynet One Technology Catalog - Installation Portal\${C_RST}   (/Raynet One Technology Catalog - Installation Portal${C_RST} v2   (/' "$OLDP" > "$T/pub2.sh"
+publish "$T/pub2.sh"
+sed 's/^HEALTH_TIMEOUT="600"$/HEALTH_TIMEOUT="900"/' "$T/pub2.sh" > "$T/pub900.sh"; publish "$T/pub900.sh"
+P="$T/pristine"; mkdir -p "$P"; cp "$OLDP" "$P/rn1-technology-catalog-installer.sh"; cp "$T/pub2.sh" "$SRV/same.sh"
+out="$(SHIM_SERVE=same bash "$P/rn1-technology-catalog-installer.sh" self-update </dev/null 2>&1)"; rc=$?
+check "a new download updated to a version with the same defaults: a new download of that version" '[ "$rc" -eq 0 ] && pristine "$OLDP" && cmp -s "$P/rn1-technology-catalog-installer.sh" "$T/pub2.sh" && pristine "$P/rn1-technology-catalog-installer.sh" && ! grep -q "new download" <<< "$out"'
+cp "$OLDP" "$P/rn1-technology-catalog-installer.sh"; sed -i '0,/^CATALOG_WEB_PORT=/s/^CATALOG_WEB_PORT=.*/CATALOG_WEB_PORT="9090"/' "$P/rn1-technology-catalog-installer.sh"
+out="$(SHIM_SERVE=same bash "$P/rn1-technology-catalog-installer.sh" self-update </dev/null 2>&1)"; rc=$?
+check "edited settings updated: kept, not a new download" '[ "$rc" -eq 0 ] && grep -qxF "CATALOG_WEB_PORT=\"9090\"" "$P/rn1-technology-catalog-installer.sh" && grep -q "Installation Portal\${C_RST} v2" "$P/rn1-technology-catalog-installer.sh" && ! pristine "$P/rn1-technology-catalog-installer.sh"'
+cp "$OLDP" "$P/rn1-technology-catalog-installer.sh"; cp "$T/pub900.sh" "$SRV/same.sh"
+out="$(SHIM_SERVE=same bash "$P/rn1-technology-catalog-installer.sh" self-update </dev/null 2>&1)"; rc=$?
+check "a new download updated to a version with another default: the carried value kept, not a new download" '[ "$rc" -eq 0 ] && grep -qxF "HEALTH_TIMEOUT=\"600\"" "$P/rn1-technology-catalog-installer.sh" && ! pristine "$P/rn1-technology-catalog-installer.sh"'
+
+# 14. One way: a file that is not a new download (its line blank after a write, a start that found it changed) gets
+#     the new version without the line, and a file that only differs in that line is up to date.
+sumval() { sed -n 's/^SETTINGS_PUBLISHED_SUM=//p' "$1"; }
+rm -f "$P"/rn1-technology-catalog-installer.sh.bak-*
+cp "$OLDP" "$P/rn1-technology-catalog-installer.sh"; cp "$OLDP" "$SRV/same.sh"
+out="$(SHIM_SERVE=same bash "$P/rn1-technology-catalog-installer.sh" self-update </dev/null 2>&1)"; rc=$?
+check "a new download, the same version: up to date, untouched" '[ "$rc" -eq 0 ] && grep -q "The installer is up to date." <<< "$out" && cmp -s "$P/rn1-technology-catalog-installer.sh" "$OLDP" && ! ls "$P"/rn1-technology-catalog-installer.sh.bak-* >/dev/null 2>&1'
+sed -i 's/^SETTINGS_PUBLISHED_SUM=.*/SETTINGS_PUBLISHED_SUM=""/' "$P/rn1-technology-catalog-installer.sh"; before="$(cksum < "$P/rn1-technology-catalog-installer.sh")"
+out="$(SHIM_SERVE=same bash "$P/rn1-technology-catalog-installer.sh" self-update </dev/null 2>&1)"; rc=$?
+check "a file whose sum is gone, the same version: up to date (the line is no difference), untouched" '[ "$rc" -eq 0 ] && grep -q "The installer is up to date." <<< "$out" && [ "$(cksum < "$P/rn1-technology-catalog-installer.sh")" = "$before" ] && ! ls "$P"/rn1-technology-catalog-installer.sh.bak-* >/dev/null 2>&1'
+cp "$T/pub2.sh" "$SRV/same.sh"
+out="$(SHIM_SERVE=same bash "$P/rn1-technology-catalog-installer.sh" self-update </dev/null 2>&1)"; rc=$?
+check "a file whose sum is gone, updated to a version with the same defaults: the new version without a sum - not a new download" '[ "$rc" -eq 0 ] && grep -q "Installer updated" <<< "$out" && [ "$(sumval "$P/rn1-technology-catalog-installer.sh")" = "\"\"" ] && grep -q "Installation Portal\${C_RST} v2" "$P/rn1-technology-catalog-installer.sh" && ! pristine "$P/rn1-technology-catalog-installer.sh"'
+cp "$OLDP" "$P/rn1-technology-catalog-installer.sh"; sed -i '0,/^CATALOG_WEB_PORT=/s/^CATALOG_WEB_PORT=.*/CATALOG_WEB_PORT="9090"/' "$P/rn1-technology-catalog-installer.sh"
+cp "$OLDP" "$SRV/same.sh"; before="$(cksum < "$P/rn1-technology-catalog-installer.sh")"
+out="$(SHIM_SERVE=same bash "$P/rn1-technology-catalog-installer.sh" self-update </dev/null 2>&1)"; rc=$?
+check "a hand-edited file (its sum still there), the same version: up to date, untouched" '[ "$rc" -eq 0 ] && grep -q "The installer is up to date." <<< "$out" && [ "$(cksum < "$P/rn1-technology-catalog-installer.sh")" = "$before" ]'
 
 echo "== $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]

@@ -15,9 +15,11 @@ jobs:
         with:
           persist-credentials: false
       - name: Syntax
-        run: bash -n rn1-technology-catalog-installer.sh && dash -c 'exit 0'
+        run: bash -n rn1-technology-catalog-installer.sh && bash -n install.sh && dash -c 'exit 0'
       - name: catalog.sh is an identical copy (update address of older installations)
         run: cmp catalog.sh rn1-technology-catalog-installer.sh && test -x catalog.sh && test -x rn1-technology-catalog-installer.sh
+      - name: SETTINGS_PUBLISHED_SUM is the cksum of the published settings section (a new download knows its defaults)
+        run: bash tests/check_settings_hash.sh "$PWD/rn1-technology-catalog-installer.sh"
       - name: Generator, menu and Catalog versions
         run: bash tests/run_tests.sh "$PWD/rn1-technology-catalog-installer.sh"
       - name: Updates and offline bundle
@@ -50,6 +52,9 @@ jobs:
         run: bash tests/run_memory_tests.sh "$PWD/rn1-technology-catalog-installer.sh"
       - name: Internet access, the proxy questions and the proxy of the package managers
         run: bash tests/run_network_tests.sh "$PWD/rn1-technology-catalog-installer.sh"
+      # install.sh of this checkout: the one-liner of the README reaches main only, not this branch
+      - name: One-line install (install.sh with a fake curl and wget, curl | bash in a terminal)
+        run: bash tests/run_install_tests.sh "$PWD/rn1-technology-catalog-installer.sh"
       # last, and also after a failed suite: a new stable Catalog on Docker Hub does not hide the test results
       - name: The default Catalog is the newest stable one on Docker Hub (a warning when Docker Hub cannot be read)
         if: ${{ !cancelled() }}
@@ -326,6 +331,8 @@ jobs:
           else
             grep -q "Homebrew installs what the installer needs here:" <<< "$out" && grep -q "Nothing was installed" <<< "$out"
           fi
+      - name: The one-line install in the bash 3.2 of macOS (install.sh with a fake curl and wget)
+        run: /bin/bash -n install.sh && /bin/bash tests/run_install_tests.sh "$PWD/rn1-technology-catalog-installer.sh"
       - name: Homebrew bash and the GNU tools
         run: |
           brew install bash coreutils gnu-sed grep findutils

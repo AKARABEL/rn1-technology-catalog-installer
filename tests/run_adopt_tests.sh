@@ -87,7 +87,8 @@ case "${1:-}" in
     done ;;
   volume)
     case "${2:-} ${3:-} ${4:-}" in
-      "ls -q --filter") ;;
+      # SHIM_VOLUMES: names of volumes with the label of the project before the first _ (the data of a stack)
+      "ls -q --filter") a="$*"; p="${a##*=}"; printf '%s' "${SHIM_VOLUMES:-}" | grep "^${p}_" || true ;;
       inspect\ *) exit 1 ;;
       *) unhandled ;;
     esac ;;
@@ -297,6 +298,36 @@ check "comments and quotes: values as bash reads them" '[ "$rc" -eq 0 ] && grep 
 X="$T/stray"; installer "$X" "$N"; (cd "$X" && bash "$N" generate </dev/null >/dev/null 2>&1)
 out="$(printf '23\nn\n0\n' | bash "$X/$N" menu 2>&1)"
 check "a .env here without an installation: option 23 lists the one in the other folder" '[ -f "$X/.env" ] && grep -q "Existing Catalog installations:" <<< "$out" && grep -q "$OLD .*project root" <<< "$out" && grep -q "Found in $OLD:" <<< "$out" && grep -q "Cancelled." <<< "$out" && ! grep -q "nothing to take over here" <<< "$out"'
+
+# 17. A new download (its settings as published; PUB: a release of these tests) takes the values of the
+#     installation in its folder over by itself - unless another installer here manages it: only an installer
+#     that is the only one here, or whose siblings are new downloads too, takes over. adopt keeps its logic.
+publish() { sed -i "s/^SETTINGS_PUBLISHED_SUM=.*/SETTINGS_PUBLISHED_SUM=\"$(bash "$1" __settings_hash)\"/" "$1"; }
+PUB="$T/published.sh"; sed 's/^CHECK_FOR_UPDATES=.*/CHECK_FOR_UPDATES="false"/' "$NEW" > "$PUB"; publish "$PUB"
+P="$T/pubsib"; installer "$P" catalog.sh "$PORT9393"; gen "$P" catalog.sh; cp "$PUB" "$P/$N"
+envP="$(cksum < "$P/.env")"
+out="$(menu "$P" '0\n')"
+check "new download next to the edited installer of the installation: nothing taken over, that one named" '! grep -q "new download" <<< "$out" && grep -q "catalog.sh in this folder has other settings - option 23 takes them over" <<< "$out" && cmp -s "$P/$N" "$PUB" && [ "$(cksum < "$P/.env")" = "$envP" ]'
+out="$(SHIM_NO_LABELS=1 bash "$P/$N" status </dev/null 2>&1)"
+check "new download next to the edited installer: 'status' takes nothing over either" '! grep -q "new download" <<< "$out" && cmp -s "$P/$N" "$PUB"'
+B="$T/twopub"; installer "$B" catalog.sh "$PORT9393"; gen "$B" catalog.sh; cp "$PUB" "$B/catalog.sh"; cp "$PUB" "$B/$N"
+envB="$(cksum < "$B/.env")"
+out="$(SHIM_VOLUMES="twopub_db_data" menu "$B" '0\n')"
+check "two new downloads: the one started first takes the installation's values over" 'grep -q "This installer is a new download with its default settings" <<< "$out" && grep -q "^   CATALOG_WEB_PORT  *8080 -> 9393$" <<< "$out" && grep -qxF "CATALOG_WEB_PORT=\"9393\"" "$B/$N" && cmp -s "$B/catalog.sh" "$PUB" && [ "$(cksum < "$B/.env")" = "$envB" ]'
+out="$(printf '0\n' | SHIM_NO_LABELS=1 bash "$B/catalog.sh" menu 2>&1)"
+check "two new downloads: the other one does not fight it - it names the installer that took over" '! grep -q "new download" <<< "$out" && grep -q "$N in this folder has other settings - option 23 takes them over" <<< "$out" && cmp -s "$B/catalog.sh" "$PUB"'
+# a sibling that is a new download of ANOTHER release (its own sum fits its own settings, not ours): it counts as a
+# new download - each sibling is checked against its own sum
+PUBX="$T/publishedx.sh"; sed 's/^HEALTH_TIMEOUT=.*/HEALTH_TIMEOUT="900"/' "$PUB" > "$PUBX"; publish "$PUBX"
+X="$T/otherrel"; installer "$X" catalog.sh "$PORT9393"; gen "$X" catalog.sh; cp "$PUBX" "$X/catalog.sh"; cp "$PUB" "$X/$N"
+envX="$(cksum < "$X/.env")"
+out="$(SHIM_VOLUMES="otherrel_db_data" menu "$X" '0\n')"
+check "a sibling that is a new download of another release: the installer started first takes the values over" 'grep -q "This installer is a new download with its default settings" <<< "$out" && grep -q "^   CATALOG_WEB_PORT  *8080 -> 9393$" <<< "$out" && grep -qxF "CATALOG_WEB_PORT=\"9393\"" "$X/$N" && cmp -s "$X/catalog.sh" "$PUBX" && [ "$(cksum < "$X/.env")" = "$envX" ]'
+A="$T/pubadopt"; mkdir -p "$A"; cp "$PUB" "$A/$N"
+out="$(SHIM_NO_LABELS=1 bash "$A/$N" adopt "$OLD" </dev/null 2>&1)"; rc=$?
+check "a new download adopts the installation of another folder as before" '[ "$rc" -eq 0 ] && ! grep -q "new download" <<< "$out" && grep -qxF "CATALOG_WEB_PORT=\"8181\"" "$A/$N" && grep -qxF "COMPOSE_PROJECT_NAME=\"oldroot\"" "$A/$N" && [ "$(grep "^MONGO_INITDB_ROOT_PASSWORD=" "$A/.env")" = "$(grep "^MONGO_INITDB_ROOT_PASSWORD=" "$OLD/.env")" ]'
+out="$(SHIM_NO_LABELS=1 bash "$A/$N" status </dev/null 2>&1)"
+check "the adopted installation: the installer is no new download any more" '! grep -q "new download" <<< "$out" && [ "$(ls "$A/$N".bak-* | wc -l)" -eq 1 ]'
 
 check "no unhandled podman, compose or systemctl calls" '[ ! -s "$UNHANDLED" ]'
 if [ -s "$UNHANDLED" ]; then sort -u "$UNHANDLED" | sed 's/^/  /'; fi

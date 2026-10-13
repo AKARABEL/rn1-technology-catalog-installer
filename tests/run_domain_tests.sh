@@ -9,6 +9,8 @@ T="$(mktemp -d)/dom"
 rm -rf "$T"; mkdir -p "$T/bin" "$T/dns"
 PASS=0; FAIL=0
 check() { if eval "$2"; then PASS=$((PASS+1)); echo "PASS: $1"; else FAIL=$((FAIL+1)); echo "FAIL: $1"; fi; }
+# cksum of the installer without its SETTINGS_PUBLISHED_SUM line, which the installer blanks at the first start next to an installation
+body() { grep -v '^SETTINGS_PUBLISHED_SUM=' "$1" | cksum; }
 # the internet check (menu start, new installation, option 16, engine setup) has its own suite (run_network_tests)
 export RN1_NET_CHECK=off
 LE="Let's Encrypt"
@@ -300,14 +302,14 @@ check "normalize: scheme, port, path, query and case go" '[ "$(nz "HTTPS://Catal
 check "normalize: spaces, user and the final dot go" '[ "$(nz " it@catalog.example.com. ")" = catalog.example.com ] && [ "$(nz catalog.example.com)" = catalog.example.com ]'
 check "normalize: an IPv6 address keeps its brackets" '[ "$(nz "[2001:db8::1]:443")" = "[2001:db8::1]" ]'
 fresh
-cs="$(cksum < "$I")"
+cs="$(body "$I")"
 out="$(bash "$I" domain http://192.0.2.10:8080/ </dev/null 2>&1)"; rc=$?
-check "domain: an IP address is refused" '[ "$rc" -eq 1 ] && grep -q "\"192.0.2.10\" is an IP address - leave it empty to use the IP address." <<< "$out" && [ "$(cksum < "$I")" = "$cs" ]'
+check "domain: an IP address is refused" '[ "$rc" -eq 1 ] && grep -q "\"192.0.2.10\" is an IP address - leave it empty to use the IP address." <<< "$out" && [ "$(body "$I")" = "$cs" ]'
 out="$(bash "$I" domain "[2001:db8::1]" </dev/null 2>&1)"; rc=$?
 check "domain: an IPv6 address is refused" '[ "$rc" -eq 1 ] && grep -q "is an IP address" <<< "$out"'
 for bad in intranet -catalog.example.com catalog_web.example.com "$(printf 'a%.0s' {1..64}).example.com"; do
   out="$(bash "$I" domain "$bad" </dev/null 2>&1)"; rc=$?
-  check "domain: \"${bad:0:20}\" is no host name" '[ "$rc" -eq 1 ] && grep -q "Give a host name in lower case" <<< "$out" && [ "$(cksum < "$I")" = "$cs" ]'
+  check "domain: \"${bad:0:20}\" is no host name" '[ "$rc" -eq 1 ] && grep -q "Give a host name in lower case" <<< "$out" && [ "$(body "$I")" = "$cs" ]'
 done
 cp "$I" "$T/cs.sh"; set_to CATALOG_DOMAIN "" Catalog.example.com "$T/cs.sh"
 out="$(bash "$T/cs.sh" check-settings 2>&1)"; rc=$?
@@ -377,9 +379,9 @@ set_to INSTALL_NGINX_PROXY_MANAGER true false; set_to CATALOG_WEB_PORT 8080 80
 printf 'n\n' | bash "$I" domain catalog.example.com >/dev/null 2>&1
 check "no Nginx Proxy Manager, Catalog Web on port 80: http://domain" '[ "$(val BASEURL)" = http://catalog.example.com ]'
 bash "$I" domain - </dev/null >/dev/null 2>&1
-cs="$(cksum < "$I")"
+cs="$(body "$I")"
 out="$(printf 'y\nit@mail.example.net\n' | bash "$I" domain catalog.example.com 2>&1)"; rc=$?
-check "settings that clash (port 80 twice) change nothing" '[ "$rc" -ne 0 ] && grep -q "the settings do not work together" <<< "$out" && grep -q "host port 80 is used by more than one setting" <<< "$out" && [ "$(cksum < "$I")" = "$cs" ]'
+check "settings that clash (port 80 twice) change nothing" '[ "$rc" -ne 0 ] && grep -q "the settings do not work together" <<< "$out" && grep -q "host port 80 is used by more than one setting" <<< "$out" && [ "$(body "$I")" = "$cs" ]'
 
 # 5. Installed stack: domain, e-mail, certificate first, then the proxy host; a second run changes nothing
 installed

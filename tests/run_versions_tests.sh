@@ -282,7 +282,7 @@ cp "$I" "$T/before.sh"
 out="$(choose '\n')"; rc=$?
 check "versions screen: reads the registries once, one row each, NPM included" '[ "$rc" -eq 0 ] && [ "$(grep -c "Checking Docker Hub and GHCR" <<< "$out")" -eq 1 ] && grep -q "Catalog + 4 workers" <<< "$out" && grep -q "Nginx Proxy Manager" <<< "$out" && grep -q "MinIO" <<< "$out"'
 check "versions screen: Enter writes the exact recommended tags" '[ "$(tags)" = "26.3.4789.148|8.0.32|2.19.6|2.19.6|3.13.7-management-alpine|RELEASE.2025-10-15T17-29-55Z|2.16.0|" ]'
-check "versions screen: only those settings changed, no backup left" '[ "$(diff "$T/before.sh" "$I" | grep -c "^[<>]")" -eq 12 ] && ! ls "$D"/*.bak-* >/dev/null 2>&1'
+check "versions screen: only those settings changed, no backup left" '[ "$(diff <(grep -v "^SETTINGS_PUBLISHED_SUM=" "$T/before.sh") <(grep -v "^SETTINGS_PUBLISHED_SUM=" "$I") | grep -c "^[<>]")" -eq 12 ] && ! ls "$D"/*.bak-* >/dev/null 2>&1'
 check "versions screen: nothing outside the series shown, the newer series named" '! grep -E "^ +[1-6] " <<< "$out" | grep -Eq "$OUTSIDE" && grep -q "MongoDB 9.0, OpenSearch 3 and RabbitMQ 4 exist - not released for the Catalog yet" <<< "$out"'
 check "versions screen: the settings are named" 'grep -q "MONGO_TAG = \"8.0.32\"" <<< "$out" && grep -q "CATALOG_VERSION = \"26.3.4789.148\"" <<< "$out"'
 out="$(choose '\n')"; rc=$?

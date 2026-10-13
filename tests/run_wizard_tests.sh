@@ -7,6 +7,8 @@ rm -rf "$T"; mkdir -p "$T/bin" "$T/dbin" "$T/state" "$T/npm" "$T/dns"
 sed 's/^CONTAINER_ENGINE=""$/CONTAINER_ENGINE="podman"/' "$1" > "${T%/*}/podman-installer.sh"; NEW="${T%/*}/podman-installer.sh"
 PASS=0; FAIL=0
 check() { if eval "$2"; then PASS=$((PASS+1)); echo "PASS: $1"; else FAIL=$((FAIL+1)); echo "FAIL: $1"; fi; }
+# cksum of the installer without its SETTINGS_PUBLISHED_SUM line, which the installer blanks at the first start of a file whose settings were changed
+body() { grep -v '^SETTINGS_PUBLISHED_SUM=' "$1" | cksum; }
 # the internet check (menu start, new installation, option 16, engine setup) has its own suite (run_network_tests)
 export RN1_NET_CHECK=off
 # LOG: the calls of one case (emptied by fresh/installed). BAD: calls the fakes do not know, for the whole suite.
@@ -867,9 +869,9 @@ check "install with 32 GB: no warning, no question, the cache of MongoDB for 32 
 
 # 5b. 0 at each question stops the task and returns to the menu; only the answers before are kept
 fresh
-before="$(cksum < "$I")"
+before="$(body "$I")"
 out="$(printf 'i\n0\n\n0\n' | bash "$I" menu 2>&1)"
-check "stop at the engine: nothing changed, back in the menu, the next start opens the menu" 'grep -q "Stopped. I starts it again" <<< "$out" && back_in_menu && [ "$(cksum < "$I")" = "$before" ] && [ -f "$D/.setup-later" ] && grep -q "The next start opens the menu directly" <<< "$out"'
+check "stop at the engine: nothing changed, back in the menu, the next start opens the menu" 'grep -q "Stopped. I starts it again" <<< "$out" && back_in_menu && [ "$(body "$I")" = "$before" ] && [ -f "$D/.setup-later" ] && grep -q "The next start opens the menu directly" <<< "$out"'
 fresh 's/^CONTAINER_ENGINE=.*/CONTAINER_ENGINE=""/'
 out="$(printf 'i\n\n0\n\n0\n' | bash "$I" menu 2>&1)"
 check "stop at the domain: the engine kept, nothing else" 'back_in_menu && [ "$(setting CONTAINER_ENGINE)" = podman ] && [ -z "$(setting CATALOG_DOMAIN)" ] && [ ! -e "$D/.setup-later" ]'
@@ -1094,11 +1096,40 @@ check "remove: images found without containers" 'grep -q "Images of the stack  *
 check "remove: volumes with no proof they are this folder's - not selected, .env kept" 'grep -q "not selected: they may be another installation" <<< "$out" && [ -f "$ST/vols" ] && [ -f "$D/.env" ]'
 
 # 18. Remove everything including the installer; a toggle with a leading zero works
-# (the download line uses curl where wget is missing, as on RHEL minimal)
-if command -v wget >/dev/null 2>&1; then DL="wget -nv -O rn1-technology-catalog-installer.sh"; else DL="curl -fsSL -o rn1-technology-catalog-installer.sh"; fi
+# (the one-line install with curl; with wget where curl is missing, below: a fake curl is always first on the PATH here)
+DL="curl -fsSL https://raw.githubusercontent.com/AKARABEL/rn1-technology-catalog-installer/main/install.sh | bash"
 installed
 out="$(printf 'r\nn\ny\na\n\nDELETE\n' | bash "$I" menu 2>&1)"; rc=$?
-check "remove all: installer gone, exits with the download line" '[ "$rc" -eq 0 ] && [ ! -e "$I" ] && grep -q "The installer was removed too" <<< "$out" && grep -q "$DL" <<< "$out"'
+check "remove all: installer gone, exits with the one-line install for this folder" '[ "$rc" -eq 0 ] && [ ! -e "$I" ] && grep -q "The installer was removed too. To install again, run this in $D:" <<< "$out" && grep -qF "$DL" <<< "$out"'
+# a host with wget and without curl: the PATH of this suite without curl (a real wget is linked, else a stand-in)
+mkdir -p "$T/nocurl"
+IFS=: read -r -a dirs <<< "$PATH"
+for dir in "${dirs[@]}"; do
+  for f in "$dir"/*; do
+    [ "${f##*/}" = curl ] || [ -e "$T/nocurl/${f##*/}" ] || ln -s "$f" "$T/nocurl/${f##*/}" 2>/dev/null || true
+  done
+done
+if [ ! -e "$T/nocurl/wget" ]; then printf '#!/bin/sh\nexit 1\n' > "$T/nocurl/wget"; chmod +x "$T/nocurl/wget"; fi
+installed
+out2="$(printf 'r\nn\ny\na\n\nDELETE\n' | PATH="$T/nocurl" bash "$I" menu 2>&1)"; rc2=$?
+check "remove all on a host with wget and without curl: the one-line install with wget" '[ "$rc2" -eq 0 ] && [ ! -e "$I" ] && grep -qxF "  wget -nv -O- https://raw.githubusercontent.com/AKARABEL/rn1-technology-catalog-installer/main/install.sh | bash" <<< "$out2" && ! grep -q "curl -fsSL" <<< "$out2"'
+check "remove all: no other copy of the installer here - no note about one" '! grep -q "another copy of the installer" <<< "$out"'
+# a copy of the installer next to it (catalog.sh from before the rename): not chosen, so kept; the one-line install
+# would start it, and the end of the removal says so
+installed
+cp "$I" "$D/catalog.sh"
+out="$(printf 'r\nn\ny\na\n\nDELETE\n' | bash "$I" menu 2>&1)"; rc=$?
+check "remove all with a catalog.sh copy: installer gone, the copy kept, named with the consequence and how to delete it" '[ "$rc" -eq 0 ] && [ ! -e "$I" ] && [ -f "$D/catalog.sh" ] && grep -q "Kept, because it was not chosen: another copy of the installer in this folder: catalog.sh$" <<< "$out" && grep -q "The line above starts it, with its own settings, instead of downloading a new installer" <<< "$out" && grep -q "delete it first (in $D: rm catalog.sh)" <<< "$out"'
+# the same with blank lines after the end of the copy (the one-line install takes such a copy for a whole installer)
+installed
+{ cat "$I"; printf '\n\n  \n'; } > "$D/catalog.sh"
+out="$(printf 'r\nn\ny\na\n\nDELETE\n' | bash "$I" menu 2>&1)"; rc=$?
+check "remove all with a catalog.sh copy that ends in blank lines: named as well" '[ "$rc" -eq 0 ] && [ ! -e "$I" ] && [ -f "$D/catalog.sh" ] && grep -q "Kept, because it was not chosen: another copy of the installer in this folder: catalog.sh$" <<< "$out"'
+# a catalog.sh that is not an installer (the original generator script) is not named
+installed
+cp "$(cd "$(dirname "$0")" && pwd)/original.sh" "$D/catalog.sh"
+out="$(printf 'r\nn\ny\na\n\nDELETE\n' | bash "$I" menu 2>&1)"; rc=$?
+check "remove all with the original generator script as catalog.sh: not named as an installer" '[ "$rc" -eq 0 ] && [ ! -e "$I" ] && [ -f "$D/catalog.sh" ] && ! grep -q "another copy of the installer" <<< "$out"'
 installed
 out="$(printf 'r\nn\ny\n04\n0\n\n0\n' | bash "$I" menu 2>&1)"; rc=$?
 check "remove: toggle 04 understood (no octal error)" '[ "$rc" -eq 0 ] && grep -q "Cancelled - nothing was removed" <<< "$out" && ! grep -q "value too great" <<< "$out"'
@@ -1148,9 +1179,9 @@ check "engine locked: the other engine is refused, Enter takes the one with the 
 # 23b. Data volumes, but no .env and no backup of it: new passwords would not open them - nothing is asked
 fresh
 touch "$ST/vols"
-before="$(cksum < "$I")"
+before="$(body "$I")"
 out="$(printf 'i\n\n0\n' | bash "$I" menu 2>&1)"
-check "volumes without their passwords: named before any question, nothing changed" 'grep -q "Data volumes of project \"inst\" are in Podman, but this folder has no .env" <<< "$out" && grep -q "not needed. Nothing was changed." <<< "$out" && ! grep -q "The container engine runs" <<< "$out" && [ "$(cksum < "$I")" = "$before" ] && [ ! -e "$D/.setup-later" ] && ! grep -Eq "$MUTATING" "$LOG"'
+check "volumes without their passwords: named before any question, nothing changed" 'grep -q "Data volumes of project \"inst\" are in Podman, but this folder has no .env" <<< "$out" && grep -q "not needed. Nothing was changed." <<< "$out" && ! grep -q "The container engine runs" <<< "$out" && [ "$(body "$I")" = "$before" ] && [ ! -e "$D/.setup-later" ] && ! grep -Eq "$MUTATING" "$LOG"'
 
 # 23c. The containers of this folder are in the engine the Engine step takes (CONTAINER_ENGINE named
 # another one): the repair takes over instead of a new installation

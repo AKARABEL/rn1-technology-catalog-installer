@@ -8,6 +8,8 @@ rm -rf "$T"; mkdir -p "$T/bin"
 sed 's/^CONTAINER_ENGINE=""$/CONTAINER_ENGINE="podman"/' "$1" > "${T%/*}/podman-installer.sh"; NEW="${T%/*}/podman-installer.sh"
 PASS=0; FAIL=0
 check() { if eval "$2"; then PASS=$((PASS+1)); echo "PASS: $1"; else FAIL=$((FAIL+1)); echo "FAIL: $1"; fi; }
+# cksum of an installer without its SETTINGS_PUBLISHED_SUM line, which the installer blanks once it wrote a setting
+body() { grep -v '^SETTINGS_PUBLISHED_SUM=' "$1" | cksum; }
 # the internet check (menu start, new installation, option 16, engine setup) has its own suite (run_network_tests)
 export RN1_NET_CHECK=off
 
@@ -256,10 +258,10 @@ cat > "$T/bin/ed-exit1" <<'EOF'
 f="${@: -1}"; sed -i 's/^CATALOG_VERSION=.*/CATALOG_VERSION="27.0.0.1"/' "$f"; exit 1
 EOF
 chmod +x "$T/bin/"ed-*
-cs1="$(cksum < "$D/gen.sh")"
+cs1="$(body "$D/gen.sh")"
 out="$(printf '1\ne\nn\n0\n0\n' | EDITOR=ed-break bash "$D/gen.sh" menu 2>&1)"; rc=$?
 check "broken edit detected" 'grep -q "cannot start with these settings" <<< "$out"'
-check "broken edit restored + menu continues" '[ "$rc" -eq 0 ] && [ "$(cksum < "$D/gen.sh")" = "$cs1" ] && grep -q "previous version" <<< "$out"'
+check "broken edit restored + menu continues" '[ "$rc" -eq 0 ] && [ "$(body "$D/gen.sh")" = "$cs1" ] && grep -q "previous version" <<< "$out"'
 out="$(printf '1\ne\n0\n0\n' | EDITOR=ed-none bash "$D/gen.sh" menu 2>&1)"
 check "no-change edit says No changes" 'grep -q "No changes" <<< "$out"'
 out="$(printf '1\ne\n0\n' | EDITOR=ed-good bash "$D/gen.sh" menu 2>&1)"
@@ -499,6 +501,60 @@ check "health progress: 9 of 11 ready: 40%" '[ "$(hp 9 11 000 0)" = "40|no answe
 check "health progress: all ready, Catalog Web just starting: 50%" '[ "$(hp 11 11 000 0)" = "50|no answer yet|" ]'
 check "health progress: Catalog Web starting for 90 s / 10 min: 74% / 92%, never 100" '[ "$(hp 11 11 500 90)" = "74|HTTP 500|" ] && [ "$(hp 11 11 000 600)" = "92|no answer yet|" ] && [ "$(hp 11 11 000 36000)" = "98|no answer yet|" ]'
 check "health progress: all ready and Catalog Web answers: 100%" '[ "$(hp 11 11 200 30)" = "100|OK|" ]'
+
+# 16. The published settings: SETTINGS_PUBLISHED_SUM is the cksum of the settings section, the lines from
+#     '# CONFIGURE ONLY THIS SECTION' to '# DO NOT CHANGE ANYTHING BELOW' (tests/check_settings_hash.sh holds
+#     every release to it). A new download - its settings as published - takes the values of an installation
+#     in its folder over at its start; nothing without an installation, and nothing for the help and the hooks.
+R="$1"; HS="$SP/check_settings_hash.sh"
+sum_of() { sed -n 's/^SETTINGS_PUBLISHED_SUM="\(.*\)"$/\1/p' "$1"; }
+publish() { sed -i "s/^SETTINGS_PUBLISHED_SUM=.*/SETTINGS_PUBLISHED_SUM=\"$(bash "$1" __settings_hash)\"/" "$1"; }
+check "settings sum: cksum of the section with both marker lines, the constant of the release" '[ "$(bash "$R" __settings_hash)" = "$(sed -n "/^# CONFIGURE ONLY THIS SECTION$/,/^# DO NOT CHANGE ANYTHING BELOW$/p" "$R" | cksum | awk "{ print \$1, \$2 }")" ] && [ "$(bash "$R" __settings_hash)" = "$(sum_of "$R")" ]'
+out="$(bash "$HS" "$R" 2>&1)"; rc=$?
+out="$(LC_ALL=xx_XX.UTF-8 LANG=xx_XX.UTF-8 bash "$HS" "$R" 2>&1)"; rc=$?
+check "check_settings_hash: a warning of bash on stderr (a locale this server does not have) is no part of the sum" '[ "$rc" -eq 0 ] && grep -qF "SETTINGS_PUBLISHED_SUM \"$(sum_of "$R")\" is the cksum of the published settings section" <<< "$out"'
+check "check_settings_hash: the release passes" '[ "$rc" -eq 0 ] && grep -qF "SETTINGS_PUBLISHED_SUM \"$(sum_of "$R")\" is the cksum of the published settings section" <<< "$out"'
+H="$T/hash"; rm -rf "$H"; mkdir -p "$H"; cp "$R" "$H/rn1-technology-catalog-installer.sh"
+sed -i 's/^HEALTH_TIMEOUT=.*/HEALTH_TIMEOUT="601"/' "$H/rn1-technology-catalog-installer.sh"
+hnew="$(bash "$H/rn1-technology-catalog-installer.sh" __settings_hash)"
+out="$(bash "$HS" "$H/rn1-technology-catalog-installer.sh" 2>&1)"; rc=$?
+check "check_settings_hash: a default changed without the sum fails with the value and the command to set it" '[ "$rc" -ne 0 ] && [ "$hnew" != "$(sum_of "$R")" ] && grep -qF "SETTINGS_PUBLISHED_SUM is \"$(sum_of "$R")\", the settings section has \"$hnew\" - set SETTINGS_PUBLISHED_SUM=\"$hnew\"" <<< "$out" && grep -qF "SETTINGS_PUBLISHED_SUM=\\\"\$(bash rn1-technology-catalog-installer.sh __settings_hash)\\\"" <<< "$out"'
+(cd "$H" && sed -i "s/^SETTINGS_PUBLISHED_SUM=.*/SETTINGS_PUBLISHED_SUM=\"$(bash rn1-technology-catalog-installer.sh __settings_hash)\"/" rn1-technology-catalog-installer.sh)
+out="$(bash "$HS" "$H/rn1-technology-catalog-installer.sh" 2>&1)"; rc=$?
+check "check_settings_hash: passes after the documented command" '[ "$rc" -eq 0 ] && [ "$(sum_of "$H/rn1-technology-catalog-installer.sh")" = "$hnew" ]'
+echo "# a line below the settings" >> "$H/rn1-technology-catalog-installer.sh"
+check "settings sum: a change below the settings section keeps it" '[ "$(bash "$H/rn1-technology-catalog-installer.sh" __settings_hash)" = "$hnew" ]'
+cp "$H/rn1-technology-catalog-installer.sh" "$H/b.sh"; sed -i 's/^# General$/# General /' "$H/b.sh"
+cp "$H/rn1-technology-catalog-installer.sh" "$H/c.sh"; sed -i '/^# CONFIGURE ONLY THIS SECTION$/{n;s/$/#/}' "$H/c.sh"
+check "settings sum: a space in a comment or a changed frame line of the section changes it" '[ "$(bash "$H/b.sh" __settings_hash)" != "$hnew" ] && [ "$(bash "$H/c.sh" __settings_hash)" != "$hnew" ]'
+out="$(bash "$H/b.sh" __settings_hash "$H/rn1-technology-catalog-installer.sh" 2>&1)"
+check "__settings_hash FILE: the sum of another file" '[ "$out" = "$hnew" ]'
+P="$(newdir pristine)"; publish "$P/gen.sh"; pub="$(cksum < "$P/gen.sh")"
+out="$(bash "$P/gen.sh" generate </dev/null 2>&1)"; rc=$?
+check "new download without an installation: nothing said, nothing taken over" '[ "$rc" -eq 0 ] && [ -f "$P/.env" ] && ! grep -q "new download" <<< "$out" && [ "$(cksum < "$P/gen.sh")" = "$pub" ] && ! ls "$P"/gen.sh.bak-* >/dev/null 2>&1'
+out="$(bash "$P/gen.sh" status </dev/null 2>&1)"
+check "new download, the files of its own defaults, no container and no data volume: no installation - nothing said, still a new download" '! grep -q "new download" <<< "$out" && [ "$(cksum < "$P/gen.sh")" = "$pub" ]'
+sed -i 's/^CATALOG_WEB_PORT=.*/CATALOG_WEB_PORT=9191/' "$P/.env"; envP="$(cksum < "$P/.env")"
+for c in help __settings_hash check-settings jobs __menu_items; do
+  SHIM_VOLUMES="pristine_db_data" bash "$P/gen.sh" "$c" </dev/null >/dev/null 2>&1
+done
+check "new download: the help, the hooks and the jobs list take nothing over" '[ "$(cksum < "$P/gen.sh")" = "$pub" ]'
+out="$(bash "$P/gen.sh" network-hosts </dev/null 2>&1)"
+check "new download, the files of a Catalog never started (no container, no data volume): 'network-hosts' takes nothing over" '! grep -q -e "new download" -e " -> " <<< "$out" && [ "$(cksum < "$P/gen.sh")" = "$pub" ] && [ "$(cksum < "$P/.env")" = "$envP" ]'
+out="$(SHIM_VOLUMES="pristine_db_data" bash "$P/gen.sh" network-hosts </dev/null 2>/dev/null)"
+check "new download, the data volumes of the stack: 'network-hosts' takes the values over, its list stays clean" '! grep -q -e "new download" -e " -> " <<< "$out" && grep -q "registry-1.docker.io:443" <<< "$out" && grep -qxF "CATALOG_WEB_PORT=\"9191\"" "$P/gen.sh" && [ "$(cksum < "$P/.env")" = "$envP" ] && [ "$(ls "$P"/gen.sh.bak-* | wc -l)" -eq 1 ]'
+Q="$(newdir pristine_env)"; publish "$Q/gen.sh"; pub="$(cksum < "$Q/gen.sh")"
+bash "$Q/gen.sh" generate </dev/null >/dev/null 2>&1; rm -f "$Q/docker-compose.yml"
+sed -i 's/^CATALOG_WEB_PORT=.*/CATALOG_WEB_PORT=9292/' "$Q/.env"
+out="$(bash "$Q/gen.sh" credentials </dev/null 2>&1)"
+check "new download, only a .env without data volumes: no installation, nothing taken over" '! grep -q "new download" <<< "$out" && [ "$(cksum < "$Q/gen.sh")" = "$pub" ]'
+out="$(SHIM_VOLUMES="pristine_env_db_data" bash "$Q/gen.sh" credentials </dev/null 2>&1)"
+check "new download, a .env with the data volumes of the stack: taken over" 'grep -q "^ This installer is a new download with its default settings; the installation$" <<< "$out" && grep -q "^   CATALOG_WEB_PORT  *8080 -> 9292$" <<< "$out" && grep -q "Previous version: gen.sh.bak-" <<< "$out" && grep -qxF "CATALOG_WEB_PORT=\"9292\"" "$Q/gen.sh" && [ "$(grep -n "new download" <<< "$out" | cut -d: -f1)" -lt "$(grep -n "Credentials (from .env)" <<< "$out" | cut -d: -f1)" ]'
+W="$(newdir foreign)"; publish "$W/gen.sh"; pub="$(cksum < "$W/gen.sh")"
+printf 'COMPOSE_PROJECT_NAME=wiki\nTZ=UTC\nLOG_LEVEL_DEFAULT=Debug\nQUEUE_PREFIX=wikiq\nDB_PASSWORD=secret\n' > "$W/.env"
+printf 'services:\n  wiki:\n    image: ghcr.io/example/wiki:2.5\n    env_file: .env\n' > "$W/docker-compose.yml"
+out="$(SHIM_VOLUMES="foreign_db_data" bash "$W/gen.sh" status </dev/null 2>&1)"
+check "another application's .env and compose file in the folder (volumes of its project exist): no Catalog's, nothing taken over" '! grep -q "new download" <<< "$out" && [ "$(cksum < "$W/gen.sh")" = "$pub" ] && ! grep -q "^COMPOSE_PROJECT_NAME=\"wiki\"" "$W/gen.sh"'
 
 check "no podman, compose or systemctl call the fakes do not know" '[ ! -s "$SHIM_UNHANDLED" ] || { sort -u "$SHIM_UNHANDLED"; false; }'
 

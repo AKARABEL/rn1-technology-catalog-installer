@@ -606,6 +606,389 @@ check "newer download: option 23 keeps 25.4 - the settings take the installed Ca
 out="$(printf '0\n' | bash "$D/$N" menu 2>&1)"
 check "newer download kept at 25.4: afterwards no note" '! grep -q -e "The settings say" -e "The files say" <<< "$out"'
 
+# 11. The installer installed the Catalog with the values of its new installation (the time zone of the server,
+#     no Nginx Proxy Manager, the synchronization at 8:30), then it was downloaded again into the folder: the
+#     published defaults (Europe/Berlin, true, 30 7). The new download takes the installation's values over by
+#     itself at its start - the menu, 'status', 'generate' and 'up' - before anything else; an edited file only
+#     names them. PUB: a release of these tests (the Podman of the fakes, no update check) with its own sum.
+publish() { sed -i "s/^SETTINGS_PUBLISHED_SUM=.*/SETTINGS_PUBLISHED_SUM=\"$(bash "$1" __settings_hash)\"/" "$1"; }
+PUB="$T/published.sh"; sed 's/^CHECK_FOR_UPDATES=.*/CHECK_FOR_UPDATES="false"/' "$NEW" > "$PUB"; publish "$PUB"
+# the line of the sum, whether it is gone (a one-way state: the installer wrote a setting, or a start found the
+# section changed or had nothing to take over), and the file without it
+sumline() { sed -n 's/^SETTINGS_PUBLISHED_SUM=//p' "$1"; }
+gone() { [ "$(sumline "$1")" = '""' ]; }
+body() { grep -v '^SETTINGS_PUBLISHED_SUM=' "$1" | cksum; }
+export SHIM_TZ="Europe/Istanbul"
+wizard_installation() {
+  rm -rf "$D" "$ST"/*; mkdir -p "$D"; cp "$PUB" "$D/$N"
+  sed -i '0,/^TZ=/s#^TZ=.*#TZ="Europe/Istanbul"#; 0,/^INSTALL_NGINX_PROXY_MANAGER=/s/^INSTALL_NGINX_PROXY_MANAGER=.*/INSTALL_NGINX_PROXY_MANAGER="false"/; 0,/^AUTOSYNC_CRON=/s/^AUTOSYNC_CRON=.*/AUTOSYNC_CRON="30 8 * * *"/' "$D/$N"
+  (cd "$D" && bash "$N" generate </dev/null >/dev/null 2>&1)
+  touch "$ST/up"; sed -n 's/^CATALOG_IMAGE=.*://p' "$D/.env" > "$ST/catalog_tag"; echo "8.0.4" > "$ST/mongo_version"
+  (cd "$D" && pwd -P) > "$ST/wd"; cp "$D/.env" "$ST/upenv"
+  cp "$PUB" "$D/$N"
+  envW="$(cksum < "$D/.env")"; composeW="$(cksum < "$D/docker-compose.yml")"
+  : > "$LOG"
+}
+# line PATTERN -> the number of the first line of $out with PATTERN (999999: none)
+line() { local n; n="$(grep -n -m 1 -- "$1" <<< "$out" | cut -d: -f1)"; echo "${n:-999999}"; }
+said() { grep -q "^ This installer is a new download with its default settings; the installation$" <<< "$out" && grep -q "^ here has other values - taken over:$" <<< "$out"; }
+table3() { [ "$(grep -c "^   [A-Z][A-Z_]* .* -> " <<< "$out")" -eq 3 ] && grep -q "^   TZ  *Europe/Berlin -> Europe/Istanbul$" <<< "$out" && grep -q "^   INSTALL_NGINX_PROXY_MANAGER  *true -> false$" <<< "$out" && grep -qF "   AUTOSYNC_CRON                  30 7 * * * -> 30 8 * * *" <<< "$out"; }
+written() { grep -qxF "TZ=\"Europe/Istanbul\"" "$D/$N" && grep -qxF "INSTALL_NGINX_PROXY_MANAGER=\"false\"" "$D/$N" && grep -qxF "AUTOSYNC_CRON=\"30 8 * * *\"" "$D/$N" && [ "$(ls "$D/$N".bak-* | wc -l)" -eq 1 ] && cmp -s "$(ls "$D/$N".bak-*)" "$PUB"; }
+untouched() { [ "$(cksum < "$D/.env")" = "$envW" ] && [ "$(cksum < "$D/docker-compose.yml")" = "$composeW" ] && nocompose; }
+check "published test release: its settings are as published" '[ "$(bash "$PUB" __settings_hash)" = "$(sed -n "s/^SETTINGS_PUBLISHED_SUM=\"\(.*\)\"$/\1/p" "$PUB")" ]'
+wizard_installation
+# (n: a question would keep the values - there is none; a pipe has no pause before the menu, the n is the menu's)
+out="$(printf 'n\n0\n' | bash "$D/$N" menu 2>&1)"
+check "new download, menu: the installation's values taken over first, without a question, then the menu" 'said && table3 && [ "$(line "This installer is a new download")" -lt "$(line "Installation Portal")" ] && grep -q "Taken over: 3 value(s) - .env, docker-compose.yml and the containers stay.$" <<< "$out" && grep -q "^    Previous version: $N.bak-" <<< "$out" && ! grep -q "Cancelled" <<< "$out"'
+check "new download, menu: the values written, the installer kept as a backup, .env, compose and containers untouched" 'written && untouched'
+check "new download, menu: no note of other values afterwards" '! grep -q -e "differ from the installation" -e "do not match the settings" -e "The settings say" <<< "$out"'
+out="$(printf '0\n' | bash "$D/$N" menu 2>&1)"
+check "new download: the second start says nothing" '! grep -q -e "new download" -e "differ from the installation" -e "Press Enter to open the menu" <<< "$out" && [ "$(ls "$D/$N".bak-* | wc -l)" -eq 1 ]'
+out="$(bash "$D/$N" status </dev/null 2>&1)"
+check "new download: a later 'status' says nothing either" '! grep -q -e "new download" -e "differ from the installation" <<< "$out" && grep -q "Catalog 26.3.4789.148 installed$" <<< "$out"'
+wizard_installation
+out="$(bash "$D/$N" status </dev/null 2>&1)"
+check "new download, 'status': taken over first, then the status without a note" 'said && table3 && [ "$(line "This installer is a new download")" -lt "$(line "NAME STATUS")" ] && ! grep -q "differ from the installation" <<< "$out" && written && untouched'
+wizard_installation
+out="$(bash "$D/$N" generate </dev/null 2>&1)"; rc=$?
+check "new download, 'generate': taken over first, then the same files written" '[ "$rc" -eq 0 ] && said && table3 && written && [ "$(cksum < "$D/.env")" = "$envW" ] && [ "$(cksum < "$D/docker-compose.yml")" = "$composeW" ] && nocompose'
+wizard_installation
+out="$(bash "$D/$N" up </dev/null 2>&1)"; rc=$?
+check "new download, 'up': taken over first, then the files started as they are, no note" '[ "$rc" -eq 0 ] && said && table3 && written && [ "$(line "This installer is a new download")" -lt "$(line "Starting the stack")" ] && ! grep -q "do not match the settings" <<< "$out" && [ "$(cksum < "$D/.env")" = "$envW" ] && grep -q "compose.* up -d --remove-orphans$" "$LOG"'
+# changed on purpose: one setting edited after the download, or a hand edit of the section that changes no value
+wizard_installation
+sed -i 's/^HEALTH_TIMEOUT=.*/HEALTH_TIMEOUT="900"/' "$D/$N"; edited="$(body "$D/$N")"
+out="$(printf '0\n' | bash "$D/$N" menu 2>&1)"
+check "one setting edited after the download: not taken over, the menu names the values" '! grep -q "new download" <<< "$out" && grep -q "The settings differ from the installation in TZ, INSTALL_NGINX_PROXY_MANAGER, AUTOSYNC_CRON - option 23 takes the installation.s values over, option 2 writes the settings\." <<< "$out" && [ "$(body "$D/$N")" = "$edited" ] && gone "$D/$N" && ! ls "$D/$N".bak-* >/dev/null 2>&1 && untouched'
+out="$(bash "$D/$N" status </dev/null 2>&1)"
+check "one setting edited: 'status' names them, takes nothing over" '! grep -q "new download" <<< "$out" && grep -q "The settings differ from the installation in TZ, INSTALL_NGINX_PROXY_MANAGER, AUTOSYNC_CRON - .*adopt \.. takes the installation.s values over" <<< "$out" && [ "$(body "$D/$N")" = "$edited" ]'
+out="$(printf '23\ny\n\n0\n' | bash "$D/$N" menu 2>&1)"
+check "one setting edited: option 23 takes the values over, the edit stays" 'grep -q "Took over 3 value(s) of the installation" <<< "$out" && grep -qxF "TZ=\"Europe/Istanbul\"" "$D/$N" && grep -qxF "HEALTH_TIMEOUT=\"900\"" "$D/$N" && untouched'
+wizard_installation
+sed -i 's/^# General$/# General (checked)/' "$D/$N"; edited="$(body "$D/$N")"
+out="$(bash "$D/$N" status </dev/null 2>&1)"
+check "a hand edit of the settings section that changes no value: not a new download, only named" '! grep -q "new download" <<< "$out" && grep -q "The settings differ from the installation in TZ" <<< "$out" && [ "$(body "$D/$N")" = "$edited" ] && gone "$D/$N"'
+# the file cannot be written: said, and the notes as before
+if [ "$(id -u)" -ne 0 ]; then
+  wizard_installation
+  chmod a-w "$D/$N"
+  out="$(bash "$D/$N" status </dev/null 2>&1)"
+  check "a new download that is not writable: said, nothing taken over, the note as before" 'grep -q "^ here has other values, but the file is not writable: nothing was taken over.$" <<< "$out" && grep -q "The settings differ from the installation in TZ" <<< "$out" && cmp -s "$D/$N" "$PUB" && ! ls "$D/$N".bak-* >/dev/null 2>&1'
+  chmod u+w "$D/$N"
+else
+  echo "SKIP: running as root, for whom every file is writable - the case of a new download that is not writable is not tested here (run the suite as a normal user, for example in the CentOS 7 container of tests/run_in_container.sh)"
+fi
+# while a job runs it waits for the next start
+wizard_installation
+sleep 60 & sp=$!
+mkdir -p "$D/.jobs/1"; echo "Pull" > "$D/.jobs/1/title"; echo running > "$D/.jobs/1/state"; echo "$sp" > "$D/.jobs/1/pid"
+out="$(bash "$D/$N" status </dev/null 2>&1)"
+kill "$sp" 2>/dev/null; wait "$sp" 2>/dev/null
+check "a new download while a job runs: taken over at the next start" 'grep -q "^ here has other values - taken over at the next start, when no job runs (J).$" <<< "$out" && cmp -s "$D/$N" "$PUB"'
+out="$(bash "$D/$N" status </dev/null 2>&1)"
+check "a new download, the job done: taken over" 'said && table3 && written'
+# a self-update of a new download carries its settings over: the old file takes nothing over; they are the
+# defaults of the new version too, so that one is a new download and takes the values over at its start
+PUB2="$T/published2.sh"
+sed 's/Raynet One Technology Catalog - Installation Portal\${C_RST}   (/Raynet One Technology Catalog - Installation Portal${C_RST} v2   (/; s/^HEALTH_TIMEOUT=\(.*\)$/HEALTH_TIMEOUT=\1\nNEW_SETTING="default-of-new-version"/' "$PUB" > "$PUB2"; publish "$PUB2"
+wizard_installation
+out="$(SHIM_INSTALLER="$PUB2" bash "$D/$N" self-update </dev/null 2>&1)"; rc=$?
+check "self-update of a new download: the old file takes nothing over, the new one is a new download too" '[ "$rc" -eq 0 ] && grep -q "Installer updated" <<< "$out" && ! grep -q "new download" <<< "$out" && cmp -s "$D/$N" "$PUB2" && cmp -s "$(ls "$D/$N".bak-*)" "$PUB" && untouched'
+out="$(bash "$D/$N" status </dev/null 2>&1)"
+check "self-update of a new download: the next start takes the installation's values over" 'said && table3 && grep -qxF "TZ=\"Europe/Istanbul\"" "$D/$N" && grep -qxF "NEW_SETTING=\"default-of-new-version\"" "$D/$N" && [ "$(ls "$D/$N".bak-* | wc -l)" -eq 2 ] && untouched'
+# the user's installer, a version without the sum (nothing proves its settings are the published ones, so it is
+# never a new download): option 22 brings this version, which has no sum either - the note and option 23 as before
+wizard_installation
+sed -i '/^SETTINGS_PUBLISHED_SUM=/d' "$D/$N"
+out="$(printf '22\ny\n\n0\n' | SHIM_INSTALLER="$PUB2" bash "$D/$N" menu 2>&1)"
+check "an installer without the sum, option 22: the new version names the values (option 23), takes nothing over by itself" 'grep -q "The settings differ from the installation in TZ, INSTALL_NGINX_PROXY_MANAGER, AUTOSYNC_CRON" <<< "$out" && ! grep -q "new download" <<< "$out" && grep -q "Installation Portal v2" <<< "$out" && gone "$D/$N" && grep -qxF "TZ=\"Europe/Berlin\"" "$D/$N" && untouched'
+out="$(printf '23\ny\n\n0\n' | bash "$D/$N" menu 2>&1)"
+check "an installer without the sum, option 23 takes the values over as before" 'grep -q "Took over 3 value(s) of the installation" <<< "$out" && grep -qxF "TZ=\"Europe/Istanbul\"" "$D/$N" && untouched'
+# a new download of a release whose default is a newer Catalog than the installed 25.4: the versions of the
+# containers and the series of the installation taken over (U or option 21 upgrades it with the backup)
+export SHIM_TZ="Europe/Berlin"
+setup
+cp "$PUB" "$D/$N"; env25="$(cksum < "$D/.env")"
+out="$(bash "$D/$N" status </dev/null 2>&1)"
+check "a new download next to Catalog 25.4: the installed versions taken over, nothing raised" 'said && grep -q "^   CATALOG_VERSION  *26.3.4789.148 -> 25.4.4191.133$" <<< "$out" && grep -q "^   OPENSEARCH_TAG  *2 -> 2.19.5$" <<< "$out" && grep -qxF "CATALOG_VERSION=\"25.4.4191.133\"" "$D/$N" && ! grep -q "The settings say" <<< "$out" && grep -q "Catalog 25.4.4191.133 installed$" <<< "$out" && [ "$(cksum < "$D/.env")" = "$env25" ] && nocompose'
+# the server state (.env names 25.4, catalog-web runs 26.3) with a new download of a release that had 25.4: the
+# values of the backup of that second taken over by themselves, putting the backups back is still asked
+export SHIM_TZ="Etc/UTC"
+server_state
+cp "$FRESH" "$D/$N"; publish "$D/$N"
+out="$(printf 'n\n0\n' | bash "$D/$N" menu 2>&1)"
+check "server state, new download: the installation's values taken over, the backups not put back after no" 'said && grep -q "^   CATALOG_VERSION  *25.4.4191.133 -> 26.3.4789.148$" <<< "$out" && grep -q "other values come from .env.bak-20261011-123742" <<< "$out" && grep -q "The files stay as they are - option 6 would start Catalog 25.4.4191.133" <<< "$out" && grep -qxF "CATALOG_VERSION=\"26.3.4789.148\"" "$D/$N" && grep -qxF "CATALOG_WEB_PORT=\"8181\"" "$D/$N" && [ "$(cksum < "$D/.env")" = "$envA" ] && nocompose && ! grep -q "The settings say" <<< "$out" && [ "$(grep -c "belong to it\.$" <<< "$out")" -eq 1 ] && [ "$(grep -c "The files stay as they are - option 6 would start" <<< "$out")" -eq 1 ]'
+server_state
+cp "$FRESH" "$D/$N"; publish "$D/$N"
+out="$(printf 'y\n0\n' | bash "$D/$N" menu 2>&1)"
+check "server state, new download: the backups put back after yes" 'said && grep -q ".env and docker-compose.yml name the installed Catalog 26.3.4789.148 again." <<< "$out" && grep -qxF "CATALOG_VERSION=\"26.3.4789.148\"" "$D/$N" && [ "$(cksum < "$D/.env")" = "$env26" ] && [ "$(cksum < "$D/docker-compose.yml")" = "$compose26" ] && nocompose && ! grep -q -e "The settings say" -e "The files say" <<< "$out"'
+server_state
+cp "$FRESH" "$D/$N"; publish "$D/$N"
+out="$(bash "$D/$N" generate </dev/null 2>&1)"; rc=$?
+check "server state, new download, 'generate': the values taken over, the backups named, then 26.3 written" '[ "$rc" -eq 0 ] && said && grep -q "Menu option 23 puts them back, or .* generate. writes them from the settings, which now fit the installation." <<< "$out" && grep -qx "CATALOG_IMAGE=raynetgmbh/rayventory-catalog:26.3.4789.148" "$D/.env" && grep -qx "CATALOG_WEB_PORT=8181" "$D/.env" && [ "$(grep "^MONGO_INITDB_ROOT_PASSWORD=" "$D/.env")" = "$(grep "^MONGO_INITDB_ROOT_PASSWORD=" "$D/.env.bak-20261011-123742")" ] && nocompose && ! grep -q "would replace" <<< "$out"'
+
+# 12. One way: only a file that has never been changed is a new download. A value the user (or the installer for
+#     the user) puts back to the published one - option 1 and S, the editor, set-version, timezone, by hand -
+#     leaves the settings as the published file again, and the next start must not take the installation's
+#     value over against that. SETTINGS_PUBLISHED_SUM goes at the first change, and at the first start that
+#     finds the section changed or has nothing to take over.
+# an installation made by an installer that was edited by hand (setting NAME VALUE ...), then started: it is not
+# a new download (its first start flips the sum), the files are as that installer made them
+edited_installation() {
+  rm -rf "$D" "$ST"/*; mkdir -p "$D"; cp "$PUB" "$D/$N"
+  while [ $# -ge 2 ]; do sed -i "0,/^$1=/s#^$1=.*#$1=\"$2\"#" "$D/$N"; shift 2; done
+  # EI_HOOK: files the installation has before it is generated (the login of a proxy, a certificate)
+  if [ -n "${EI_HOOK:-}" ]; then eval "$EI_HOOK"; fi
+  (cd "$D" && bash "$N" generate </dev/null >/dev/null 2>&1)
+  touch "$ST/up"; sed -n 's/^CATALOG_IMAGE=.*://p' "$D/.env" > "$ST/catalog_tag"; echo "8.0.4" > "$ST/mongo_version"
+  (cd "$D" && pwd -P) > "$ST/wd"; cp "$D/.env" "$ST/upenv"
+  envW="$(cksum < "$D/.env")"; : > "$LOG"
+}
+setv() { sed -i "0,/^$1=/s#^$1=.*#$1=\"$2\"#" "$D/$N"; }
+export SHIM_TZ="Europe/Berlin"
+edited_installation CATALOG_WEB_PORT 9393
+check "an edited installer: its first start ended the new download for good (the sum is gone)" 'gone "$D/$N" && [ "$(grep "^CATALOG_WEB_PORT=" "$D/.env")" = "CATALOG_WEB_PORT=9393" ]'
+out="$(printf '1\nCATALOG_WEB_PORT\n8080\ns\n\n0\n' | bash "$D/$N" menu 2>&1)"
+check "option 1 and S: a port set back to the published default stays - the next start takes nothing over" '! grep -q "new download" <<< "$out" && ! grep -qE "Taken over|taken over" <<< "$out" && grep -qxF "CATALOG_WEB_PORT=\"8080\"" "$D/$N" && [ "$(cksum < "$D/.env")" = "$envW" ] && grep -q "setting(s) saved" <<< "$out" && [ "$(body "$D/$N")" = "$(body "$PUB")" ] && gone "$D/$N"'
+out="$(bash "$D/$N" generate </dev/null 2>&1)"; rc=$?
+check "...and generate writes it into .env (the settings are what was chosen)" '[ "$rc" -eq 0 ] && ! grep -q "new download" <<< "$out" && grep -qx "CATALOG_WEB_PORT=8080" "$D/.env"'
+edited_installation CATALOG_WEB_PORT 9393
+setv CATALOG_WEB_PORT 8080
+out="$(bash "$D/$N" generate </dev/null 2>&1)"; rc=$?
+check "a hand edit back to the default, then generate: written, not taken back over" '[ "$rc" -eq 0 ] && ! grep -q "new download" <<< "$out" && grep -qx "CATALOG_WEB_PORT=8080" "$D/.env" && grep -qxF "CATALOG_WEB_PORT=\"8080\"" "$D/$N" && gone "$D/$N"'
+edited_installation CATALOG_VERSION 25.4.4191.133
+out="$(bash "$D/$N" set-version 26.3.4789.148 </dev/null 2>&1)"
+check "set-version to the default of this release: the sum goes with the write, the file equals the published one otherwise" 'grep -qxF "CATALOG_VERSION=\"26.3.4789.148\"" "$D/$N" && gone "$D/$N" && [ "$(body "$D/$N")" = "$(body "$PUB")" ]'
+out="$(bash "$D/$N" status </dev/null 2>&1)"
+check "...the next start leaves 26.3 in the settings (the user chose it; U or option 21 upgrades)" '! grep -q "new download" <<< "$out" && grep -qxF "CATALOG_VERSION=\"26.3.4789.148\"" "$D/$N" && grep -q "The settings say Catalog 26.3.4789.148, 25.4.4191.133 is installed" <<< "$out"'
+edited_installation TZ Etc/UTC AUTOSYNC_CRON "30 5 * * *"
+out="$(printf 'y\ny\n' | SHIM_TZ=Europe/Berlin bash "$D/$N" timezone 2>&1)"
+check "timezone: TZ and the job times are the published ones afterwards (the sum is gone)" 'grep -q "TZ is now Europe/Berlin" <<< "$out" && [ "$(body "$D/$N")" = "$(body "$PUB")" ] && gone "$D/$N"'
+out="$(SHIM_TZ=Europe/Berlin bash "$D/$N" status </dev/null 2>&1)"
+check "...the next start does not take Etc/UTC back over" '! grep -q "new download" <<< "$out" && grep -qxF "TZ=\"Europe/Berlin\"" "$D/$N" && [ "$(cksum < "$D/.env")" = "$envW" ]'
+# Nginx Proxy Manager: taken over from a new download, then switched on again in option 1
+edited_installation INSTALL_NGINX_PROXY_MANAGER false
+cp "$PUB" "$D/$N"
+out="$(printf '0\n' | bash "$D/$N" menu 2>&1)"
+check "a new download takes INSTALL_NGINX_PROXY_MANAGER false over, and the sum is gone" 'grep -q "^   INSTALL_NGINX_PROXY_MANAGER  *true -> false$" <<< "$out" && gone "$D/$N"'
+out="$(printf '1\nINSTALL_NGINX_PROXY_MANAGER\ny\ns\n\n0\n' | bash "$D/$N" menu 2>&1)"
+check "option 1 and S switches Nginx Proxy Manager on (the default): it stays on at the restart" '! grep -q "new download" <<< "$out" && grep -qxF "INSTALL_NGINX_PROXY_MANAGER=\"true\"" "$D/$N" && grep -q "setting(s) saved" <<< "$out" && ! grep -q "true -> false" <<< "$out"'
+# the editor (E in option 1)
+wizard_installation
+printf '#!/usr/bin/env bash\nf="${@: -1}"; sed -i "0,/^INSTALL_NGINX_PROXY_MANAGER=/s/^INSTALL_NGINX_PROXY_MANAGER=.*/INSTALL_NGINX_PROXY_MANAGER=\\"true\\"/" "$f"\n' > "$T/bin/ed-npm"; chmod +x "$T/bin/ed-npm"
+sed -i '0,/^INSTALL_NGINX_PROXY_MANAGER=/s/^INSTALL_NGINX_PROXY_MANAGER=.*/INSTALL_NGINX_PROXY_MANAGER="false"/' "$D/$N"
+out="$(printf '1\ne\n\n0\n' | EDITOR=ed-npm bash "$D/$N" menu 2>&1)"
+check "the editor puts a value back to the default: the restart takes nothing over" '! grep -q "new download" <<< "$out" && grep -q "Configuration reloaded" <<< "$out" && grep -qxF "INSTALL_NGINX_PROXY_MANAGER=\"true\"" "$D/$N" && gone "$D/$N" && [ "$(cksum < "$D/.env")" = "$envW" ]'
+# the editor changed the file of a new download that had nothing to take over yet (no .env): whatever it changed,
+# the file is chosen now (here a comment outside the settings, so the section still has its published cksum)
+rm -rf "$D" "$ST"/*; mkdir -p "$D"; cp "$PUB" "$D/$N"
+printf '#!/usr/bin/env bash\nf="${@: -1}"; sed -i "s/^# Installers from before the rename/# Installers from before the Rename/" "$f"\n' > "$T/bin/ed-outside"; chmod +x "$T/bin/ed-outside"
+out="$(printf '1\ne\n\n0\n' | EDITOR=ed-outside bash "$D/$N" menu 2>&1)"
+check "the editor changed the file of a new download: the sum is gone, also when the settings are still the published ones" 'grep -q "Configuration reloaded" <<< "$out" && grep -q "^# Installers from before the Rename" "$D/$N" && [ "$(bash "$D/$N" __settings_hash)" = "$(bash "$PUB" __settings_hash)" ] && gone "$D/$N"'
+# a hand edit of a new download, then undone before anything else ran: the first start has already seen it
+wizard_installation
+setv HEALTH_TIMEOUT 900
+out="$(bash "$D/$N" credentials </dev/null 2>&1)"
+check "a hand edit of a new download: the first start ends the state (named, not taken over)" '! grep -q "new download" <<< "$out" && gone "$D/$N"'
+setv HEALTH_TIMEOUT 600
+out="$(bash "$D/$N" status </dev/null 2>&1)"
+check "...and undoing the edit does not bring it back" '! grep -q "new download" <<< "$out" && grep -qxF "TZ=\"Europe/Berlin\"" "$D/$N" && [ "$(body "$D/$N")" = "$(body "$PUB")" ]'
+# nothing to take over: the first start ends the state, every later start skips the check
+rm -rf "$D" "$ST"/*; mkdir -p "$D"; cp "$PUB" "$D/$N"
+(cd "$D" && bash "$N" generate </dev/null >/dev/null 2>&1)
+touch "$ST/up"; sed -n 's/^CATALOG_IMAGE=.*://p' "$D/.env" > "$ST/catalog_tag"; echo "8.0.4" > "$ST/mongo_version"; (cd "$D" && pwd -P) > "$ST/wd"; cp "$D/.env" "$ST/upenv"
+check "a new download in front of an installation with its defaults: still a new download before the start" '! gone "$D/$N" && [ "$(bash "$D/$N" __settings_hash)" = "$(sumline "$D/$N" | tr -d \")" ]'
+: > "$LOG"; out="$(bash "$D/$N" status </dev/null 2>&1)"; first="$(grep -c . "$LOG")"
+check "...nothing differs: said nothing, and the sum is gone" '! grep -q "new download" <<< "$out" && gone "$D/$N" && ! ls "$D/$N".bak-* >/dev/null 2>&1'
+: > "$LOG"; out="$(bash "$D/$N" status </dev/null 2>&1)"
+check "...the next start does not look for the installation's values again (fewer engine calls)" '[ "$(grep -c . "$LOG")" -lt "$first" ]'
+
+# 13. The engine does not answer at the start (stopped, the Podman machine down): it shows no containers, so the
+#     installed versions are unknown and .env alone is not the installation - nothing is taken over, the notes
+#     stay as they are, and the next start (the engine back) takes the values over
+export SHIM_TZ="Etc/UTC"
+server_state
+cp "$PUB" "$D/$N"
+mkdir -p "$T/down"; printf '#!/usr/bin/env bash\necho "Cannot connect to Podman" >&2\nexit 125\n' > "$T/down/podman"; chmod +x "$T/down/podman"
+out="$(PATH="$T/down:$PATH" bash "$D/$N" status </dev/null 2>&1)"
+check "the engine does not answer: nothing is taken over from .env alone, the file stays a new download" '! grep -q "new download" <<< "$out" && cmp -s "$D/$N" "$PUB" && [ "$(cksum < "$D/.env")" = "$envA" ]'
+out="$(bash "$D/$N" status </dev/null 2>&1)"
+check "...the engine back: the next start takes the values over, the versions from the containers (26.3, not .env's 25.4)" 'said && grep -q "^   CATALOG_WEB_PORT  *8080 -> 8181$" <<< "$out" && ! grep -q "^   CATALOG_VERSION" <<< "$out" && grep -qxF "CATALOG_WEB_PORT=\"8181\"" "$D/$N" && grep -qxF "CATALOG_VERSION=\"26.3.4789.148\"" "$D/$N"'
+
+# 14. A leftover installation is no installation: after option 99 (or R) .env and docker-compose.yml are still
+#     there, but no container and no data volume - the installer a new download then makes starts a new
+#     installation with its own defaults (the newest Catalog), it takes nothing over. The data volumes alone
+#     (containers removed, option 13) are an installation. And .env and the compose file must be a Catalog's.
+export SHIM_TZ="Europe/Berlin"
+setup
+cp "$PUB" "$D/$N"
+rm -f "$ST/up" "$ST/exited" "$ST/wd"
+: > "$LOG"
+out="$(bash "$D/$N" status </dev/null 2>&1)"
+check "after a reset (files left, no container, no data volume): a new download takes nothing over" '! grep -q "new download" <<< "$out" && cmp -s "$D/$N" "$PUB" && ! ls "$D/$N".bak-* >/dev/null 2>&1'
+out="$(bash "$D/$N" generate </dev/null 2>&1)"; rc=$?
+check "...and 'generate' writes the newest Catalog of the download, not the removed 25.4" '[ "$rc" -eq 0 ] && grep -qx "CATALOG_IMAGE=raynetgmbh/rayventory-catalog:26.3.4789.148" "$D/.env" && ! grep -q "25.4.4191.133" "$D/.env"'
+setup
+cp "$PUB" "$D/$N"
+rm -f "$ST/up" "$ST/exited"
+out="$(bash "$D/$N" status </dev/null 2>&1)"
+check "containers removed, the data volumes kept (option 13): an installation - the versions of .env taken over" 'said && grep -q "^   CATALOG_VERSION  *26.3.4789.148 -> 25.4.4191.133$" <<< "$out" && grep -qxF "CATALOG_VERSION=\"25.4.4191.133\"" "$D/$N"'
+setup
+cp "$PUB" "$D/$N"
+printf 'COMPOSE_PROJECT_NAME=wiki\nTZ=UTC\nLOG_LEVEL_DEFAULT=Debug\nQUEUE_PREFIX=wikiq\nDB_PASSWORD=secret\n' > "$D/.env"
+printf 'services:\n  wiki:\n    image: ghcr.io/example/wiki:2.5\n    env_file: .env\n' > "$D/docker-compose.yml"
+out="$(bash "$D/$N" status </dev/null 2>&1)"
+check "another application's .env and compose file next to volumes of this project: not a Catalog's, nothing taken over" '! grep -q "new download" <<< "$out" && cmp -s "$D/$N" "$PUB" && ! grep -q "^COMPOSE_PROJECT_NAME=\"wiki\"" "$D/$N"'
+
+# 15. .env names another Catalog than the one that runs, and no backup of .env names the one that runs (one generate
+#     so far, then .env edited by hand): only the versions of the containers would be known. Nothing is taken over -
+#     the new download behaves as it did without the take-over: the note, option 23, and a generate that writes
+#     nothing (it would put the defaults over every other value of .env)
+export SHIM_TZ="Europe/Berlin"
+edited_installation CATALOG_VERSION 25.4.4191.133 CATALOG_WEB_PORT 9393 TZ Europe/Istanbul
+sed -i 's/^CATALOG_IMAGE=\(.*\):.*/CATALOG_IMAGE=\1:26.3.4789.148/; s/^CATALOG_WORKER_IMAGE=\(.*\):.*/CATALOG_WORKER_IMAGE=\1:26.3.4789.148/' "$D/.env"
+envD="$(cksum < "$D/.env")"
+cp "$PUB" "$D/$N"
+out="$(bash "$D/$N" generate </dev/null 2>&1)"; rc=$?
+check "no backup of .env names the installed Catalog: nothing taken over, generate writes nothing (rc 1, as before the take-over)" '[ "$rc" -eq 1 ] && ! said && grep -q "Nothing was written" <<< "$out" && [ "$(cksum < "$D/.env")" = "$envD" ] && [ "$(body "$D/$N")" = "$(body "$PUB")" ] && ! ls "$D/$N".bak-* >/dev/null 2>&1'
+out="$(bash "$D/$N" status </dev/null 2>&1)"
+check "...the state is over for good (no check at the next start) and the note names the way out" '! said && gone "$D/$N" && grep -q "The files say Catalog 26.3.4789.148, 25.4.4191.133 is installed" <<< "$out"'
+
+# 16. .env saved with Windows line endings (CRLF): its values are read as they are written. The Catalog it names is
+#     the one that runs, so it - not an older backup of it - is where the other values come from
+installation26
+sed 's/^CATALOG_WEB_PORT=.*/CATALOG_WEB_PORT=7070/; s#^TZ=.*#TZ=Asia/Tokyo#' "$D/.env" > "$D/.env.bak-20260101-000000"
+sed -i 's/$/\r/' "$D/.env"
+cp "$PUB" "$D/$N"
+out="$(bash "$D/$N" status </dev/null 2>&1)"
+check "CRLF in .env: the take-over reads .env, not an older backup that happens to name the same Catalog" 'said && grep -q "^   CATALOG_WEB_PORT  *8080 -> 8181$" <<< "$out" && ! grep -q -e "7070" -e "Asia/Tokyo" -e "newest backup" <<< "$out" && grep -qxF "CATALOG_WEB_PORT=\"8181\"" "$D/$N" && grep -qxF "TZ=\"Etc/UTC\"" "$D/$N"'
+
+# 17. A take-over that cannot be done is said once and not tried again: a value of .env that makes the settings fail
+#     together (the port of catalog-web 9001 is MinIO's too) rolls everything back - no backup of the installer is
+#     left, the state of a new download is over, the notes stay. A value that does not fit its own setting (yes for
+#     a true/false) is named and skipped; the others are taken over.
+edited_installation TZ Europe/Istanbul
+sed -i 's/^CATALOG_WEB_PORT=.*/CATALOG_WEB_PORT=9001/' "$D/.env"
+envG="$(cksum < "$D/.env")"
+cp "$PUB" "$D/$N"
+out="$(bash "$D/$N" status </dev/null 2>&1)"
+check "values that do not work together: said, nothing taken over, no backup of the installer left" 'grep -q "used by more than one setting" <<< "$out" && grep -q "nothing was taken over" <<< "$out" && ! grep -q "Taken over" <<< "$out" && [ "$(body "$D/$N")" = "$(body "$PUB")" ] && ! ls "$D/$N".bak-* >/dev/null 2>&1 && [ "$(cksum < "$D/.env")" = "$envG" ]'
+check "...and the state of a new download is over (no second try)" 'gone "$D/$N"'
+sleep 1
+out="$(bash "$D/$N" status </dev/null 2>&1)"
+check "...the next start repeats nothing and leaves no backup; the note names the values" '! grep -q -e "new download" -e "used by more than one setting" <<< "$out" && ! ls "$D/$N".bak-* >/dev/null 2>&1 && grep -q "The settings differ from the installation in" <<< "$out"'
+edited_installation TZ Europe/Istanbul
+sed -i 's/^INSTALL_NGINX_PROXY_MANAGER=.*/INSTALL_NGINX_PROXY_MANAGER=yes/' "$D/.env"
+envG="$(cksum < "$D/.env")"
+cp "$PUB" "$D/$N"
+out="$(bash "$D/$N" status </dev/null 2>&1)"
+check "a value that does not fit its setting (yes): named and skipped, the others taken over - and 'taken over' only after it worked" 'said && grep -q "^   TZ  *Europe/Berlin -> Europe/Istanbul$" <<< "$out" && ! grep -q "^   INSTALL_NGINX_PROXY_MANAGER" <<< "$out" && grep -q "Not taken over:.*INSTALL_NGINX_PROXY_MANAGER" <<< "$out" && grep -qxF "TZ=\"Europe/Istanbul\"" "$D/$N" && grep -qxF "INSTALL_NGINX_PROXY_MANAGER=\"true\"" "$D/$N" && [ "$(cksum < "$D/.env")" = "$envG" ]'
+
+# 18. The internet proxy, the company certificate and the cache of MongoDB: .env holds them as RN1_HTTPS_PROXY,
+#     RN1_NO_PROXY, the bundle in the compose file and MONGO_WT_CACHE_GB - none of them the name of a setting - so
+#     they are taken over too (the login stays in .proxy_login, never in the script), else the next generate drops
+#     them. What cannot be taken over safely is named.
+export SHIM_TZ="Europe/Berlin"
+proxy_lines() { grep -c '^RN1_.*PROXY=' "$D/.env"; }
+compose_proxy() { grep -c 'HTTPS_PROXY: "${RN1_HTTPS_PROXY}"' "$D/docker-compose.yml"; }
+edited_installation INTERNET_PROXY "http://proxy.example.com:3128" INTERNET_NO_PROXY "corp.example.com" TZ Europe/Istanbul
+check "the installation goes out through a proxy (3 lines in .env, catalog-web and Nginx Proxy Manager in the compose file)" '[ "$(proxy_lines)" -eq 3 ] && [ "$(compose_proxy)" -eq 2 ]'
+envP="$(grep '^RN1_' "$D/.env" | cksum)"; composeP="$(cksum < "$D/docker-compose.yml")"
+cp "$PUB" "$D/$N"
+out="$(bash "$D/$N" generate </dev/null 2>&1)"; rc=$?
+check "proxy: taken over with its internal names, shown in the table" 'said && grep -q "^   INTERNET_PROXY  *(empty) -> http://proxy.example.com:3128$" <<< "$out" && grep -q "^   INTERNET_NO_PROXY  *(empty) -> corp.example.com$" <<< "$out" && grep -qxF "INTERNET_PROXY=\"http://proxy.example.com:3128\"" "$D/$N" && grep -qxF "INTERNET_NO_PROXY=\"corp.example.com\"" "$D/$N"'
+check "...and the next generate writes the same proxy into .env and the compose file" '[ "$rc" -eq 0 ] && [ "$(proxy_lines)" -eq 3 ] && [ "$(compose_proxy)" -eq 2 ] && [ "$(grep "^RN1_" "$D/.env" | cksum)" = "$envP" ] && [ "$(cksum < "$D/docker-compose.yml")" = "$composeP" ]'
+# the login of the proxy: in .env and .proxy_login, never in the script
+EI_HOOK='printf "proxy=http://proxy.example.com:3128\nuser:p%%40ss\n" > "$D/.proxy_login"; chmod 600 "$D/.proxy_login"'
+edited_installation INTERNET_PROXY "http://proxy.example.com:3128" TZ Europe/Istanbul
+EI_HOOK=""
+loginP="$(cksum < "$D/.proxy_login")"; envP="$(grep '^RN1_' "$D/.env" | cksum)"
+cp "$PUB" "$D/$N"
+out="$(bash "$D/$N" generate </dev/null 2>&1)"; rc=$?
+check "proxy with a login: the address taken over, the login not (not in the script, its backups, the table)" '[ "$rc" -eq 0 ] && grep -q "^   INTERNET_PROXY  *(empty) -> http://proxy.example.com:3128$" <<< "$out" && grep -q "user:p%40ss" "$D/.env" && ! grep -qF -e "p%40ss" -e "p@ss" "$D/$N" "$D/$N".bak-* && ! grep -qF -e "p%40ss" -e "p@ss" <<< "$out"'
+check "...the login file stays as it was (mode 600) and the next generate writes the same login into .env" '[ "$(cksum < "$D/.proxy_login")" = "$loginP" ] && [ "$(stat -c %a "$D/.proxy_login")" = 600 ] && [ "$(grep "^RN1_" "$D/.env" | cksum)" = "$envP" ]'
+rm -f "$D/.proxy_login"; cp "$PUB" "$D/$N"; rm -f "$D/$N".bak-*
+out="$(bash "$D/$N" generate </dev/null 2>&1)"; rc=$?
+check "...a lost .proxy_login is written again from .env (mode 600), the script still has no login" '[ "$rc" -eq 0 ] && [ "$(cksum < "$D/.proxy_login")" = "$loginP" ] && [ "$(stat -c %a "$D/.proxy_login")" = 600 ] && grep -q "Its proxy login is kept in .proxy_login (mode 600)" <<< "$out" && ! grep -qF -e "p%40ss" -e "p@ss" "$D/$N" "$D/$N".bak-* && [ "$(grep "^RN1_" "$D/.env" | cksum)" = "$envP" ]'
+# the company certificate
+EI_HOOK='printf -- "-----BEGIN CERTIFICATE-----\nMIIBtest\n-----END CERTIFICATE-----\n" > "$D/proxy-ca.pem"'
+edited_installation INTERNET_PROXY "http://proxy.example.com:3128" INTERNET_PROXY_CA_FILE "$D/proxy-ca.pem" TZ Europe/Istanbul
+EI_HOOK=""
+composeP="$(cksum < "$D/docker-compose.yml")"
+cp "$PUB" "$D/$N"
+out="$(bash "$D/$N" generate </dev/null 2>&1)"; rc=$?
+check "company certificate: INTERNET_PROXY_CA_FILE taken over, the compose file keeps its mount" '[ "$rc" -eq 0 ] && grep -q "^   INTERNET_PROXY_CA_FILE  *(empty) -> $D/proxy-ca.pem$" <<< "$out" && grep -qxF "INTERNET_PROXY_CA_FILE=\"$D/proxy-ca.pem\"" "$D/$N" && grep -q "proxy-ca-bundle.pem" "$D/docker-compose.yml" && [ "$(cksum < "$D/docker-compose.yml")" = "$composeP" ]'
+# the cache of MongoDB
+edited_installation MONGO_CACHE_GB 4
+check "the installation has a cache of 4 GB (the automatic one is 11 GB for the 32 GB of the fake engine)" 'grep -qx "MONGO_WT_CACHE_GB=4" "$D/.env"'
+cp "$PUB" "$D/$N"
+out="$(bash "$D/$N" generate </dev/null 2>&1)"; rc=$?
+check "cache of MongoDB: a value that is not the automatic one is taken over as MONGO_CACHE_GB, and generate keeps it" '[ "$rc" -eq 0 ] && grep -q "^   MONGO_CACHE_GB  *(empty) -> 4$" <<< "$out" && grep -qxF "MONGO_CACHE_GB=\"4\"" "$D/$N" && grep -qx "MONGO_WT_CACHE_GB=4" "$D/.env"'
+edited_installation TZ Europe/Istanbul
+cp "$PUB" "$D/$N"
+out="$(bash "$D/$N" status </dev/null 2>&1)"
+check "...the automatic cache (11 GB) is no setting: not taken over" 'said && ! grep -q "MONGO_CACHE_GB" <<< "$out" && grep -qxF "MONGO_CACHE_GB=\"\"" "$D/$N"'
+# what cannot be taken over is named
+edited_installation TZ Europe/Istanbul
+printf "RN1_HTTPS_PROXY='ftp://proxy.example.com:21'\n" >> "$D/.env"
+cp "$PUB" "$D/$N"
+out="$(bash "$D/$N" status </dev/null 2>&1)"
+check "a proxy address that is none (ftp://): named as not taken over, the rest taken over" 'said && grep -q "^   TZ  *Europe/Berlin -> Europe/Istanbul$" <<< "$out" && grep -q "Not taken over: INTERNET_PROXY \"ftp://proxy.example.com:21\" - not a proxy address with a port" <<< "$out" && grep -qxF "INTERNET_PROXY=\"\"" "$D/$N"'
+edited_installation
+printf "RN1_HTTPS_PROXY='socks4://proxy.example.com:1080'\n" >> "$D/.env"
+cp "$PUB" "$D/$N"
+out="$(bash "$D/$N" status </dev/null 2>&1)"
+check "...when nothing else differs it is said as well, and the state of a new download is over" 'grep -q "^ here has other values, but none of them could be taken over:$" <<< "$out" && grep -q "Not taken over: INTERNET_PROXY \"socks4://proxy.example.com:1080\"" <<< "$out" && gone "$D/$N" && ! ls "$D/$N".bak-* >/dev/null 2>&1'
+
+# 19. The report of the automatic take-over goes to stderr for every command (what they print on stdout is read by
+#     scripts and written to files); in the menu it is part of the screen. The pause before the menu is only
+#     for a terminal: on a pipe it would take a line of input the menu is meant to read.
+export SHIM_TZ="Europe/Istanbul"
+for c in credentials info versions; do
+  wizard_installation
+  bash "$D/$N" $c </dev/null > "$T/$c.out" 2> "$T/$c.err"
+  check "$c: the report is on stderr, stdout starts with the command's own output" 'grep -q "^ This installer is a new download with its default settings; the installation$" "$T/$c.err" && grep -q "^   TZ  *Europe/Berlin -> Europe/Istanbul$" "$T/$c.err" && ! grep -q -e "new download" -e " -> " "$T/$c.out" && [ -s "$T/$c.out" ] && written'
+done
+wizard_installation
+out="$(printf 'x\n0\n' | bash "$D/$N" menu 2>&1)"
+check "menu on a pipe: no pause, so the first line of input is the menu's (Unknown option: x)" 'said && grep -q "Unknown option: x" <<< "$out" && ! grep -q "Press Enter to open the menu" <<< "$out"'
+
+# 21. The pause before the menu exists only in a terminal (a pipe has no prompt to show), so a test in a terminal is the
+#     one that sees it: shown after the take-over said something, absent when nothing differs
+default_installation() {
+  rm -rf "$D" "$ST"/*; mkdir -p "$D"; cp "$PUB" "$D/$N"
+  (cd "$D" && bash "$N" generate </dev/null >/dev/null 2>&1)
+  touch "$ST/up"; sed -n 's/^CATALOG_IMAGE=.*://p' "$D/.env" > "$ST/catalog_tag"; echo "8.0.4" > "$ST/mongo_version"
+  (cd "$D" && pwd -P) > "$ST/wd"; cp "$D/.env" "$ST/upenv"; : > "$LOG"
+}
+if command -v script >/dev/null 2>&1 && [ "$(uname -s)" = "Linux" ]; then
+  # tty_run COMMAND [PATTERN KEYS]... -> runs COMMAND in a pseudo-terminal in $D: waits for each PATTERN in what the
+  # terminal shows after the keys before, then types its KEYS; prints what the terminal showed
+  tty_run() {
+    local cmd="$1" log="$T/tty.log" i from=1
+    shift
+    : > "$log"
+    { while [ $# -ge 2 ]; do
+        for i in $(seq 1 120); do tail -c +"$from" "$log" 2>/dev/null | grep -aq -- "$1" && break; sleep 0.5; done
+        sleep 0.5
+        from=$(($(wc -c < "$log") + 1))
+        printf "$2"
+        shift 2
+      done
+      for i in $(seq 1 120); do grep -aq TTY-END "$log" 2>/dev/null && break; sleep 0.5; done
+    } | TERM=dumb NO_COLOR=1 timeout 150 script -qfec "stty sane; cd $D && $cmd; echo TTY-END" /dev/null > "$log" 2>&1
+    tr -d '\r' < "$log"
+  }
+  wizard_installation
+  out="$(tty_run "bash $N" "Press Enter to open the menu" '\n' "Select an option" '0\n')"
+  check "terminal: the take-over is shown, then the pause, then the menu" 'said && table3 && grep -q "Press Enter to open the menu\.\.\." <<< "$out" && [ "$(line "This installer is a new download")" -lt "$(line "Press Enter to open the menu")" ] && [ "$(line "Press Enter to open the menu")" -lt "$(line "Select an option")" ] && grep -q TTY-END <<< "$out"'
+  default_installation
+  out="$(tty_run "bash $N" "Select an option" '0\n')"
+  check "terminal: nothing to take over - no pause, the menu opens at once" '! said && ! grep -q "Press Enter to open the menu" <<< "$out" && grep -q "Select an option" <<< "$out" && grep -q TTY-END <<< "$out"'
+else
+  echo "SKIP: script (util-linux) missing - no terminal test of the pause before the menu"
+fi
+
 check "no Podman, Compose or systemctl call the fakes do not know" '[ ! -s "$UNH" ] || { cat "$UNH"; false; }'
 
 echo "== $PASS passed, $FAIL failed"

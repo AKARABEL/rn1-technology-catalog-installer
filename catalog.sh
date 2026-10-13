@@ -230,6 +230,18 @@ LOG_LEVEL_DEFAULT="Information"
 # DO NOT CHANGE ANYTHING BELOW
 ###############################################################################
 
+# The settings section above as published, by its cksum ("CRC BYTES" of the lines from '# CONFIGURE ONLY THIS
+# SECTION' to '# DO NOT CHANGE ANYTHING BELOW', each with its newline - settings_sum). While the line below
+# has it and the section still has it, the settings are the defaults of a new download (settings_pristine),
+# which takes the values of an installation in its folder over by itself. That state is one way: the first
+# time a start finds the section changed, a check finds nothing to take over, or the installer writes a
+# setting into this file (settings_unpublish), the value goes - SETTINGS_PUBLISHED_SUM="" - and a section
+# that was put back to the defaults by hand is no new download again. A self-update brings the value of the new
+# version only into a file that is still a new download and stays one. After a change of the section the
+# maintainer sets the new value (tests/check_settings_hash.sh fails until then):
+# sed -i "s/^SETTINGS_PUBLISHED_SUM=.*/SETTINGS_PUBLISHED_SUM=\"$(bash rn1-technology-catalog-installer.sh __settings_hash)\"/" rn1-technology-catalog-installer.sh && cp rn1-technology-catalog-installer.sh catalog.sh
+SETTINGS_PUBLISHED_SUM="1427209992 2773"
+
 OS_KIND="$(uname -s 2>/dev/null || echo Linux)"
 # macOS: the script uses GNU date, sed, stat, readlink ... (brew install coreutils gnu-sed grep findutils);
 # a gnubin folder already on the PATH keeps its place
@@ -352,11 +364,12 @@ rand32() {
   printf '%s' "$v"
 }
 
-# Value of KEY in the generated env file (empty if missing).
+# Value of KEY in the generated env file (empty if missing). A .env saved with Windows line endings (CRLF) reads
+# like one without: Docker Compose does not take the carriage return into the value either.
 env_value() {
   local key="$1"
   if [ -f "$ENV_FILE" ]; then
-    sed -n "s/^${key}=//p" "$ENV_FILE" | tail -n 1
+    sed -n "s/^${key}=//p" "$ENV_FILE" | tail -n 1 | tr -d '\r'
   fi
 }
 
@@ -3171,6 +3184,69 @@ settings_section() {
   awk '/^# CONFIGURE ONLY THIS SECTION/ { s = 1 } s { print } s && /^# DO NOT CHANGE ANYTHING BELOW/ { e = 1; exit } END { exit !e }' "$1" 2>/dev/null
 }
 
+# settings_sum FILE -> "CRC BYTES": cksum of the settings section of FILE, the lines settings_section prints
+# (from '# CONFIGURE ONLY THIS SECTION' to '# DO NOT CHANGE ANYTHING BELOW', each with its newline). Fails
+# when the section is damaged.
+settings_sum() {
+  local sec sum crc bytes
+  sec="$(settings_section "$1")" || return 1
+  sum="$(printf '%s\n' "$sec" | cksum)" || return 1
+  read -r crc bytes <<< "$sum"
+  printf '%s %s' "$crc" "$bytes"
+}
+
+# settings_published FILE -> the SETTINGS_PUBLISHED_SUM value FILE holds ("CRC BYTES"; empty: none, or gone)
+settings_published() {
+  awk -F'"' '/^SETTINGS_PUBLISHED_SUM="[0-9]+ [0-9]+"$/ { print $2; exit }' "$1" 2>/dev/null || true
+}
+
+# settings_pristine [FILE] -> true when the settings of FILE (default: this installer) are as published: the
+# SETTINGS_PUBLISHED_SUM it holds (read from the file, which the installer changes while it runs) is the cksum
+# of its settings section. A new download is; any change of a setting, by the installer or by hand, ends it -
+# for good: settings_unpublish. An installer without the constant (an older version) never is.
+settings_pristine() {
+  local file="${1:-$SCRIPT_PATH}" want have
+  if [ -z "$file" ] || [ ! -r "$file" ]; then
+    return 1
+  fi
+  want="$(settings_published "$file")"
+  [ -n "$want" ] && have="$(settings_sum "$file")" && [ "$have" = "$want" ]
+}
+
+# settings_set_sum FILE VALUE -> the SETTINGS_PUBLISHED_SUM line of FILE with VALUE (empty: gone). Nothing
+# when FILE has no such line. The content is written back, so owner and mode stay.
+settings_set_sum() {
+  local file="$1" value="$2" tmp
+  if ! grep -q '^SETTINGS_PUBLISHED_SUM="' "$file" 2>/dev/null; then
+    return 0
+  fi
+  tmp="$(mktemp)" || return 1
+  if ! SUM_VALUE="$value" awk '/^SETTINGS_PUBLISHED_SUM="/ { print "SETTINGS_PUBLISHED_SUM=\"" ENVIRON["SUM_VALUE"] "\""; next } { print }' "$file" > "$tmp" \
+    || ! cat -- "$tmp" > "$file"; then
+    rm -f -- "$tmp"
+    return 1
+  fi
+  rm -f -- "$tmp"
+}
+
+# settings_unpublish [FILE] -> the settings of FILE (default: this installer) are no new download's any more:
+# its SETTINGS_PUBLISHED_SUM is blank, in the file and in this run. The installer calls it whenever it writes
+# a setting into the file (set_setting), when a start finds the section changed or has nothing to take over,
+# and after the editor. Values put back to the published ones later - by the installer or by hand - make no
+# new download again, and the installation's values are never taken over against a choice.
+settings_unpublish() {
+  local file="${1:-$SCRIPT_PATH}"
+  if [ -z "$file" ] || [ ! -f "$file" ]; then
+    return 0
+  fi
+  if [ "$file" = "$SCRIPT_PATH" ]; then
+    SETTINGS_PUBLISHED_SUM=""
+  fi
+  if [ -n "$(settings_published "$file")" ] && [ -w "$file" ]; then
+    settings_set_sum "$file" "" || true
+  fi
+}
+
 # NAME|VALUE for every setting of FILE, with the values bash reads (quotes, escapes and comments
 # handled by bash itself; a later assignment wins). Fails when the settings section is damaged.
 settings_pairs() {
@@ -3226,6 +3302,7 @@ set_setting() {
       BEGIN { n = ENVIRON["SET_NAME"]; v = ENVIRON["SET_VALUE"]; marked = ENVIRON["SET_MARKED"] + 0 }
       /^# CONFIGURE ONLY THIS SECTION/ { insec = 1 }
       /^# DO NOT CHANGE ANYTHING BELOW/ { insec = 0 }
+      !insec && /^SETTINGS_PUBLISHED_SUM="/ { print "SETTINGS_PUBLISHED_SUM=\"\""; next }
       marked && insec && index($0, n "=") == 1 { print n "=\"" v "\""; done = 1; next }
       !marked && !done && index($0, n "=\"") == 1 { print n "=\"" v "\""; done = 1; next }
       { print }
@@ -3241,6 +3318,10 @@ set_setting() {
     return 1
   fi
   rm -f -- "$tmp"
+  # a setting written by the installer is no published default any more (the awk pass blanked the sum)
+  if [ "$file" = "$SCRIPT_PATH" ]; then
+    SETTINGS_PUBLISHED_SUM=""
+  fi
 }
 
 # Prints the newest versions (at most 4), numbered when $1 is "numbered".
@@ -8242,27 +8323,30 @@ install_values() {
   fi
 }
 
-# Takes the values of the installation in this folder over into the settings (after a new download of
-# the installer, for example): the table first, then all at once, with a backup of the installer. .env,
-# docker-compose.yml and the containers stay; when the files name an older Catalog than the one that
-# is installed, it then offers to put back their backups that belong to it. install_takeover [interactive|cli]
-install_takeover() {
-  local mode="${1:-interactive}" src name ours value spec run files stamp cbak
-  local -a diffs=() specs=()
+# The values of the installation in this folder that the settings would change: INSTALL_DIFFS
+# (NAME|OURS|THEIRS) and INSTALL_SPECS (NAME|THEIRS, for set_settings_atomic), from INSTALL_SRC, the env
+# file of the installation (install_env; empty: only the versions of the containers are known)
+INSTALL_SRC=""
+INSTALL_DIFFS=()
+INSTALL_SPECS=()
+# NAME|VALUE|REASON of the values the automatic take-over names and leaves alone (install_diffs auto): a value
+# its setting does not accept, a value that cannot be taken over safely
+INSTALL_NOT=()
+install_diffs() {
+  local auto="${1:-}" name ours value problem
   local -A theirs=()
-  if [ -z "$SCRIPT_PATH" ] || [ ! -w "$SCRIPT_PATH" ]; then
-    err "Cannot change ${SCRIPT_PATH:-the installer} (not a writable file)."
-    return 1
-  fi
-  src="$(install_env)"
+  INSTALL_DIFFS=()
+  INSTALL_SPECS=()
+  INSTALL_NOT=()
+  INSTALL_SRC="$(install_env)"
   while IFS='|' read -r name value; do
     if [ -n "$name" ]; then
       theirs["$name"]="$value"
     fi
-  done <<< "$(install_values "$src")"
+  done <<< "$(install_values "$INSTALL_SRC")"
   # the env file of an older installer has no host name: catalog-web runs with its container ID, to which a
   # license may be bound - the name of the current .env (not the installation's) would end it
-  if [ "$src" != "$ENV_FILE" ] && [ -z "${theirs[CATALOG_HOSTNAME]+set}" ]; then
+  if [ "$INSTALL_SRC" != "$ENV_FILE" ] && [ -z "${theirs[CATALOG_HOSTNAME]+set}" ]; then
     value="$(license_kept_hostname "$(project_volumes)")" || value=""
     if [ -n "$value" ]; then
       theirs[CATALOG_HOSTNAME]="$value"
@@ -8270,54 +8354,249 @@ install_takeover() {
   fi
   while IFS='|' read -r name ours; do
     if [ -n "$name" ] && [ -n "${theirs[$name]+set}" ] && install_differs "$name" "$ours" "${theirs[$name]}"; then
-      diffs+=("$name|$ours|${theirs[$name]}")
-      specs+=("$name|${theirs[$name]}")
+      # the automatic take-over writes only what its setting accepts, and names the rest
+      if [ -n "$auto" ] && ! problem="$(settings_check "$name" "${theirs[$name]}" "$ours")"; then
+        INSTALL_NOT+=("$name|${theirs[$name]}|$problem")
+        continue
+      fi
+      INSTALL_DIFFS+=("$name|$ours|${theirs[$name]}")
+      INSTALL_SPECS+=("$name|${theirs[$name]}")
     fi
   done <<< "$(settings_pairs "$SCRIPT_PATH")"
+  if [ -n "$auto" ]; then
+    install_extras
+  fi
+}
+
+# install_extra NAME OURS VALUE -> the value joins the take-over (INSTALL_DIFFS and INSTALL_SPECS)
+install_extra() {
+  INSTALL_DIFFS+=("$1|$2|$3")
+  INSTALL_SPECS+=("$1|$3")
+}
+
+# install_no_proxy ENV-FILE -> the internal names of INTERNET_NO_PROXY, read back from the NO_PROXY of the
+# containers in ENV-FILE (RN1_NO_PROXY, see net_no_proxy_containers): without what the installer adds by itself
+# (localhost, the services of the stack, this server, its host name, the domain, the private ranges), and each
+# name once that stands there as name and .name
+install_no_proxy() {
+  local list fixed item out="" rest
+  local -a items=()
+  list="$(env_unquote "$(env_file_value RN1_NO_PROXY "$1")")"
+  fixed=",localhost,127.0.0.1,::1,mongo,minio,rabbitmq,opensearch,opensearch-dashboards,catalog-web,nginx-proxy-manager,worker-recognition-1,worker-recognition-2,worker-other,worker-search,host.docker.internal,host.containers.internal,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,"
+  for item in $(net_server_names) "$(env_unquote "$(env_file_value CATALOG_HOSTNAME "$1")")" "$(env_unquote "$(env_file_value CATALOG_DOMAIN "$1")")" "$(net_host_addr)" "$(net_cloud_internal)"; do
+    if [ -n "$item" ]; then
+      fixed="$fixed${item,,},"
+    fi
+  done
+  IFS=',' read -r -a items <<< "$list"
+  rest=","
+  for item in ${items[@]+"${items[@]}"}; do
+    item="${item//[[:space:]]/}"
+    if [ -n "$item" ] && [[ "$fixed" != *",${item,,},"* ]] && [[ "$rest" != *",$item,"* ]]; then
+      rest="$rest$item,"
+    fi
+  done
+  IFS=',' read -r -a items <<< "${rest#,}"
+  for item in ${items[@]+"${items[@]}"}; do
+    case "$item" in
+      "") ;;
+      .*) if [[ "$rest" != *",${item#.},"* ]]; then out="$out,$item"; fi ;;
+      *) out="$out,$item" ;;
+    esac
+  done
+  printf '%s' "${out#,}"
+}
+
+# What the automatic take-over takes over besides the settings .env names itself (INSTALL_SRC): the internet
+# proxy (.env holds it as RN1_HTTPS_PROXY and RN1_NO_PROXY, which are no setting names, so the next generate
+# would write none of it), the company certificate, and the cache of MongoDB (MONGO_WT_CACHE_GB, derived from
+# MONGO_CACHE_GB or the memory: taken as MONGO_CACHE_GB when it is not the automatic value). The proxy the way
+# net_adopt takes it from another folder: its address without the login, which stays in .proxy_login (INSTALL_LOGIN,
+# written after the take-over only when that file is missing) and never goes into the script. Whatever cannot be
+# taken over safely is named (INSTALL_NOT).
+INSTALL_LOGIN=""
+install_extras() {
+  local src="$INSTALL_SRC" v p no cache auto_cache problem
+  INSTALL_LOGIN=""
+  if [ -z "$src" ]; then
+    return 0
+  fi
+  if [ -z "$INTERNET_PROXY" ]; then
+    v="$(env_unquote "$(env_file_value RN1_HTTPS_PROXY "$src")")"
+    if [ -n "$v" ]; then
+      if net_parse "$v" && [ -n "$NP_PORT" ]; then
+        INSTALL_LOGIN="$NP_LOGIN"
+        case "$NP_HOST" in
+          host.docker.internal|host.containers.internal) NP_HOST="127.0.0.1" ;;
+        esac
+        p="$NP_SCHEME://$NP_HOST:$NP_PORT"
+        if problem="$(settings_check INTERNET_PROXY "$p" "")"; then
+          install_extra INTERNET_PROXY "" "$p"
+          no="$(install_no_proxy "$src")"
+          if [ -n "$no" ] && [ -z "$INTERNET_NO_PROXY" ]; then
+            if problem="$(settings_check INTERNET_NO_PROXY "$no" "")"; then
+              install_extra INTERNET_NO_PROXY "" "$no"
+            else
+              INSTALL_NOT+=("INTERNET_NO_PROXY|$no|$problem")
+            fi
+          fi
+        else
+          INSTALL_LOGIN=""
+          INSTALL_NOT+=("INTERNET_PROXY|$(net_mask "$v")|$problem")
+        fi
+      else
+        INSTALL_NOT+=("INTERNET_PROXY|$(net_mask "$v")|not a proxy address with a port (scheme://host:port)")
+      fi
+    fi
+  fi
+  # the company certificate: the installation mounts the bundle that is made of it
+  if [ -z "$INTERNET_PROXY_CA_FILE" ] && grep -q "$(basename -- "$PROXY_CA_BUNDLE"):$NET_CA_MOUNT" "$COMPOSE_FILE" 2>/dev/null; then
+    if problem="$(settings_check INTERNET_PROXY_CA_FILE "$PROXY_CA_COPY" "")"; then
+      install_extra INTERNET_PROXY_CA_FILE "" "$PROXY_CA_COPY"
+    else
+      INSTALL_NOT+=("INTERNET_PROXY_CA_FILE|$PROXY_CA_COPY|$problem")
+    fi
+  fi
+  # the cache of MongoDB: install_differs leaves it out for option 23 (an automatic value is no setting); here
+  # only one that is not the automatic one - which option 1 would have set as MONGO_CACHE_GB - is taken over
+  cache="$(env_unquote "$(env_file_value MONGO_WT_CACHE_GB "$src")")"
+  if [ -n "$cache" ] && [ -z "${MONGO_CACHE_GB:-}" ] && mongo_cache_valid "$cache"; then
+    auto_cache="$(mongo_cache_gb)"
+    if [ -z "$auto_cache" ]; then
+      INSTALL_NOT+=("MONGO_CACHE_GB|$cache|the memory of $ENGINE_NAME is unknown, so it is not known whether this is the automatic cache")
+    elif [ "$cache" != "$auto_cache" ]; then
+      install_extra MONGO_CACHE_GB "" "$cache"
+    fi
+  fi
+}
+
+# What the automatic take-over names and leaves alone (INSTALL_NOT), one line each
+install_not_lines() {
+  local spec name value reason
+  for spec in ${INSTALL_NOT[@]+"${INSTALL_NOT[@]}"}; do
+    IFS='|' read -r name value reason <<< "$spec"
+    warn "Not taken over: $name \"$value\" - $reason"
+  done
+}
+
+# The table of the values install_takeover takes over (INSTALL_DIFFS): setting, its value, the installation's
+# value, where they come from, and what is left alone. The automatic take-over (auto) shows it after it worked.
+# install_table "" | auto RUN FILES
+install_table() {
+  local auto="$1" run="$2" files="$3" spec name ours value src="$INSTALL_SRC"
+  echo
+  if [ -n "$auto" ]; then
+    echo " This installer is a new download with its default settings; the installation"
+    echo " here has other values - taken over:"
+    printf '   %-30s %s\n' "" "default -> installation"
+  else
+    echo " The installation in this folder has other values than the settings of $SCRIPT_NAME:"
+    printf '   %-30s %s\n' "" "$SCRIPT_NAME -> installation"
+  fi
+  for spec in "${INSTALL_DIFFS[@]}"; do
+    IFS='|' read -r name ours value <<< "$spec"
+    printf '   %-30s %s -> %s\n' "$name" "${ours:-(empty)}" "${value:-(empty)}"
+  done
+  if [ -n "$run" ] && [ -n "$src" ]; then
+    echo " The versions are those of the containers, the other values come from $src."
+  fi
+  if [ -z "$src" ]; then
+    warn "No $ENV_FILE and no backup of it names the installed Catalog $run: only the versions are known - check the other settings (option 1)."
+  elif [ "$src" != "$ENV_FILE" ]; then
+    echo " ($ENV_FILE names Catalog $files; $src is the newest backup that names the installed $run.)"
+  fi
+  if [ -n "$src" ]; then
+    env_settings "$src" > /dev/null
+  fi
+  if [ -n "$ENV_SKIPPED" ]; then
+    warn "Not taken over (special characters):$ENV_SKIPPED"
+  fi
+  install_not_lines
+}
+
+# Takes the values of the installation in this folder over into the settings (after a new download of
+# the installer, for example): the table first, then all at once, with a backup of the installer. .env,
+# docker-compose.yml and the containers stay; when the files name an older Catalog than the one that
+# is installed, it then offers to put back their backups that belong to it. auto: a new download at its
+# start (auto_takeover, which has run install_diffs) - nothing asked before the values are written, nothing
+# said when none differs. install_takeover [interactive|cli] [auto]
+install_takeover() {
+  local mode="${1:-interactive}" auto="${2:-}" src run files stamp cbak check="" checked=""
+  local -a diffs=() specs=()
+  if [ -z "$SCRIPT_PATH" ] || [ ! -w "$SCRIPT_PATH" ]; then
+    err "Cannot change ${SCRIPT_PATH:-the installer} (not a writable file)."
+    return 1
+  fi
+  if [ -z "$auto" ]; then
+    install_diffs
+  fi
+  src="$INSTALL_SRC"
+  if [ "${#INSTALL_DIFFS[@]}" -gt 0 ]; then
+    diffs=("${INSTALL_DIFFS[@]}")
+    specs=("${INSTALL_SPECS[@]}")
+  elif [ -n "$auto" ]; then
+    return 0
+  fi
   run="$(running_catalog)"
   files="$(env_value CATALOG_IMAGE)"
   files="${files##*:}"
   if [ "${#diffs[@]}" -gt 0 ]; then
-    echo
-    echo " The installation in this folder has other values than the settings of $SCRIPT_NAME:"
-    printf '   %-30s %s\n' "" "$SCRIPT_NAME -> installation"
-    for spec in "${diffs[@]}"; do
-      IFS='|' read -r name ours value <<< "$spec"
-      printf '   %-30s %s -> %s\n' "$name" "${ours:-(empty)}" "${value:-(empty)}"
-    done
-    if [ -n "$run" ] && [ -n "$src" ]; then
-      echo " The versions are those of the containers, the other values come from $src."
+    if [ -z "$auto" ]; then
+      install_table "" "$run" "$files"
+      echo " Taking them over writes these values into $SCRIPT_NAME (its previous version is kept). $ENV_FILE, $COMPOSE_FILE and the containers stay as they are."
     fi
-    if [ -z "$src" ]; then
-      warn "No $ENV_FILE and no backup of it names the installed Catalog $run: only the versions are known - check the other settings (option 1)."
-    elif [ "$src" != "$ENV_FILE" ]; then
-      echo " ($ENV_FILE names Catalog $files; $src is the newest backup that names the installed $run.)"
-    fi
-    if [ -n "$src" ]; then
-      env_settings "$src" > /dev/null
-    fi
-    if [ -n "$ENV_SKIPPED" ]; then
-      warn "Not taken over (special characters):$ENV_SKIPPED"
-    fi
-    echo " Taking them over writes these values into $SCRIPT_NAME (its previous version is kept). $ENV_FILE, $COMPOSE_FILE and the containers stay as they are."
     if [ -n "$(job_running_ids)" ]; then
       err "Jobs are running (J) - take the values over when they are done."
       return 1
     fi
-    if [ "$mode" != "cli" ] && ! confirm "Take over the installation's values?" y; then
+    if [ -z "$auto" ] && [ "$mode" != "cli" ] && ! confirm "Take over the installation's values?" y; then
       info "Cancelled - nothing was changed."
       return 0
     fi
     if ! set_settings_atomic --keep-backup "${specs[@]}"; then
       return 1
     fi
-    if ! "$BASH" -n "$SCRIPT_PATH" || ! "$BASH" "$SCRIPT_PATH" check-settings; then
+    if [ -n "$auto" ]; then
+      # said only when it worked; the errors of the check come with the failure
+      if check="$("$BASH" -n "$SCRIPT_PATH" 2>&1 && "$BASH" "$SCRIPT_PATH" check-settings 2>&1)"; then
+        checked="yes"
+      fi
+    elif "$BASH" -n "$SCRIPT_PATH" && "$BASH" "$SCRIPT_PATH" check-settings; then
+      checked="yes"
+    fi
+    if [ "$checked" != "yes" ]; then
       cat -- "$SETTINGS_BACKUP" > "$SCRIPT_PATH"
+      rm -f -- "$SETTINGS_BACKUP"
+      SETTINGS_BACKUP=""
       reload_settings
-      err "The values of the installation do not fit the settings - nothing was changed in $SCRIPT_NAME."
+      if [ -n "$auto" ]; then
+        # one try: a take-over that does not work is not repeated at every start - the notes and option 23 stay
+        settings_unpublish
+        echo
+        echo " This installer is a new download with its default settings; the installation"
+        echo " here has other values, but they do not fit the settings - nothing was taken over:"
+        printf '%s\n' "$check" | sed 's/^/    /'
+        echo " Option 23 lists the values, option 1 changes the settings."
+      else
+        err "The values of the installation do not fit the settings - nothing was changed in $SCRIPT_NAME."
+      fi
       return 1
     fi
-    ok "Took over ${#specs[@]} value(s) of the installation (previous $SCRIPT_NAME: $SETTINGS_BACKUP)."
+    if [ -n "$auto" ]; then
+      install_table auto "$run" "$files"
+      ok "Taken over: ${#specs[@]} value(s) - $ENV_FILE, $COMPOSE_FILE and the containers stay."
+      echo "    Previous version: $(basename -- "$SETTINGS_BACKUP")"
+      # the login of the proxy is in .env (and in .proxy_login while that exists): never in the script
+      if [ -n "$INSTALL_LOGIN" ] && [ -n "$INTERNET_PROXY" ]; then
+        if [ ! -e "$PROXY_LOGIN_FILE" ] && proxy_login_save "$INSTALL_LOGIN"; then
+          echo "    Its proxy login is kept in $(basename -- "$PROXY_LOGIN_FILE") (mode 600), not in the settings."
+        elif [ -z "$(proxy_login)" ]; then
+          warn "Not taken over: the login of the proxy - $(basename -- "$PROXY_LOGIN_FILE") names another proxy; option 26 asks for it."
+        fi
+      fi
+    else
+      ok "Took over ${#specs[@]} value(s) of the installation (previous $SCRIPT_NAME: $SETTINGS_BACKUP)."
+    fi
   fi
   if [ -n "$src" ] && [ "$src" != "$ENV_FILE" ]; then
     stamp="${src#"$ENV_FILE".bak-}"
@@ -8350,6 +8629,111 @@ install_takeover() {
       info "$WORK_DIR is the folder of $SCRIPT_NAME, and its settings match the installation - there is nothing to take over here."
     fi
   fi
+}
+
+# True when .env or the compose file here are a Catalog's (CATALOG_IMAGE in .env, the Catalog image in the compose
+# file - as find_installations reads them), not another application's
+catalog_files() {
+  grep -q '^CATALOG_IMAGE=' "$ENV_FILE" 2>/dev/null || grep -q 'rayventory-catalog' "$COMPOSE_FILE" 2>/dev/null
+}
+
+# True when the engine and Compose answer about this stack (the volumes of its project, catalog-web's container
+# by exit status): the installed versions are those of the containers, and an engine that does not answer shows
+# none - running_catalog and install_data take that for 'no container' and 'perhaps data'. auto_takeover needs it.
+auto_engine_answers() {
+  engine_cli || return 1
+  "$ENGINE" volume ls -q --filter "label=com.docker.compose.project=$(stack_project)" >/dev/null 2>&1 || return 1
+  if [ -f "$COMPOSE_FILE" ]; then
+    detect_compose >/dev/null 2>&1 && compose ps -a -q catalog-web >/dev/null 2>&1
+  fi
+}
+
+# "yes" when auto_takeover said something in this run: the menu does not offer the same take-over (and the
+# putting back of the backups it asks about) a second time at its start
+AUTO_TAKEOVER_SAID=""
+
+# A new download of the installer takes the values of the installation in its folder over by itself, at its
+# start and before anything else: its settings are the published defaults (settings_pristine), which nobody
+# chose. The installation: the containers of the stack or its data volumes, with the .env of a Catalog (the
+# files alone, which option 99 or R leave, are none); its values are those option 23 takes over (install_diffs:
+# the versions of the containers, the rest from .env or the backup of .env that names the installed Catalog).
+# Settings changed on purpose - by hand, by the installer, or carried over by a self-update with other values
+# than the new defaults - are never taken over, only named (option 23 takes them over): the state of a new
+# download is one way (settings_unpublish). Another installer in this folder manages the installation unless
+# its settings are as published too: only an installer that is pristine and alone here, or whose siblings are
+# all pristine, takes over - the first of them to start; the others then name it as an installer with other
+# settings. Nothing is said when no value differs. Returns 0 when it said something.
+# auto_takeover interactive|cli
+auto_takeover() {
+  local mode="$1" sib
+  if [ -z "$SCRIPT_PATH" ]; then
+    return 1
+  fi
+  # one way: a section that is not as published any more (a hand edit, an editor) is never a new download's again
+  if ! settings_pristine; then
+    settings_unpublish
+    return 1
+  fi
+  # the files of a Catalog: not another application's .env and compose file in this folder
+  if [ ! -f "$ENV_FILE" ] || ! catalog_files; then
+    return 1
+  fi
+  while IFS= read -r sib; do
+    if [ -n "$sib" ] && ! settings_pristine "$sib"; then
+      return 1
+    fi
+  done <<< "$(other_installers)"
+  # an engine that does not answer shows no containers: nothing is taken over (the notes as before, and the next
+  # start tries again) - the installation would be read from .env alone
+  if ! auto_engine_answers; then
+    return 1
+  fi
+  # an installation is containers of the stack or its data volumes; the files option 99 (or R) left are none, and
+  # a new download then starts a new installation with its own defaults
+  if [ -z "$(project_volumes)" ] && ! stack_containers_any; then
+    return 1
+  fi
+  install_diffs auto
+  # .env names another Catalog than the one that runs and no backup of it names the installed one: only the
+  # versions of the containers would be known, and the generate that follows would write the defaults over every
+  # other value of .env (without the take-over it says 'Nothing was written'). Nothing is taken over: the note
+  # and option 23 as before, and the check is not repeated.
+  if [ -z "$INSTALL_SRC" ]; then
+    settings_unpublish
+    return 1
+  fi
+  if [ "${#INSTALL_DIFFS[@]}" -eq 0 ]; then
+    # nothing to take over, now or at any later start: the installation has the defaults of this download, or
+    # its values are named
+    settings_unpublish
+    if [ "${#INSTALL_NOT[@]}" -eq 0 ]; then
+      return 1
+    fi
+    echo
+    echo " This installer is a new download with its default settings; the installation"
+    echo " here has other values, but none of them could be taken over:"
+    install_not_lines
+    AUTO_TAKEOVER_SAID="yes"
+    return 0
+  fi
+  if [ ! -w "$SCRIPT_PATH" ]; then
+    echo
+    echo " This installer is a new download with its default settings; the installation"
+    echo " here has other values, but the file is not writable: nothing was taken over."
+    AUTO_TAKEOVER_SAID="yes"
+    return 0
+  fi
+  if [ -n "$(job_running_ids)" ]; then
+    echo
+    echo " This installer is a new download with its default settings; the installation"
+    echo " here has other values - taken over at the next start, when no job runs (J)."
+    AUTO_TAKEOVER_SAID="yes"
+    return 0
+  fi
+  AUTO_TAKEOVER_SAID="yes"
+  install_takeover "$mode" auto || true
+  reload_settings
+  return 0
 }
 
 # The step that writes these versions (settings: into the files) or starts them (files) would lower
@@ -8942,18 +9326,30 @@ CURRENT_INSTALLER_URL="https://raw.githubusercontent.com/AKARABEL/rn1-technology
 # "yes" once update_installer has replaced this file with a newer version
 INSTALLER_UPDATED="no"
 
-# The line that downloads and starts the installer: with wget, or with curl where wget is missing
+INSTALL_SH_URL="https://raw.githubusercontent.com/AKARABEL/rn1-technology-catalog-installer/main/install.sh"
+
+# The one-line install for a folder without an installer (install.sh downloads the installer into the current
+# folder and starts it; it keeps one that is there): with curl, or with wget where curl is missing
 install_line() {
-  if ! command -v wget >/dev/null 2>&1 && command -v curl >/dev/null 2>&1; then
-    echo "curl -fsSL -o rn1-technology-catalog-installer.sh $CURRENT_INSTALLER_URL && chmod +x rn1-technology-catalog-installer.sh && ./rn1-technology-catalog-installer.sh"
+  if ! command -v curl >/dev/null 2>&1 && command -v wget >/dev/null 2>&1; then
+    echo "wget -nv -O- $INSTALL_SH_URL | bash"
   else
-    echo "wget -nv -O rn1-technology-catalog-installer.sh $CURRENT_INSTALLER_URL && chmod +x rn1-technology-catalog-installer.sh && ./rn1-technology-catalog-installer.sh"
+    echo "curl -fsSL $INSTALL_SH_URL | bash"
   fi
 }
 
-# Downloads the newest installer and carries the current settings over to it.
+# cksum of FILE without its SETTINGS_PUBLISHED_SUM line, which says nothing about what the installer does
+body_cksum() {
+  grep -v '^SETTINGS_PUBLISHED_SUM=' "$1" | cksum
+}
+
+# Downloads the newest installer and carries the current settings over to it. The new version brings its own
+# SETTINGS_PUBLISHED_SUM only when this file is still a new download (its settings as published) and the
+# carried settings are the published ones of the new version too: that file is a new download of the new
+# version. In every other file the line stays blank - a one-way state (settings_unpublish) - and a file that
+# only differs in that line is up to date.
 update_installer() {
-  local mode="${1:-interactive}" tmp line name value backup new_names pairs sum url="$INSTALLER_URL"
+  local mode="${1:-interactive}" tmp line name value backup new_names pairs sum url="$INSTALLER_URL" was_new="no" new_sum
   if [ -z "$SCRIPT_PATH" ] || [ ! -w "$SCRIPT_PATH" ]; then
     err "Cannot update ${SCRIPT_PATH:-the installer} (not a writable file)."
     return 1
@@ -8979,6 +9375,10 @@ update_installer() {
     return 1
   fi
   new_names="$(settings_pairs "$tmp" | cut -d'|' -f1)"
+  new_sum="$(settings_published "$tmp")"
+  if settings_pristine; then
+    was_new="yes"
+  fi
   sum="$(cksum < "$SCRIPT_PATH")"
   if ! pairs="$(settings_pairs "$SCRIPT_PATH")" || [ -z "$pairs" ]; then
     rm -f -- "$tmp"
@@ -8995,12 +9395,16 @@ update_installer() {
       return 1
     fi
   done <<< "$pairs"
-  if [ "$(cksum < "$tmp")" = "$(cksum < "$SCRIPT_PATH")" ]; then
+  # (set_setting blanked the line of the new version in tmp)
+  if [ "$was_new" = "yes" ] && [ -n "$new_sum" ] && [ "$(settings_sum "$tmp")" = "$new_sum" ]; then
+    settings_set_sum "$tmp" "$new_sum" || true
+  fi
+  if [ "$(body_cksum "$tmp")" = "$(body_cksum "$SCRIPT_PATH")" ]; then
     rm -f -- "$tmp"
     ok "The installer is up to date."
     return 0
   fi
-  if [ "$INSTALLER_URL" = "$LEGACY_INSTALLER_URL" ] && [ "$(grep -v '^INSTALLER_URL=' "$tmp" | cksum)" = "$(grep -v '^INSTALLER_URL=' "$SCRIPT_PATH" | cksum)" ]; then
+  if [ "$INSTALLER_URL" = "$LEGACY_INSTALLER_URL" ] && [ "$(grep -v -e '^INSTALLER_URL=' -e '^SETTINGS_PUBLISHED_SUM=' "$tmp" | cksum)" = "$(grep -v -e '^INSTALLER_URL=' -e '^SETTINGS_PUBLISHED_SUM=' "$SCRIPT_PATH" | cksum)" ]; then
     rm -f -- "$tmp"
     set_setting INSTALLER_URL "$CURRENT_INSTALLER_URL" || return 1
     ok "The installer is up to date. Its update address is now $CURRENT_INSTALLER_URL."
@@ -18241,6 +18645,8 @@ edit_config() {
     fi
   done
   rm -f -- "$saved"
+  # the editor changed the file: whatever it holds now was chosen, also when it equals the published settings
+  settings_unpublish
   export RVC_NOTICE="Configuration reloaded. Use option 2 to regenerate the files, then 6 to apply."
   if [ "$(settings_hub_keys "$SCRIPT_PATH")" = "$hub" ]; then
     export RVC_HUB_STATUS="$HUB_STATUS" RVC_LATEST_VERSION="$LATEST_VERSION" RVC_HUB_STABLE="$HUB_STABLE"
@@ -20203,7 +20609,7 @@ remove_size() {
 remove_wizard() {
   local -a steps=(Overview Choose Confirm Remove Done) keys=() labels=() picked=() toks=() failed=()
   local jobs id ncont=0 nvol=0 nimg=0 vols="" busy="" lost="" foreign="" foreign_catalog="" choice i tok answer rc ans f key v users
-  local removed="" self_gone="no" vol="no" img="no" anything="no" n files_on="no" keep_env="" since sure="yes" hint
+  local copies="" removed="" self_gone="no" vol="no" img="no" anything="no" n files_on="no" keep_env="" since sure="yes" hint
 
   wiz_head "Remove" 1 "${steps[@]}"
   jobs="$(wiz_running_jobs)"
@@ -20522,8 +20928,23 @@ remove_wizard() {
   fi
   if [ "$self_gone" = "yes" ]; then
     echo
-    echo "  The installer was removed too. To install again, download it with:"
+    echo "  The installer was removed too. To install again, run this in $WORK_DIR:"
     echo "  $(install_line)"
+    # that line starts an installer that is still in the folder (catalog.sh from before the rename, a copy)
+    # instead of downloading a new one; nothing is deleted here that was not chosen
+    copies=""
+    for f in catalog.sh rn1-technology-catalog-installer.sh; do
+      # (the last line that is not blank, as the one-line install reads it: blank lines after it do not matter)
+      if [ -f "$WORK_DIR/$f" ] && [ "$(sed -n -e '/[^[:space:]]/h' -e '${x;p;}' "$WORK_DIR/$f" 2>/dev/null)" = 'main "$@"; exit $?' ]; then
+        copies="$copies $f"
+      fi
+    done
+    if [ -n "$copies" ]; then
+      echo
+      echo "  Kept, because it was not chosen: another copy of the installer in this folder:$copies"
+      echo "  The line above starts it, with its own settings, instead of downloading a new installer."
+      echo "  For a new one, delete it first (in $WORK_DIR: rm$copies)."
+    fi
     exit 0
   fi
   echo "  I installs it again; the settings at the top of $SCRIPT_NAME were kept."
@@ -21370,7 +21791,8 @@ menu() {
   # settings older than the installation here (a new download of the installer has its defaults): its
   # values are offered before anything else can write the files or start the containers with them
   note="$(install_note)"
-  if [ -n "$note" ]; then
+  # (not when the take-over of a new download just said what it did, and asked about the backups: the menu shows the note)
+  if [ -n "$note" ] && [ -z "$AUTO_TAKEOVER_SAID" ]; then
     echo
     warn "$note."
     adopt_installation interactive || true
@@ -21510,19 +21932,45 @@ EOF
 }
 
 main() {
-  local cmd="${1:-}"
+  local cmd="${1:-}" answer
   if [ "$#" -gt 0 ]; then
     shift
   fi
   cd -- "$WORK_DIR"
   case "$cmd" in
-    check-settings|__cron_convert|__settings_groups|__server_hostname) ;;
+    check-settings|__cron_convert|__settings_groups|__server_hostname|__settings_hash) ;;
     # the release check of CI reads Docker Hub only: the proxy of the settings, no container engine
     __recommended_catalog) proxy_load ;;
     *)
       # the proxy of the settings for every download of this run (and the programs it starts)
       proxy_load
       resolve_engine
+      ;;
+  esac
+
+  # a new download takes the values of the installation here over before anything else (auto_takeover) - not
+  # for the help, the hooks and the jobs, nor for adopt and self-update, which take or carry settings over
+  # themselves (the new installer of a self-update does it at its start)
+  # The report of a command goes to stderr: what these commands print is read by scripts and written to files
+  # (credentials > file, info, versions, network-hosts); only the menu, which is a screen, has it on stdout.
+  case "$cmd" in
+    ""|menu)
+      if [ "$cmd" = "menu" ] || { [ -t 0 ] && [ -t 1 ]; }; then
+        if auto_takeover interactive; then
+          echo
+          # (a pause on input that is not a terminal would take a line the menu is meant to read)
+          if [ -t 0 ]; then
+            read -r -p "Press Enter to open the menu..." answer || true
+          fi
+        fi
+      else
+        auto_takeover cli >&2 || true
+      fi
+      ;;
+    generate|validate|config|up|start|setup|install|status|ps|logs|pull|restart|down|stop|credentials|creds|info|urls|\
+    domain|license|check|network-check|network-hosts|timezone|tz|install-podman|install-docker|install-engine|health|updates|\
+    upgrade|download|snapshot|import-chain|import|versions|set-version)
+      auto_takeover cli >&2 || true
       ;;
   esac
 
@@ -21592,6 +22040,20 @@ main() {
     __recommended_catalog)
       fetch_hub_versions || return 1
       printf '%s %s %s\n' "$(recommended_catalog)" "${HUB_STABLE:--}" "$(if grep -qxF -- "$CATALOG_VERSION" <<< "$HUB_VERSIONS"; then echo listed; else echo missing; fi)"
+      ;;
+    # the value of SETTINGS_PUBLISHED_SUM for the settings section of this file (or of FILE), for the maintainer
+    # after a change of the defaults and for tests/check_settings_hash.sh
+    __settings_hash)
+      answer="${1:-$SCRIPT_PATH}"
+      case "$answer" in
+        /*) ;;
+        *) answer="$CALL_DIR/$answer" ;;
+      esac
+      if ! settings_sum "$answer"; then
+        err "${1:-$SCRIPT_NAME} has no settings section from '# CONFIGURE ONLY THIS SECTION' to '# DO NOT CHANGE ANYTHING BELOW'."
+        return 1
+      fi
+      echo
       ;;
     __domain_normalize) domain_normalize "${1:-}"; echo ;;
     __server_hostname) server_hostname; echo ;;
