@@ -81,6 +81,7 @@ if [[ "$url" == http://localhost:*/v1/* ]]; then
       n="${p##*/}"
       if [ -f "$ST/setting-$n" ]; then done_with 200 "{\"property\":\"$n\",\"value\":\"$(cat "$ST/setting-$n")\"}"; fi
       done_with 204 "" ;;
+    "POST /v1/synchronization/synchronize") done_with 202 '{"operationId":"op-9"}' ;;
     "POST /v1/databaseconfiguration")
       n="$(sed -n 's/.*"property":"\([^"]*\)".*/\1/p' "$data")"
       sed -n 's/.*"value":"\([^"]*\)".*/\1/p' "$data" > "$ST/setting-$n"
@@ -155,6 +156,10 @@ case "$url" in
     if [ "$head" = yes ]; then printf 'docker-content-digest: sha256:%s\r\n' "$(printf '%s:%s' "$repo" "$(target "$repo" "${url##*/}")" | sha256sum | cut -c1-12)"; exit 0; fi
     done_with 200 '{}' ;;
   http://127.0.0.1:81/api/*) path="/${url#http://127.0.0.1:81/api/}" ;;
+  # the online catalog: the key ABCDEF1-1234567-89ABCDE-FEDCBA9 is valid
+  https://rayventorycatalog.raynet.de/v3/synchronization/manifest)
+    grep -qF 'X-Api-Key: ABCDEF1-1234567-89ABCDE-FEDCBA9' <<< "$cfg" && done_with 200 '{"files":[]}'
+    done_with 401 '{"detail":"Invalid API key"}' ;;
   *) echo "UNHANDLED curl $method $url" >> "$BAD"; done_with 404 "" ;;
 esac
 # Nginx Proxy Manager 2.16 (strict: an unknown call is written to $BAD)
@@ -920,7 +925,12 @@ out="$(printf 'i\n\n\n\n\n\n2\n\nrootpw\n%s\n\n\n0\n' "$T/lic.rswl" | bash "$I" 
 check "license step: activated by the license file, root by default, the exact bytes" 'grep -q "Install .* step 7 of 9" <<< "$out" && grep -q "Catalog Web confirms it: the license is valid." <<< "$out" && cmp -s "$ST/got-license" "$T/lic.rswl" && grep -q "POST /v1/license/activate/file" "$ST/local.log"'
 check "license step: the activation fills System Settings (parent feed, automatic conflicts, log level Info)" '[ "$(cat "$ST/setting-ParentInstanceUrl")" = "https://rayventorycatalog.raynet.de" ] && [ "$(cat "$ST/setting-ConflictsResolvingBehavior")" = "Always take incoming" ] && [ "$(cat "$ST/setting-LoggingLevel")" = "Info" ] && grep -q "System Settings filled: ParentInstanceUrl" <<< "$out"'
 check "license step: the login shows the hardware ID with the host name catalog-web runs with, before the path" 'sed -n "/Activation needs a site administrator/,/Uploading lic.rswl/p" <<< "$out" | grep -Eq "Hardware ID +HID8-4B1E-11-22-33 \(host name $(envv CATALOG_HOSTNAME)\)" && grep -q "Raynet makes a license file or e-mail text for this hardware ID." <<< "$out"'
-check "license step: then the data step names the valid license, later, the summary" 'grep -q "Install .* step 8 of 9" <<< "$out" && grep -q "The Catalog is activated (valid license)." <<< "$out" && grep -q "Install .* step 9 of 9" <<< "$out" && grep -q "The Catalog has no data yet: option 20 (daily self-sync), or 17 and 19." <<< "$out"'
+check "license step: then the data step asks for the master key; without one nothing starts, the summary says so" 'grep -q "Install .* step 8 of 9" <<< "$out" && grep -q "The master API key of https://rayventorycatalog.raynet.de" <<< "$out" && grep -q "No API key: the synchronization cannot start yet" <<< "$out" && grep -q "Install .* step 9 of 9" <<< "$out" && grep -q "The Catalog has no data yet: option 20 (daily self-sync), or 17 and 19." <<< "$out" && ! grep -q "POST /v1/synchronization/synchronize" "$ST/local.log"'
+# the master key typed in after the activation: System Settings with the key, then the synchronization started
+# in the Catalog and left to its web interface (no snapshot, not followed)
+fresh
+out="$(printf 'i\n\n\n\n\n\n2\n\nrootpw\n%s\n\nABCDEF1-1234567-89ABCDE-FEDCBA9\ny\ny\n0\n' "$T/lic.rswl" | bash "$I" menu 2>&1)"
+check "data step: the master key saved and set, the synchronization started, its status page named, not followed" '[ "$(cat "$ST/setting-ParentInstanceKey")" = "ABCDEF1-1234567-89ABCDE-FEDCBA9" ] && [ "$(cat "$ST/setting-ParentInstanceUrl")" = "https://rayventorycatalog.raynet.de" ] && grep -q "POST /v1/synchronization/synchronize" "$ST/local.log" && ! grep -q "/v1/operation/" "$ST/local.log" && grep -q "/#/pages/synchronization/status" <<< "$out" && grep -q "the first synchronization runs in the Catalog" <<< "$out" && ! grep -q "Snapshot" <<< "$out" && [ -s "$D/.catalog_api_key" ]'
 # at 80 columns: the ways, the login with the license, the order screen (cancelled at its first field), a
 # refused license file, later, the summary
 fresh
@@ -958,7 +968,7 @@ check "install: failed check shown in full, continued anyway, failed files step 
 
 # 7b. Step 5: a cancelled self-sync is not reported as set up
 installed
-out="$(printf 'i\n2\n1\n\n\n0\n' | bash "$I" menu 2>&1)"
+out="$(printf 'i\n2\n\n\n\n0\n' | bash "$I" menu 2>&1)"
 check "install: cancelled data step - summary says there is no data yet" 'grep -q "The Catalog has no data yet" <<< "$out" && ! grep -q "synchronizes itself every day" <<< "$out"'
 
 # 7c. A folder the installer cannot write to

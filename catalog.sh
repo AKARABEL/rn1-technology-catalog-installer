@@ -5868,14 +5868,14 @@ download_snapshot() {
       0)
         chainfile="$(ls -1t -- "$dir"/chain-*.tsv 2>/dev/null | head -n 1)" || chainfile=""
         if [ "$count" -gt 1 ] && [ -n "$chainfile" ]; then
-          if confirm "Import the $count files into the local catalog now, one after the other?" "${SNAP_IMPORT_DEFAULT:-n}"; then
+          if confirm "Import the $count files into the local catalog now, one after the other?" n; then
             import_chain "$chainfile"
           else
             echo "  Import them later with option 19 (it offers the whole chain)."
           fi
         else
           IFS=$'\t' read -r type date _ <<< "$plan"
-          if confirm "Import $dir/$date-$type.tar.gz into the local catalog now?" "${SNAP_IMPORT_DEFAULT:-n}"; then
+          if confirm "Import $dir/$date-$type.tar.gz into the local catalog now?" n; then
             import_snapshot "$dir/$date-$type.tar.gz"
           else
             echo "  Import it later with option 19."
@@ -7079,7 +7079,8 @@ import_snapshot_menu() {
 # value. The Catalog builds its proxy from server and port into a Uri: the server keeps its scheme.
 catalog_settings_fill() {
   local key p scheme host port l user="" pass="" pairs=() i name value was cur re out body code done_names=() failed=0
-  key="$(api_key_stored)"
+  # the key just typed in (not saved), else the stored one
+  key="${1:-$(api_key_stored)}"
   # NAME VALUE WAS: written when the field is empty or has WAS (*: whatever it has)
   pairs=(ParentInstanceUrl "${CATALOG_CLOUD_URL%/}" "*" ConflictsResolvingBehavior "Always take incoming" "Resolve manually" LoggingLevel Info Debug)
   if [ -n "$key" ]; then
@@ -7183,6 +7184,77 @@ catalog_settings_menu() {
   catalog_settings_fill
 }
 
+# The address of Catalog Web for a browser, as option 15 names it first: the domain (https once Nginx Proxy
+# Manager has its certificate), else this server and the port of Catalog Web
+catalog_web_url() {
+  local domain npm port
+  domain="$(setting CATALOG_DOMAIN)"
+  npm="$(setting INSTALL_NGINX_PROXY_MANAGER)"
+  port="$(setting CATALOG_WEB_PORT)"
+  if [ -n "$domain" ] && [ "$npm" = "true" ] && [ "$(cat -- "$NPM_CERT_FILE" 2>/dev/null)" = "$domain" ]; then
+    printf 'https://%s' "$domain"
+  elif [ -n "$domain" ] && { [ "$npm" = "true" ] || [ "$port" = "80" ]; }; then
+    printf 'http://%s' "$domain"
+  elif [ -n "$domain" ]; then
+    printf 'http://%s:%s' "$domain" "$port"
+  else
+    printf 'http://%s:%s' "$(host_ip)" "$port"
+  fi
+}
+
+# The data step of the install task, with LOCAL_AUTH of the activation (else a login): the master API key of
+# the online catalog, System Settings (catalog_settings_fill), then - after a yes - the synchronization,
+# started in the Catalog and followed in its web interface: a new Catalog synchronizes for hours, the
+# installation does not wait for it. Marks: settings (the key is set), sync (started).
+catalog_data_setup() {
+  local key
+  echo "  The Catalog gets its data from $CATALOG_CLOUD_URL by a synchronization that runs"
+  echo "  inside the Catalog (a new one: some hours) - its web interface shows how far it is."
+  echo "  Servers without internet: options 17 and 19 download and import the snapshots instead."
+  echo
+  key="$(api_key_stored)"
+  if [ -n "$key" ]; then
+    info "Testing the stored API key $(api_key_mask "$key")"
+    api_key_check "$key"
+    report_key_state
+    if [ "$KEY_STATE" != "valid" ]; then
+      key=""
+    fi
+  fi
+  if [ -z "$key" ]; then
+    echo "  The master API key of $CATALOG_CLOUD_URL (from Raynet):"
+    if prompt_api_key; then
+      key="$NEW_KEY"
+      if confirm "Save the key for the next time (in $API_KEY_FILE, readable only by $(id -un))?" y; then
+        api_key_save "$key"
+        ok "API key saved."
+      fi
+    fi
+  fi
+  if [ -z "$LOCAL_AUTH" ]; then
+    local_auth_obtain || return 1
+  fi
+  if [ "$LOCAL_ADMIN" != "yes" ] && [ "$LICENSE_ADMIN" != "yes" ]; then
+    local_auth_check
+    if [ "$LOCAL_ADMIN" != "yes" ]; then
+      err "Changing System Settings needs a local administrator (for example admin or root)."
+      return 1
+    fi
+  fi
+  catalog_settings_fill "$key" || true
+  if [ -z "$key" ]; then
+    warn "No API key: the synchronization cannot start yet - option 20 asks for the key and starts it."
+    return 0
+  fi
+  wiz_mark settings
+  if ! confirm "Start the synchronization now?" y; then
+    info "Later: option 20 starts it."
+    return 0
+  fi
+  self_sync_run web || return 1
+  wiz_mark sync
+}
+
 # Online servers: the local catalog gets the online catalog URL and key and synchronizes itself
 # (daily by AUTOSYNC_CRON afterwards).
 local_self_sync() {
@@ -7270,21 +7342,27 @@ local_self_sync() {
   fi
 }
 
-# Worker: starts the synchronization of the local catalog and follows it.
+# Worker: starts the synchronization of the local catalog and follows it; self_sync_run web only starts
+# it and names the page of the web interface that shows it (a new Catalog synchronizes for hours)
 self_sync_run() {
-  local tmp out code opid
+  local mode="${1:-follow}" tmp out code opid
   local_auth_take
   tmp="$(mktemp)"
   out="$(mktemp)"
   printf -- '--rvcboundary--\r\n' > "$tmp"
-  follow_mark
+  if [ "$mode" != "web" ]; then
+    follow_mark
+  fi
   code="$(local_call POST /v1/synchronization/synchronize "$out" -H 'Content-Type: multipart/form-data; boundary=rvcboundary' --data-binary "@$tmp")"
   rm -f -- "$tmp"
   case "$code" in
     200|202)
       opid="$(json_field operationId "$out")"
       rm -f -- "$out"
-      if [ -n "$opid" ]; then
+      if [ "$mode" = "web" ]; then
+        ok "The synchronization runs in the Catalog - its web interface shows how far it is:"
+        echo "  $(catalog_web_url)/#/pages/synchronization/status"
+      elif [ -n "$opid" ]; then
         watch_operation "$opid" Synchronization || return $?
       else
         ok "Synchronization started - follow it in the Catalog web interface."
@@ -8020,8 +8098,11 @@ license_activate() {
     fi
     case "$rc" in
       0)
-        # activated: the login of the activation fills System Settings at once, before any import
-        catalog_settings_fill || true
+        # activated: the login of the activation fills System Settings at once (the install task: in its
+        # data step, which follows with this login)
+        if [ "$mode" != "wizard" ]; then
+          catalog_settings_fill || true
+        fi
         return 0
         ;;
       2) ;;
@@ -8081,19 +8162,51 @@ license_cli() {
 }
 
 # Step of the install task: the license, which the data needs. A valid one is named in the data step.
+# After an activation the data step (step N+1) follows at once with its login: INSTALL_DATA says what
+# came of it (sync, settings, or none) for install_finish.
+INSTALL_DATA=""
 install_license() {
   local n="$1" rc=0
   shift
+  INSTALL_DATA=""
   license_status
   if [ "$LICENSE_STATE" = "valid" ]; then
     return 0
   fi
   wiz_head "Install" "$n" "$@"
-  wiz_run license_activate wizard || rc=$?
+  WIZ_MARK="$(mktemp)"
+  wiz_run install_license_run "$n" "$@" || rc=$?
+  if grep -qx sync "$WIZ_MARK" 2>/dev/null; then
+    INSTALL_DATA="sync"
+  elif grep -qx settings "$WIZ_MARK" 2>/dev/null; then
+    INSTALL_DATA="settings"
+  elif grep -qx data "$WIZ_MARK" 2>/dev/null; then
+    INSTALL_DATA="none"
+  fi
+  rm -f -- "$WIZ_MARK"
+  WIZ_MARK=""
   # the outcome (a failure too) stays on the screen until a key; later goes on at once
   if [ "$rc" -ne 2 ]; then
     ui_pause_tty
   fi
+}
+
+# install_license_run N STEP-NAME... -> the activation, then the data step (N+1) with its login
+install_license_run() {
+  local n="$1" rc=0
+  shift
+  license_activate wizard || rc=$?
+  if [ "$rc" -ne 0 ] || [ -z "$LOCAL_AUTH" ]; then
+    return "$rc"
+  fi
+  license_status
+  if [ "$LICENSE_STATE" != "valid" ]; then
+    return 0
+  fi
+  ui_pause_tty
+  wiz_head "Install" $((n + 1)) "$@"
+  wiz_mark data
+  catalog_data_setup || true
 }
 
 ###############################################################################
@@ -19119,16 +19232,6 @@ wiz_last_job() {
   printf '%s' "$last"
 }
 
-# wiz_job_since ID TITLE-START -> state of the newest job after ID whose title starts so (empty: none)
-wiz_job_since() {
-  local since="$1" id state=""
-  for ((id = since + 1; id <= $(wiz_last_job); id++)); do
-    if [[ "$(cat -- "$JOBS_DIR/$id/title" 2>/dev/null)" == "$2"* ]]; then
-      state="$(job_state "$id")"
-    fi
-  done
-  printf '%s' "$state"
-}
 
 # True when this folder has an installation: its generated files, or containers of this installation
 # (volumes alone may belong to another folder with the same name).
@@ -19833,12 +19936,6 @@ install_generate() {
   fi
 }
 
-# Step of the install task: snapshots, imported right away by default
-install_snapshots() {
-  SNAP_IMPORT_DEFAULT="y"
-  download_snapshot
-}
-
 # I: in a folder without an installation the new installation (install_new; first: the menu starts with
 # it on the first start here), also on the files that option 99 or R left. In a folder that is installed
 # already: repair (check, settings, files, start), continue with the license and the data, update or
@@ -20234,7 +20331,7 @@ install_new() {
 # needs a valid license: without one the summary says so instead.
 # install_finish DATA-STEP STEP-NAME...
 install_finish() {
-  local n="$1" choice since data="no"
+  local n="$1" data="no"
   shift
   license_status
   case "$LICENSE_STATE" in
@@ -20242,39 +20339,22 @@ install_finish() {
     invalid) data="unlicensed" ;;
     *) data="noweb" ;;
   esac
+  # the license step ran the data step already, right after the activation
+  if [ "$data" = "no" ] && [ -n "$INSTALL_DATA" ]; then
+    data="$INSTALL_DATA"
+  fi
   if [ "$data" = "no" ]; then
     wiz_head "Install" "$n" "$@"
     ok "The Catalog is activated (valid license)."
-    echo "  The Catalog is empty until it gets its data from $CATALOG_CLOUD_URL."
-    echo
-    printf '   %s %s  %s\n' "${C_BLD}1$C_RST" "$(menu_icon run)" "Daily self-sync: the Catalog fetches the data itself $C_DIM(server with internet, option 20)$C_RST"
-    printf '   %s %s  %s\n' "${C_BLD}2$C_RST" "$(menu_icon run)" "Download the snapshots here and import them $C_DIM(options 17 and 19)$C_RST"
-    printf '   %s    %s\n' "${C_BLD}0$C_RST" "${C_DIM}later$C_RST"
-    echo
-    ui_ask choice "Select [0]:" || choice="0"
-    # what really happened is read afterwards: a mark of the self-sync, and the jobs started meanwhile
-    since="$(wiz_last_job)"
     WIZ_MARK="$(mktemp)"
-    case "$choice" in
-      1) wiz_run local_self_sync || true ;;
-      2) wiz_run install_snapshots || true ;;
-    esac
+    wiz_run catalog_data_setup || true
     if grep -qx sync "$WIZ_MARK" 2>/dev/null; then
       data="sync"
+    elif grep -qx settings "$WIZ_MARK" 2>/dev/null; then
+      data="settings"
     fi
     rm -f -- "$WIZ_MARK"
     WIZ_MARK=""
-    case "$(wiz_job_since "$since" "Snapshot import")" in
-      done) data="snapshot" ;;
-      # unfollowed: the import goes on in the Catalog
-      running|unfollowed) data="importing" ;;
-      "")
-        case "$(wiz_job_since "$since" "Snapshot download")" in
-          done) data="downloaded" ;;
-          running) data="downloading" ;;
-        esac
-        ;;
-    esac
     ui_pause_tty
   fi
 
@@ -20288,13 +20368,11 @@ install_finish() {
   echo
   case "$data" in
     sync)
-      echo "  Catalog data: the Catalog synchronizes itself every day"
-      echo "  ($AUTOSYNC_CRON in $TZ)."
+      echo "  Catalog data: the first synchronization runs in the Catalog (some hours) - see"
+      echo "  $(catalog_web_url)/#/pages/synchronization/status"
+      echo "  Afterwards the Catalog synchronizes itself every day ($AUTOSYNC_CRON in $TZ)."
       ;;
-    snapshot) echo "  Catalog data: imported from the snapshots (option 19 imports newer ones)." ;;
-    importing) echo "  Catalog data: the import runs in the background (J shows it)." ;;
-    downloaded) warn "Catalog data: downloaded, not imported yet - option 19 imports it." ;;
-    downloading) echo "  Catalog data: downloading in the background (J); option 19 imports it then." ;;
+    settings) warn "Catalog data: the synchronization is set up but not started - option 20 starts it." ;;
     unlicensed)
       warn "The Catalog has no data yet: it is not activated (no valid license)."
       echo "  Option 25 activates the Catalog, then options 20 / 17 and 19 load the data."
