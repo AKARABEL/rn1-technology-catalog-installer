@@ -6621,7 +6621,7 @@ follow_index() {
 # synchronization history (what the web interface shows), the status of the operation (only Admin and
 # SiteAdmin may read it) and the steps the Catalog logs after follow_mark.
 # watch_operation OPID LABEL -> 0 finished, 1 failed, 4 not followed to the end (the operation goes on in
-# the Catalog or its end is not known: the login expired, nothing changed for 4 hours, probably cancelled)
+# the Catalog or its end is not known: the login expired, nothing changed for a day, probably cancelled)
 watch_operation() {
   local out rc=0
   out="$(mktemp)"
@@ -6769,9 +6769,10 @@ watch_loop() {
         fi
       fi
     fi
-    if [ $((SECONDS - quiet)) -ge 14400 ]; then
+    # a full snapshot can unpack for many hours without a sign: only a whole day without one ends the follow
+    if [ $((SECONDS - quiet)) -ge 86400 ]; then
       follow_clear
-      warn "Nothing has changed for 4 hours - not followed any further: check the Catalog web interface."
+      warn "Nothing has changed for 24 hours - not followed any further: check the Catalog web interface."
       job_unfollowed
       return 4
     fi
@@ -21441,7 +21442,7 @@ menu_items() {
 2|18|edit|API keys|online + local: show, test|Shows, changes and tests the API keys
 2|19|run|Import snapshot|full import, then delta|Imports the full snapshot, then the deltas
 2|20|run|Daily self-sync|Catalog fetches changes daily|The Catalog synchronizes itself daily
-2|27|run|System Settings|parent feed, proxy, log level|Sets parent feed, auto-resolve, proxy, log Info
+2|27|run|System Settings|parent feed, proxy, log level|Parent feed, auto-resolve, proxy, log level
 3|-||UPDATE|newer versions|newer Catalog, components, installer
 3|8|run|Versions, offline bundle|pick versions, download only|Recommended versions, picker, offline bundle
 3|11|run|Pull images|images in docker-compose.yml|Pulls the images named in docker-compose.yml
