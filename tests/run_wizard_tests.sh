@@ -76,6 +76,15 @@ if [[ "$url" == http://localhost:*/v1/* ]]; then
       cp "$data" "$ST/got-text"
       grep -q "LICENSE ENDS HERE" "$ST/got-text" || done_with 400 '"Activation failed with the following error: Unknown order number. Activation not possible."'
       touch "$ST/license"; done_with 200 "$LICOK" ;;
+    # System Settings, one setting per call: what the activation wrote is kept in setting-NAME
+    "GET /v1/databaseconfiguration/"*)
+      n="${p##*/}"
+      if [ -f "$ST/setting-$n" ]; then done_with 200 "{\"property\":\"$n\",\"value\":\"$(cat "$ST/setting-$n")\"}"; fi
+      done_with 204 "" ;;
+    "POST /v1/databaseconfiguration")
+      n="$(sed -n 's/.*"property":"\([^"]*\)".*/\1/p' "$data")"
+      sed -n 's/.*"value":"\([^"]*\)".*/\1/p' "$data" > "$ST/setting-$n"
+      done_with 200 "" ;;
   esac
   echo "UNHANDLED curl $method $url" >> "$BAD"; done_with 404 ""
 fi
@@ -909,6 +918,7 @@ fresh
 printf 'fake license file\001\002\nline 2\n' > "$T/lic.rswl"
 out="$(printf 'i\n\n\n\n\n\n2\n\nrootpw\n%s\n\n\n0\n' "$T/lic.rswl" | bash "$I" menu 2>&1)"
 check "license step: activated by the license file, root by default, the exact bytes" 'grep -q "Install .* step 7 of 9" <<< "$out" && grep -q "Catalog Web confirms it: the license is valid." <<< "$out" && cmp -s "$ST/got-license" "$T/lic.rswl" && grep -q "POST /v1/license/activate/file" "$ST/local.log"'
+check "license step: the activation fills System Settings (parent feed, automatic conflicts, log level Info)" '[ "$(cat "$ST/setting-ParentInstanceUrl")" = "https://rayventorycatalog.raynet.de" ] && [ "$(cat "$ST/setting-ConflictsResolvingBehavior")" = "Always take incoming" ] && [ "$(cat "$ST/setting-LoggingLevel")" = "Info" ] && grep -q "System Settings filled: ParentInstanceUrl" <<< "$out"'
 check "license step: the login shows the hardware ID with the host name catalog-web runs with, before the path" 'sed -n "/Activation needs a site administrator/,/Uploading lic.rswl/p" <<< "$out" | grep -Eq "Hardware ID +HID8-4B1E-11-22-33 \(host name $(envv CATALOG_HOSTNAME)\)" && grep -q "Raynet makes a license file or e-mail text for this hardware ID." <<< "$out"'
 check "license step: then the data step names the valid license, later, the summary" 'grep -q "Install .* step 8 of 9" <<< "$out" && grep -q "The Catalog is activated (valid license)." <<< "$out" && grep -q "Install .* step 9 of 9" <<< "$out" && grep -q "The Catalog has no data yet: option 20 (daily self-sync), or 17 and 19." <<< "$out"'
 # at 80 columns: the ways, the login with the license, the order screen (cancelled at its first field), a
