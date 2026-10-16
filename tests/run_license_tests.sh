@@ -146,6 +146,15 @@ case "$method $p" in
     echo Ok > "$SRV/license"
     reply 200 "$OKBODY" ;;
   "GET /v1/databaseconfiguration/synchronization") reply 204 "" ;;
+  # System Settings, one setting per call (the activation fills them): kept in setting-NAME
+  "GET /v1/databaseconfiguration/"*)
+    n="${p##*/}"
+    [ -f "$SRV/setting-$n" ] && reply 200 "{\"property\":\"$n\",\"value\":\"$(cat "$SRV/setting-$n")\"}"
+    reply 204 "" ;;
+  "POST /v1/databaseconfiguration")
+    n="$(sed -n 's/.*"property":"\([^"]*\)".*/\1/p' "${data#@}")"
+    sed -n 's/.*"value":"\([^"]*\)".*/\1/p' "${data#@}" > "$SRV/setting-$n"
+    reply 200 "" ;;
   "POST /v1/databaseconfiguration/synchronization") cp "${data#@}" "$SRV/sync-settings.json"; reply 204 "" ;;
   "POST /v1/synchronization/snapshot") echo "$form" >> "$SRV/uploads"; reply 202 '{"operationId":"op-1","status":"accepted"}' ;;
   "POST /v1/synchronization/synchronize") reply 202 '{"operationId":"op-2"}' ;;
