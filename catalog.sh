@@ -7069,6 +7069,119 @@ import_snapshot_menu() {
   fi
 }
 
+# catalog_settings_fill -> System Settings (Synchronization + Updates, Proxy server, Logging) of the local
+# catalog, with LOCAL_AUTH of an administrator: Parent feed = CATALOG_CLOUD_URL always, conflicts resolved
+# automatically (Always take incoming) in place of Resolve manually, Log level Info in place of the Debug a
+# new Catalog starts with, and in empty fields only the stored API key (left empty without one) and the
+# proxy of INTERNET_PROXY with its saved login (the Catalog shows its proxy password masked). One setting
+# per POST, as the web interface saves them: a setting the Catalog has goes back as it came, with the new
+# value. The Catalog builds its proxy from server and port into a Uri: the server keeps its scheme.
+catalog_settings_fill() {
+  local key p scheme host port l user="" pass="" pairs=() i name value was cur re out body code done_names=() failed=0
+  key="$(api_key_stored)"
+  # NAME VALUE WAS: written when the field is empty or has WAS (*: whatever it has)
+  pairs=(ParentInstanceUrl "${CATALOG_CLOUD_URL%/}" "*" ConflictsResolvingBehavior "Always take incoming" "Resolve manually" LoggingLevel Info Debug)
+  if [ -n "$key" ]; then
+    pairs+=(ParentInstanceKey "$key" "")
+  fi
+  if [ -n "$INTERNET_PROXY" ]; then
+    p="$INTERNET_PROXY"
+    scheme="http"
+    case "$p" in
+      *://*) scheme="${p%%://*}"; p="${p#*://}" ;;
+    esac
+    p="${p##*@}"
+    p="${p%%/*}"
+    host="$p"
+    port=""
+    if [[ "$p" =~ ^(.*[^:]):([0-9]+)$ ]]; then
+      host="${BASH_REMATCH[1]}"
+      port="${BASH_REMATCH[2]}"
+    fi
+    if [ -z "$port" ]; then
+      case "$scheme" in
+        https) port="443" ;;
+        *) port="80" ;;
+      esac
+    fi
+    pairs+=(SynchronizationProxyServer "$scheme://$host" "" SynchronizationProxyServerPort "$port" "")
+    l="$(proxy_login)"
+    if [ -n "$l" ]; then
+      user="$(net_decode "${l%%:*}")"
+      pass="$(net_decode "${l#*:}")"
+      pairs+=(SynchronizationProxyServerUsername "$user" "" SynchronizationProxyServerPassword "$pass" "")
+    fi
+  fi
+  out="$(mktemp)"
+  body="$(mktemp)"
+  chmod 600 "$body"
+  for ((i = 0; i < ${#pairs[@]}; i += 3)); do
+    name="${pairs[i]}"
+    value="${pairs[i + 1]}"
+    was="${pairs[i + 2]}"
+    code="$(local_call GET "/v1/databaseconfiguration/$name" "$out")"
+    cur=""
+    case "$code" in
+      200) cur="$(tr -d '\r\n' < "$out")" ;;
+      204|404) ;;
+      520) rm -f -- "$out" "$body"; report_unlicensed; return 1 ;;
+      *) failed=$((failed + 1)); continue ;;
+    esac
+    re='"value" *: *"(([^"\\]|\\.)*)"'
+    if [[ "$cur" =~ $re ]]; then
+      if [ "${BASH_REMATCH[1]}" = "$(json_escape "$value")" ]; then
+        continue
+      fi
+      if [ -n "${BASH_REMATCH[1]}" ] && [ "${BASH_REMATCH[1]}" != "$was" ] && [ "$was" != "*" ]; then
+        continue
+      fi
+      # split by hand: in a ${x/a/b} of bash 5.2 an & of the value would stand for the match
+      printf '%s"value":"%s"%s' "${cur%%"${BASH_REMATCH[0]}"*}" "$(json_escape "$value")" "${cur#*"${BASH_REMATCH[0]}"}" > "$body"
+    else
+      printf '{"property":"%s","value":"%s"}' "$name" "$(json_escape "$value")" > "$body"
+    fi
+    code="$(local_call POST /v1/databaseconfiguration "$out" -H 'Content-Type: application/json' --data-binary "@$body")"
+    case "$code" in
+      200|201|204) done_names+=("$name") ;;
+      *) failed=$((failed + 1)) ;;
+    esac
+  done
+  rm -f -- "$out" "$body"
+  if [ "${#done_names[@]}" -gt 0 ]; then
+    ok "System Settings filled: ${done_names[*]}."
+  elif [ "$failed" -eq 0 ]; then
+    ok "System Settings already set - nothing to change."
+  fi
+  if [ -z "$key" ]; then
+    info "No API key for $CATALOG_CLOUD_URL stored yet: the API Key field stays empty (option 20 sets it)."
+  fi
+  if [ "$failed" -gt 0 ]; then
+    warn "$failed field(s) of System Settings could not be written - the web interface sets them by hand."
+    return 1
+  fi
+}
+
+# Option 27: System Settings of a Catalog activated before (the activation fills them only once): an
+# administrator logs in, catalog_settings_fill does the rest
+catalog_settings_menu() {
+  license_status
+  case "$LICENSE_STATE" in
+    valid) ;;
+    invalid) report_unlicensed; return 1 ;;
+    *) report_license_state; return 1 ;;
+  esac
+  local_auth_obtain || return 1
+  if [ "$LOCAL_ADMIN" != "yes" ]; then
+    if [ "$LOCAL_STATE" = "valid" ]; then
+      err "Changing System Settings needs a local administrator (for example admin or root)."
+    else
+      report_local_state
+    fi
+    return 1
+  fi
+  catalog_settings_fill
+}
+
 # Online servers: the local catalog gets the online catalog URL and key and synchronizes itself
 # (daily by AUTOSYNC_CRON afterwards).
 local_self_sync() {
@@ -7137,6 +7250,8 @@ local_self_sync() {
     200|201|204)
       ok "The local catalog now synchronizes from $CATALOG_CLOUD_URL (automatically: AUTOSYNC_CRON \"$(setting AUTOSYNC_CRON)\")."
       wiz_mark sync
+      # the proxy fields, which the synchronization settings above leave as they are
+      catalog_settings_fill || true
       ;;
     520) rm -f -- "$out"; report_unlicensed; return 1 ;;
     *) rm -f -- "$out"; err "Saving the synchronization settings failed (HTTP $code)."; return 1 ;;
@@ -7903,7 +8018,11 @@ license_activate() {
       esac
     fi
     case "$rc" in
-      0) return 0 ;;
+      0)
+        # activated: the login of the activation fills System Settings at once, before any import
+        catalog_settings_fill || true
+        return 0
+        ;;
       2) ;;
       *) fails=$((fails + 1)) ;;
     esac
@@ -21206,6 +21325,7 @@ $(help_item 17 run "Download snapshot" "Catalog data from $CATALOG_CLOUD_URL (ne
 $(help_item 18 edit "API keys" "Shows, changes, tests and deletes the keys for the online and the" "local Catalog. Keys are tested before they are saved.")
 $(help_item 19 run "Import snapshot" "Uploads downloaded snapshots into the local Catalog, file by file: full" "import, then delta. Catalog 25.x accepts at most 10 GB per file.")
 $(help_item 20 run "Daily self-sync" "Lets the local Catalog synchronize itself every day (servers with" "internet access).")
+$(help_item 27 run "System Settings" "Parent feed $CATALOG_CLOUD_URL, conflicts resolved automatically, log level" "Info, and in empty fields the API key and the proxy (the activation does it too).")
 
 ${c}UPDATE $UI_SEP newer versions$r
 $(help_item 8 run "Versions, offline bundle" "Recommended versions of all components, version picker, and" "\"Download only\": an offline bundle for servers without internet.")
@@ -21270,6 +21390,7 @@ menu_dispatch() {
     24) run_action domain_menu ;;
     25) run_action license_activate ;;
     26) run_action net_menu ;;
+    27) run_action catalog_settings_menu ;;
     99) run_action menu_reset ;;
     j|J) run_action jobs_menu ;;
     i|I) install_wizard ;;
@@ -21320,6 +21441,7 @@ menu_items() {
 2|18|edit|API keys|online + local: show, test|Shows, changes and tests the API keys
 2|19|run|Import snapshot|full import, then delta|Imports the full snapshot, then the deltas
 2|20|run|Daily self-sync|Catalog fetches changes daily|The Catalog synchronizes itself daily
+2|27|run|System Settings|parent feed, proxy, log level|Sets parent feed, auto-resolve, proxy, log Info
 3|-||UPDATE|newer versions|newer Catalog, components, installer
 3|8|run|Versions, offline bundle|pick versions, download only|Recommended versions, picker, offline bundle
 3|11|run|Pull images|images in docker-compose.yml|Pulls the images named in docker-compose.yml
@@ -21909,6 +22031,8 @@ Commands:
                               The license of the Catalog: status (no login), or activation by the
                               license file, the order number (needs internet) or the license text of
                               Raynet's e-mail (a site administrator logs in); without one: as option 25
+  settings                    System Settings of the Catalog as option 27: parent feed, automatic conflict
+                              resolving, log level Info, the API key and the proxy (an administrator logs in)
   check                       Check prerequisites ($ENGINE_NAME, $ENGINE compose, ports, vm.max_map_count, Docker Hub)
   network-check               Check the sites the installation needs, directly or through INTERNET_PROXY;
                               exit code 0 when every required one answers (no questions; option 26 asks)
@@ -22016,6 +22140,7 @@ main() {
     info|urls) show_access_info ;;
     domain) domain_menu "${1:-}" ;;
     license) license_cli "$@" ;;
+    settings) catalog_settings_menu ;;
     check) do_check ;;
     network-check) net_cli_check ;;
     network-hosts) net_hosts_text ;;
