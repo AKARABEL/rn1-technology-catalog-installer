@@ -929,7 +929,7 @@ check "license step: then the data step asks for the master key; without one not
 # the master key typed in after the activation: System Settings with the key, then the synchronization started
 # in the Catalog and left to its web interface (no snapshot, not followed)
 fresh
-out="$(printf 'i\n\n\n\n\n\n2\n\nrootpw\n%s\n\nABCDEF1-1234567-89ABCDE-FEDCBA9\ny\ny\n0\n' "$T/lic.rswl" | bash "$I" menu 2>&1)"
+out="$(printf 'i\n\n\n\n\n\n2\n\nrootpw\n%s\nABCDEF1-1234567-89ABCDE-FEDCBA9\ny\ny\n\n0\n' "$T/lic.rswl" | bash "$I" menu 2>&1)"
 check "data step: the master key saved and set, the synchronization started, its status page named, not followed" '[ "$(cat "$ST/setting-ParentInstanceKey")" = "ABCDEF1-1234567-89ABCDE-FEDCBA9" ] && [ "$(cat "$ST/setting-ParentInstanceUrl")" = "https://rayventorycatalog.raynet.de" ] && grep -q "POST /v1/synchronization/synchronize" "$ST/local.log" && ! grep -q "/v1/operation/" "$ST/local.log" && grep -q "/#/pages/synchronization/status" <<< "$out" && grep -q "the first synchronization runs in the Catalog" <<< "$out" && ! grep -q "Snapshot" <<< "$out" && [ -s "$D/.catalog_api_key" ]'
 # at 80 columns: the ways, the login with the license, the order screen (cancelled at its first field), a
 # refused license file, later, the summary
